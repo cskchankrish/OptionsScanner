@@ -11,7 +11,7 @@ A React app built with Vite that:
 - Has light/dark theme toggle
 - Works on mobile and desktop
 
-## Deploy in 10 minutes (FREE forever)
+## Deploy in 10 minutes
 
 ### Option 1 — Vercel (recommended, easiest)
 
@@ -74,7 +74,3 @@ Just send them the deployed URL. Works on any device, no login needed, always sh
 - **Refresh interval** — change `REFRESH_MS` in `App.jsx` (currently 15 minutes)
 - **Page size** — change `PAGE_SIZE` (currently 40 cards per page)
 - **Theme colors** — edit `THEMES` object at the top of `App.jsx`
-
-## Why not host inside Claude artifacts?
-
-Claude artifacts run in a sandboxed iframe that blocks `fetch()` to external domains for security. That's why the dashboard couldn't pull live data from Google Sheets directly inside Claude. Deploying to Vercel/Netlify removes that restriction completely — it's just a normal web app.
