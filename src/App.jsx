@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import Papa from "papaparse";
+import { hasConvictionMetrics, readConvictionMetrics } from "./convictionMetrics.js";
 
 // ─── LIVE GOOGLE SHEETS LINK ──────────────────────────────────────────────────
 const CSV_URL    = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
@@ -112,6 +113,7 @@ function parseData(rows) {
         near200:   g(r,"Near 200EMA D").toUpperCase() === "YES",
         emaDist:   r["EMA Distance%"] ? parseFloat(String(r["EMA Distance%"]).replace("%","")) : null,
         ema200:    Number(r["200 EMA"]) || null,
+        conviction:readConvictionMetrics(r),
       };
       const { score, signals, appliedCombos } = scoreStock(raw);
       return { ...raw, score, signals, appliedCombos };
@@ -181,6 +183,45 @@ function StatBox({ label, val, color, t }) {
       padding:"6px 12px", textAlign:"center", flexShrink:0 }}>
       <div style={{ fontSize:9, color:t.textMuted, textTransform:"uppercase", letterSpacing:1 }}>{label}</div>
       <div style={{ fontSize:18, fontWeight:900, color, fontFamily:"monospace" }}>{val}</div>
+    </div>
+  );
+}
+
+const CONVICTION_DISPLAY = [
+  { key:"rank",   label:"Rank",  max:null, title:"Conviction rank" },
+  { key:"rs",     label:"RS",    max:10,   title:"Relative strength score" },
+  { key:"volume", label:"Volume", max:15,  title:"Conviction volume score" },
+  { key:"trend",  label:"Trend", max:25,   title:"Trend score" },
+  { key:"base",   label:"Base",   max:100, title:"Potential base score" },
+];
+
+function convictionMetricColor(key, value, t) {
+  if (!Number.isFinite(value)) return t.textFaint;
+  if (key === "rank") return value <= 100 ? "#16a34a" : value <= 300 ? "#d97706" : t.textSub;
+  const strong = { rs:8, volume:12, trend:20, base:50 }[key];
+  const watch  = { rs:6, volume:8,  trend:15, base:40 }[key];
+  return value >= strong ? "#16a34a" : value >= watch ? "#d97706" : t.textSub;
+}
+
+function ConvictionStrip({ metrics, t }) {
+  if (!hasConvictionMetrics(metrics)) return null;
+  return (
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(5,minmax(0,1fr))",
+      borderTop:`1px solid ${t.border}`, marginTop:9, paddingTop:8, minHeight:34 }}>
+      {CONVICTION_DISPLAY.map(({ key, label, max, title }) => {
+        const value = metrics[key];
+        const shown = Number.isFinite(value) ? (Number.isInteger(value) ? value : value.toFixed(1)) : "—";
+        return (
+          <div key={key} title={title} style={{ textAlign:"center", minWidth:0, padding:"0 2px" }}>
+            <div style={{ color:t.textMuted, fontSize:8, fontWeight:700, textTransform:"uppercase",
+              whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", letterSpacing:0 }}>{label}</div>
+            <div style={{ color:convictionMetricColor(key, value, t), fontFamily:"monospace",
+              fontSize:11, fontWeight:900, lineHeight:1.4, whiteSpace:"nowrap" }}>
+              {key === "rank" && Number.isFinite(value) ? "#" : ""}{shown}{max && Number.isFinite(value) ? `/${max}` : ""}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -427,6 +468,7 @@ function StockCard({ stock, onClick, t, isDark }) {
           <span>EMA: <span style={{ color:stock.emaDist<3?"#16a34a":stock.emaDist>15?"#ef4444":"#d97706" }}>{stock.emaDist}%</span></span>
         )}
       </div>
+      <ConvictionStrip metrics={stock.conviction} t={t} />
     </div>
   );
 }

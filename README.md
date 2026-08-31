@@ -8,6 +8,7 @@ A React app built with Vite that:
 - Fetches your Google Sheets data (published as CSV)
 - Scores 200+ F&O stocks based on Inside Day, Inside Value, Confluence Pivots, and Compression Ratio signals
 - Auto-refreshes every 15 minutes
+- Shows nightly Swing Scanner Rank, RS, Volume, Trend, and Base scores when present
 - Has light/dark theme toggle
 - Works on mobile and desktop
 
@@ -64,6 +65,21 @@ const CSV_URL = "https://docs.google.com/spreadsheets/d/e/.../pub?output=csv";
 To use a different sheet:
 1. Edit that line
 2. Commit & push to GitHub — Vercel/Netlify auto-redeploys
+
+## Conviction metrics
+
+The card footer reads five optional columns from the same published worksheet:
+
+- `Conviction Rank`
+- `Conviction RS`
+- `Conviction Volume`
+- `Conviction Trend`
+- `Conviction Base`
+
+The `nse-swing-scanner` nightly workflow appends and refreshes these columns by
+matching `NSE Symbol`. Missing values remain blank and the card footer stays
+hidden, so the dashboard remains compatible while the sheet integration is
+being configured.
 
 ## Sharing with friends
 
