@@ -1,6 +1,8 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import Papa from "papaparse";
 import { hasConvictionMetrics, readConvictionMetrics } from "./convictionMetrics.js";
+import { isTradableSourceRow } from "./sourceHealth.js";
+import { compareStocks } from "./stockSort.js";
 
 // ─── LIVE GOOGLE SHEETS LINK ──────────────────────────────────────────────────
 const CSV_URL    = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
@@ -95,8 +97,10 @@ function getTier(score) {
 // ─── CSV PARSER ───────────────────────────────────────────────────────────────
 function parseData(rows) {
   const g = (r, k) => { const v = r[k]; return (v !== null && v !== undefined) ? String(v).trim() : ""; };
-  const out = rows
-    .filter(r => r["NSE Symbol"] && r["Weekly Pivot"] !== undefined && r["Weekly Pivot"] !== null)
+  const candidates = rows.filter(r => r["NSE Symbol"]);
+  const sourceErrors = candidates.filter(r => !isTradableSourceRow(r)).length;
+  const stocks = candidates
+    .filter(isTradableSourceRow)
     .map(r => {
       const raw = {
         sym:       g(r,"NSE Symbol").replace(/%5E/g,"").replace("NSEI","NIFTY").replace("NSEBANK","BANKNIFTY"),
@@ -120,8 +124,8 @@ function parseData(rows) {
     })
     .sort((a,b) => b.score - a.score);
 
-  if (!out.length) throw new Error("No valid rows found. Ensure the sheet is published as CSV.");
-  return out;
+  if (!stocks.length) throw new Error("No valid rows found. Ensure the sheet is published as CSV.");
+  return { stocks, sourceErrors };
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -189,6 +193,7 @@ function StatBox({ label, val, color, t }) {
 
 const CONVICTION_DISPLAY = [
   { key:"rank",   label:"Rank",  max:null, title:"Conviction rank" },
+  { key:"tier",   label:"Tier",  max:null, title:"Conviction tier" },
   { key:"rs",     label:"RS",    max:10,   title:"Relative strength score" },
   { key:"volume", label:"Volume", max:15,  title:"Conviction volume score" },
   { key:"trend",  label:"Trend", max:25,   title:"Trend score" },
@@ -196,6 +201,7 @@ const CONVICTION_DISPLAY = [
 ];
 
 function convictionMetricColor(key, value, t) {
+  if (key === "tier") return { A:"#16a34a", B:"#22c55e", C:"#d97706", D:t.textSub }[value] || t.textFaint;
   if (!Number.isFinite(value)) return t.textFaint;
   if (key === "rank") return value <= 100 ? "#16a34a" : value <= 300 ? "#d97706" : t.textSub;
   const strong = { rs:8, volume:12, trend:20, base:50 }[key];
@@ -206,18 +212,21 @@ function convictionMetricColor(key, value, t) {
 function ConvictionStrip({ metrics, t }) {
   if (!hasConvictionMetrics(metrics)) return null;
   return (
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(5,minmax(0,1fr))",
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(6,minmax(0,1fr))",
       borderTop:`1px solid ${t.border}`, marginTop:9, paddingTop:8, minHeight:34 }}>
       {CONVICTION_DISPLAY.map(({ key, label, max, title }) => {
         const value = metrics[key];
-        const shown = Number.isFinite(value) ? (Number.isInteger(value) ? value : value.toFixed(1)) : "—";
+        const available = key === "tier" ? /^[ABCD]$/.test(value || "") : Number.isFinite(value);
+        const shown = available
+          ? (key === "tier" ? value : (Number.isInteger(value) ? value : value.toFixed(1)))
+          : "—";
         return (
           <div key={key} title={title} style={{ textAlign:"center", minWidth:0, padding:"0 2px" }}>
             <div style={{ color:t.textMuted, fontSize:8, fontWeight:700, textTransform:"uppercase",
               whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", letterSpacing:0 }}>{label}</div>
             <div style={{ color:convictionMetricColor(key, value, t), fontFamily:"monospace",
               fontSize:11, fontWeight:900, lineHeight:1.4, whiteSpace:"nowrap" }}>
-              {key === "rank" && Number.isFinite(value) ? "#" : ""}{shown}{max && Number.isFinite(value) ? `/${max}` : ""}
+              {key === "rank" && available ? "#" : ""}{shown}{max && available ? `/${max}` : ""}
             </div>
           </div>
         );
@@ -474,28 +483,37 @@ function StockCard({ stock, onClick, t, isDark }) {
 }
 
 // ─── STOCK LIST VIEW ──────────────────────────────────────────────────────────
-const SIG_FILTERS = ["All","Inside Day","Inside Value","Confluence","Tight CR"];
+const SIG_FILTERS = ["All","Inside Day","Inside Value","Confluence","Tight CR","Tier A","Tier B","Tier C","Tier D"];
+const SORT_OPTIONS = [
+  ["smart", "Smart Priority"],
+  ["setup", "Setup Score"],
+  ["rank", "Conviction Rank"],
+  ["trend", "Trend Strength"],
+];
 
 function StockListView({ stocks, t, isDark }) {
   const [search,    setSearch]    = useState("");
   const [sigFilter, setSigFilter] = useState("All");
   const [minScore,  setMinScore]  = useState(0);
+  const [sortMode,  setSortMode]  = useState("smart");
   const [selected,  setSelected]  = useState(null);
   const [page,      setPage]      = useState(1);
 
-  useEffect(() => { setPage(1); }, [search, sigFilter, minScore]);
+  useEffect(() => { setPage(1); }, [search, sigFilter, minScore, sortMode]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
+    const tierFilter = sigFilter.startsWith("Tier ") ? sigFilter.slice(-1) : null;
     return stocks.filter(s => {
       if (q && !s.sym.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) return false;
       if (sigFilter==="Inside Day"  && !s.signals?.insideDay)  return false;
       if (sigFilter==="Inside Value"&& !s.signals?.insideVal)  return false;
       if (sigFilter==="Confluence"  && !s.signals?.confluence) return false;
       if (sigFilter==="Tight CR"    && !(s.signals?.tightDCR||s.signals?.tightWCR||s.signals?.tightMCR)) return false;
+      if (tierFilter && s.conviction?.tier !== tierFilter) return false;
       return s.score >= minScore;
-    });
-  }, [stocks, search, sigFilter, minScore]);
+    }).sort((a,b) => compareStocks(a, b, sortMode));
+  }, [stocks, search, sigFilter, minScore, sortMode]);
 
   const visible = filtered.slice(0, page * PAGE_SIZE);
   const hasMore = visible.length < filtered.length;
@@ -522,11 +540,19 @@ function StockListView({ stocks, t, isDark }) {
         ))}
       </div>
 
-      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14 }}>
-        <span style={{ fontSize:11, color:t.textMuted, whiteSpace:"nowrap" }}>Min score:</span>
-        <input type="range" min={0} max={100} step={5} value={minScore}
-          onChange={e=>setMinScore(+e.target.value)} style={{ flex:1, accentColor:t.accent }} />
-        <span style={{ fontSize:12, color:t.accent, fontFamily:"monospace", fontWeight:700, minWidth:26 }}>{minScore}</span>
+      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14, flexWrap:"wrap" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, flex:"1 1 210px", minWidth:190 }}>
+          <span style={{ fontSize:11, color:t.textMuted, whiteSpace:"nowrap" }}>Min score:</span>
+          <input type="range" min={0} max={100} step={5} value={minScore}
+            onChange={e=>setMinScore(+e.target.value)} style={{ flex:1, accentColor:t.accent, minWidth:80 }} />
+          <span style={{ fontSize:12, color:t.accent, fontFamily:"monospace", fontWeight:700, minWidth:26 }}>{minScore}</span>
+        </div>
+        <select aria-label="Sort stocks" value={sortMode} onChange={e=>setSortMode(e.target.value)}
+          style={{ width:150, height:34, boxSizing:"border-box", background:t.inputBg,
+            border:`1px solid ${t.border}`, borderRadius:7, color:t.textSub,
+            fontFamily:"inherit", fontSize:11, fontWeight:700, padding:"0 8px", outline:"none" }}>
+          {SORT_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
         <span style={{ fontSize:11, color:t.textMuted, whiteSpace:"nowrap" }}>· {filtered.length} stocks</span>
       </div>
 
@@ -634,6 +660,7 @@ export default function App() {
   const mobile       = useIsMobile();
   const [isDark,     setIsDark]     = useState(true);
   const [stocks,     setStocks]     = useState(null);
+  const [sourceErrors,setSourceErrors]= useState(0);
   const [lastUpdated,setLastUpdated]= useState(null);
   const [error,      setError]      = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -651,7 +678,12 @@ export default function App() {
       Papa.parse(text, {
         header: true, dynamicTyping: true, skipEmptyLines: true,
         complete: results => {
-          try { setStocks(parseData(results.data)); setLastUpdated(Date.now()); }
+          try {
+            const parsed = parseData(results.data);
+            setStocks(parsed.stocks);
+            setSourceErrors(parsed.sourceErrors);
+            setLastUpdated(Date.now());
+          }
           catch(e) { setError(e.message); }
           setRefreshing(false);
         },
@@ -726,6 +758,7 @@ export default function App() {
             <div style={{ fontSize:10, color:t.textMuted, marginTop:3, display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
               <span style={{ color:t.liveColor }}>● LIVE</span>
               <span>· {stocks.length} stocks</span>
+              {sourceErrors > 0 && <span style={{ color:"#d97706" }}>· {sourceErrors} data issues hidden</span>}
               {lastUpdated && <span>· {timeAgo(lastUpdated)}</span>}
               {refreshing  && <span style={{ color:t.accentSub }}>· Refreshing…</span>}
             </div>

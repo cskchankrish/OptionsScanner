@@ -8,7 +8,8 @@ A React app built with Vite that:
 - Fetches your Google Sheets data (published as CSV)
 - Scores 200+ F&O stocks based on Inside Day, Inside Value, Confluence Pivots, and Compression Ratio signals
 - Auto-refreshes every 15 minutes
-- Shows nightly Swing Scanner Rank, RS, Volume, Trend, and Base scores when present
+- Shows nightly Swing Scanner Tier, Rank, RS, Volume, Trend, and Base scores when present
+- Prioritizes Inside Day/Inside Value stocks confirmed by strong Tier, Trend, or Rank
 - Has light/dark theme toggle
 - Works on mobile and desktop
 
@@ -68,9 +69,10 @@ To use a different sheet:
 
 ## Conviction metrics
 
-The card footer reads five optional columns from the same published worksheet:
+The card footer reads six optional columns from the same published worksheet:
 
 - `Conviction Rank`
+- `Conviction Tier`
 - `Conviction RS`
 - `Conviction Volume`
 - `Conviction Trend`
@@ -80,6 +82,12 @@ The `nse-swing-scanner` nightly workflow appends and refreshes these columns by
 matching `NSE Symbol`. Missing values remain blank and the card footer stays
 hidden, so the dashboard remains compatible while the sheet integration is
 being configured.
+
+Tier buttons filter A/B/C/D names. The default Smart Priority order promotes
+Inside Day and Inside Value stocks with strong Conviction confirmation; Setup
+Score, Conviction Rank, and Trend remain available as explicit sort choices.
+Rows containing malformed source responses or unusable trade levels are hidden
+and counted in the live-status line instead of rendering as trade cards.
 
 ## Sharing with friends
 

@@ -1,5 +1,6 @@
 const COLUMN_NAMES = {
   rank: "Conviction Rank",
+  tier: "Conviction Tier",
   rs: "Conviction RS",
   volume: "Conviction Volume",
   trend: "Conviction Trend",
@@ -13,11 +14,18 @@ function optionalNumber(value) {
 }
 
 export function readConvictionMetrics(row) {
-  return Object.fromEntries(
-    Object.entries(COLUMN_NAMES).map(([key, column]) => [key, optionalNumber(row[column])]),
-  );
+  const tier = String(row[COLUMN_NAMES.tier] ?? "").trim().toUpperCase();
+  return {
+    rank: optionalNumber(row[COLUMN_NAMES.rank]),
+    tier: /^[ABCD]$/.test(tier) ? tier : null,
+    rs: optionalNumber(row[COLUMN_NAMES.rs]),
+    volume: optionalNumber(row[COLUMN_NAMES.volume]),
+    trend: optionalNumber(row[COLUMN_NAMES.trend]),
+    base: optionalNumber(row[COLUMN_NAMES.base]),
+  };
 }
 
 export function hasConvictionMetrics(metrics) {
-  return Object.values(metrics || {}).some(Number.isFinite);
+  return /^[ABCD]$/.test(metrics?.tier || "") ||
+    Object.entries(metrics || {}).some(([key, value]) => key !== "tier" && Number.isFinite(value));
 }
