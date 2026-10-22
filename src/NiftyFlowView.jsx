@@ -9,6 +9,28 @@ function formatLots(n) {
   return `${sign}${abs.toLocaleString("en-IN")}`;
 }
 
+function getMarketSessionStatus() {
+  const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const day = nowIst.getDay(); // 0 = Sunday, 6 = Saturday
+  const isWeekend = day === 0 || day === 6;
+  const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
+
+  // Active market auto-refresh window: 09:00 AM (540 mins) to 04:00 PM (960 mins) IST
+  const isWithinHours = mins >= 540 && mins < 960;
+  const isAutoActive = !isWeekend && isWithinHours;
+
+  let reason = "";
+  if (isWeekend) {
+    reason = "Weekend · Resumes Mon 09:00 AM";
+  } else if (mins < 540) {
+    reason = "Pre-market · Resumes 09:00 AM";
+  } else if (mins >= 960) {
+    reason = "Market Closed · Resumes 09:00 AM";
+  }
+
+  return { isAutoActive, reason };
+}
+
 function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
@@ -534,6 +556,15 @@ export function NiftyFlowView({ t, isDark }) {
   const [selectedDayIdx, setSelectedDayIdx] = useState(0);
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
+  const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
+
+  // Check market status every 5 seconds so live transitions (09:00 AM or 04:00 PM) reflect immediately
+  useEffect(() => {
+    const statusTimer = setInterval(() => {
+      setMarketStatus(getMarketSessionStatus());
+    }, 5000);
+    return () => clearInterval(statusTimer);
+  }, []);
 
   const changeInterval = (sec) => {
     setRefreshIntervalSec(sec);
@@ -595,8 +626,10 @@ export function NiftyFlowView({ t, isDark }) {
     loadAll();
   }, []);
 
-  // Live 1-second interval to tick down and auto-refresh at 0
+  // Live 1-second interval to tick down and auto-refresh at 0 (ACTIVE ONLY 09:00 AM to 04:00 PM IST)
   useEffect(() => {
+    if (!marketStatus.isAutoActive) return;
+
     const timer = setInterval(() => {
       setCountdown(prev => {
         if (prev <= 1) {
@@ -607,7 +640,7 @@ export function NiftyFlowView({ t, isDark }) {
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [refreshIntervalSec]);
+  }, [marketStatus.isAutoActive, refreshIntervalSec]);
 
   const maxBarVal = useMemo(() => {
     if (!oiData?.strikes?.length) return 100000;
@@ -669,44 +702,61 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            {/* INTERVAL SELECTOR */}
-            <div style={{
-              display: "flex", alignItems: "center", gap: 3,
-              background: isDark ? "#0f172a" : "#f1f5f9",
-              padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
-            }}>
-              <span style={{ fontSize: 10, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Auto:</span>
-              {[
-                { label: "1 min", sec: 60 },
-                { label: "2 min", sec: 120 },
-                { label: "5 min", sec: 300 },
-              ].map(opt => (
-                <button
-                  key={opt.sec}
-                  onClick={() => changeInterval(opt.sec)}
-                  style={{
-                    background: refreshIntervalSec === opt.sec ? t.accent : "transparent",
-                    color: refreshIntervalSec === opt.sec ? "#fff" : t.textMuted,
-                    border: "none",
-                    borderRadius: 4, padding: "3px 7px",
-                    fontSize: 10, fontWeight: 800, cursor: "pointer"
-                  }}>
-                  {opt.label}
-                </button>
-              ))}
-            </div>
+            {/* INTERVAL SELECTOR (ACTIVE ONLY DURING MARKET WINDOW 09:00 - 16:00 IST) */}
+            {marketStatus.isAutoActive && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 3,
+                background: isDark ? "#0f172a" : "#f1f5f9",
+                padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
+              }}>
+                <span style={{ fontSize: 10, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Auto:</span>
+                {[
+                  { label: "1 min", sec: 60 },
+                  { label: "2 min", sec: 120 },
+                  { label: "5 min", sec: 300 },
+                ].map(opt => (
+                  <button
+                    key={opt.sec}
+                    onClick={() => changeInterval(opt.sec)}
+                    style={{
+                      background: refreshIntervalSec === opt.sec ? t.accent : "transparent",
+                      color: refreshIntervalSec === opt.sec ? "#fff" : t.textMuted,
+                      border: "none",
+                      borderRadius: 4, padding: "3px 7px",
+                      fontSize: 10, fontWeight: 800, cursor: "pointer"
+                    }}>
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            )}
 
-            <div style={{
-              display: "flex", alignItems: "center", gap: 6,
-              fontSize: 11, color: t.textMuted,
-              background: isDark ? "#0f172a" : "#f1f5f9",
-              padding: "5px 9px", borderRadius: 6,
-              border: `1px solid ${t.border}`,
-              fontFamily: "monospace"
-            }}>
-              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#22c55e" }} />
-              {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, "0")}
-            </div>
+            {/* COUNTDOWN OR PAUSED STATUS BADGE */}
+            {marketStatus.isAutoActive ? (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6,
+                fontSize: 11, color: t.textMuted,
+                background: isDark ? "#0f172a" : "#f1f5f9",
+                padding: "5px 9px", borderRadius: 6,
+                border: `1px solid ${t.border}`,
+                fontFamily: "monospace"
+              }}>
+                <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#22c55e" }} />
+                {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, "0")}
+              </div>
+            ) : (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6,
+                fontSize: 11, color: isDark ? "#fbbf24" : "#b45309",
+                background: isDark ? "#291e05" : "#fefce8",
+                padding: "5px 10px", borderRadius: 6,
+                border: `1px solid ${isDark ? "#78350f" : "#fef08a"}`,
+                fontFamily: "monospace", fontWeight: 700
+              }}>
+                <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#f59e0b" }} />
+                ⏸️ {marketStatus.reason}
+              </div>
+            )}
 
             <button onClick={loadAll} disabled={refreshing} style={{
               background: t.accentBg, border: `1px solid ${t.accent}`,

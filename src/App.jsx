@@ -759,7 +759,15 @@ export default function App() {
 
   useEffect(() => {
     fetchLive();
-    const id = setInterval(fetchLive, REFRESH_MS);
+    const id = setInterval(() => {
+      const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+      const day = nowIst.getDay();
+      const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
+      // Auto-refresh only during trading days between 09:00 AM and 04:00 PM IST
+      if (day !== 0 && day !== 6 && mins >= 540 && mins < 960) {
+        fetchLive();
+      }
+    }, REFRESH_MS);
     return () => clearInterval(id);
   }, [fetchLive]);
 
