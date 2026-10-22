@@ -3,6 +3,7 @@ import Papa from "papaparse";
 import { hasConvictionMetrics, readConvictionMetrics } from "./convictionMetrics.js";
 import { isTradableSourceRow } from "./sourceHealth.js";
 import { compareStocks } from "./stockSort.js";
+import { NiftyFlowView } from "./NiftyFlowView.jsx";
 
 // ─── LIVE GOOGLE SHEETS LINK ──────────────────────────────────────────────────
 const CSV_URL    = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
@@ -801,6 +802,7 @@ export default function App() {
   const TABS = [
     { id:"setups", label:`🎯 All (${stocks.length})` },
     { id:"top",    label:`⭐ Top (${topPicks.length})` },
+    { id:"nifty",  label:"📊 Nifty Flow & Argon" },
     { id:"guide",  label:"📐 Scoring" },
   ];
 
@@ -864,6 +866,7 @@ export default function App() {
       {/* CONTENT */}
       {activeTab==="setups" && <StockListView stocks={stocks} t={t} isDark={isDark} />}
       {activeTab==="top"    && <StockListView stocks={topPicks} t={t} isDark={isDark} />}
+      {activeTab==="nifty"  && <NiftyFlowView t={t} isDark={isDark} />}
       {activeTab==="guide"  && <ScoringGuide t={t} />}
     </div>
   );
