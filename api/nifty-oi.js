@@ -64,9 +64,9 @@ function buildTimeline(totPut, totCall, spot) {
     }
   }
 
-  // Append or update latest live tick
+  // Append or update latest live tick (1-min granularity)
   const last = intradayHistory[intradayHistory.length - 1];
-  if (!last || last.minutes < capMins - 2) {
+  if (!last || last.minutes < capMins || (last.time !== nowStr && Math.abs(totPut - last.putWriting) > 200)) {
     intradayHistory.push({
       time: nowStr,
       minutes: capMins,
@@ -98,10 +98,10 @@ function formatLots(n) {
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET");
-  res.setHeader("Cache-Control", "s-maxage=60, stale-while-revalidate=120");
+  res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=60");
 
   const now = Date.now();
-  if (cache.data && now - cache.timestamp < 60000) {
+  if (cache.data && now - cache.timestamp < 30000) {
     return res.status(200).json(cache.data);
   }
 

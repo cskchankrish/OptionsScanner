@@ -532,7 +532,13 @@ export function NiftyFlowView({ t, isDark }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedDayIdx, setSelectedDayIdx] = useState(0);
-  const [countdown, setCountdown] = useState(300); // 5-minute countdown in seconds
+  const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
+  const [countdown, setCountdown] = useState(60);
+
+  const changeInterval = (sec) => {
+    setRefreshIntervalSec(sec);
+    setCountdown(sec);
+  };
 
   const fetchNiftyOi = async () => {
     try {
@@ -580,7 +586,7 @@ export function NiftyFlowView({ t, isDark }) {
   const loadAll = async () => {
     setRefreshing(true);
     await Promise.all([fetchNiftyOi(), fetchArgon()]);
-    setCountdown(300);
+    setCountdown(refreshIntervalSec);
     setRefreshing(false);
     setLoading(false);
   };
@@ -595,13 +601,13 @@ export function NiftyFlowView({ t, isDark }) {
       setCountdown(prev => {
         if (prev <= 1) {
           fetchNiftyOi();
-          return 300;
+          return refreshIntervalSec;
         }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [refreshIntervalSec]);
 
   const maxBarVal = useMemo(() => {
     if (!oiData?.strikes?.length) return 100000;
@@ -644,7 +650,7 @@ export function NiftyFlowView({ t, isDark }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 18, fontWeight: 900, color: t.text }}>⚡ NIFTY 5-MIN OI CONSOLIDATOR</span>
+              <span style={{ fontSize: 18, fontWeight: 900, color: t.text }}>⚡ NIFTY LIVE OI CONSOLIDATOR</span>
               <span style={{
                 background: isSupportHeavier ? (isDark ? "#052e16" : "#dcfce7") : isResistanceHeavier ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#1e293b" : "#f1f5f9"),
                 color: isSupportHeavier ? "#16a34a" : isResistanceHeavier ? "#ef4444" : "#d97706",
@@ -663,6 +669,33 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {/* INTERVAL SELECTOR */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 3,
+              background: isDark ? "#0f172a" : "#f1f5f9",
+              padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
+            }}>
+              <span style={{ fontSize: 10, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Auto:</span>
+              {[
+                { label: "1 min", sec: 60 },
+                { label: "2 min", sec: 120 },
+                { label: "5 min", sec: 300 },
+              ].map(opt => (
+                <button
+                  key={opt.sec}
+                  onClick={() => changeInterval(opt.sec)}
+                  style={{
+                    background: refreshIntervalSec === opt.sec ? t.accent : "transparent",
+                    color: refreshIntervalSec === opt.sec ? "#fff" : t.textMuted,
+                    border: "none",
+                    borderRadius: 4, padding: "3px 7px",
+                    fontSize: 10, fontWeight: 800, cursor: "pointer"
+                  }}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
             <div style={{
               display: "flex", alignItems: "center", gap: 6,
               fontSize: 11, color: t.textMuted,
@@ -672,7 +705,7 @@ export function NiftyFlowView({ t, isDark }) {
               fontFamily: "monospace"
             }}>
               <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#22c55e" }} />
-              Auto {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, "0")}
+              {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, "0")}
             </div>
 
             <button onClick={loadAll} disabled={refreshing} style={{
