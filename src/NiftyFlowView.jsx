@@ -15,6 +15,7 @@ export function NiftyFlowView({ t, isDark }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedDayIdx, setSelectedDayIdx] = useState(0);
+  const [countdown, setCountdown] = useState(300); // 5-minute countdown in seconds
 
   const fetchNiftyOi = async () => {
     try {
@@ -48,14 +49,27 @@ export function NiftyFlowView({ t, isDark }) {
   const loadAll = async () => {
     setRefreshing(true);
     await Promise.all([fetchNiftyOi(), fetchArgon()]);
+    setCountdown(300);
     setRefreshing(false);
     setLoading(false);
   };
 
   useEffect(() => {
     loadAll();
-    const interval = setInterval(fetchNiftyOi, 5 * 60 * 1000); // Auto-refresh OI every 5 mins
-    return () => clearInterval(interval);
+  }, []);
+
+  // Live 1-second interval to tick down and auto-refresh at 0
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) {
+          fetchNiftyOi();
+          return 300;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
   }, []);
 
   const maxBarVal = useMemo(() => {
@@ -117,13 +131,27 @@ export function NiftyFlowView({ t, isDark }) {
             </div>
           </div>
 
-          <button onClick={loadAll} disabled={refreshing} style={{
-            background: t.accentBg, border: `1px solid ${t.accent}`,
-            color: t.accentSub, borderRadius: 8, padding: "7px 12px",
-            fontSize: 12, fontWeight: 700, cursor: refreshing ? "default" : "pointer"
-          }}>
-            {refreshing ? "Refreshing…" : "🔄 Refresh 5m OI"}
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <div style={{
+              display: "flex", alignItems: "center", gap: 6,
+              fontSize: 11, color: t.textMuted,
+              background: isDark ? "#0f172a" : "#f1f5f9",
+              padding: "5px 9px", borderRadius: 6,
+              border: `1px solid ${t.border}`,
+              fontFamily: "monospace"
+            }}>
+              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#22c55e" }} />
+              Auto {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, "0")}
+            </div>
+
+            <button onClick={loadAll} disabled={refreshing} style={{
+              background: t.accentBg, border: `1px solid ${t.accent}`,
+              color: t.accentSub, borderRadius: 8, padding: "7px 12px",
+              fontSize: 12, fontWeight: 700, cursor: refreshing ? "default" : "pointer"
+            }}>
+              {refreshing ? "Refreshing…" : "🔄 Refresh Now"}
+            </button>
+          </div>
         </div>
 
         {/* METRICS ROW */}
