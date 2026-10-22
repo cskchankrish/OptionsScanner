@@ -9,6 +9,439 @@ function formatLots(n) {
   return `${sign}${abs.toLocaleString("en-IN")}`;
 }
 
+function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
+  const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
+  const [hoverIdx, setHoverIdx] = useState(null);
+
+  // Fallback points if empty
+  const points = useMemo(() => {
+    if (timeline && timeline.length > 0) return timeline;
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot },
+      { time: "10:00", minutes: 600, putWriting: 45000, callWriting: 25000, netDiff: 20000, spot },
+      { time: "11:30", minutes: 690, putWriting: 140000, callWriting: 80000, netDiff: 60000, spot },
+      { time: "13:30", minutes: 810, putWriting: 279500, callWriting: 157500, netDiff: 122000, spot },
+    ];
+  }, [timeline, spot]);
+
+  // SVG dimensions
+  const svgWidth = 850;
+  const svgHeight = 220;
+  const padLeft = 65;
+  const padRight = 35;
+  const padTop = 30;
+  const padBottom = 35;
+  const plotW = svgWidth - padLeft - padRight;
+  const plotH = svgHeight - padTop - padBottom;
+
+  const startMin = 555; // 09:15
+  const endMin = 930;   // 15:30
+  const spanMin = endMin - startMin; // 375
+
+  const xPos = (m) => padLeft + ((Math.max(startMin, Math.min(endMin, m)) - startMin) / spanMin) * plotW;
+
+  // Max diff bound symmetric around 0
+  const maxDiff = useMemo(() => {
+    let max = 50000;
+    points.forEach(p => {
+      max = Math.max(max, Math.abs(p.netDiff || 0));
+    });
+    return Math.ceil((max * 1.15) / 10000) * 10000;
+  }, [points]);
+
+  // Max dual bound
+  const maxDual = useMemo(() => {
+    let max = 50000;
+    points.forEach(p => {
+      max = Math.max(max, p.putWriting || 0, p.callWriting || 0);
+    });
+    return Math.ceil((max * 1.15) / 10000) * 10000;
+  }, [points]);
+
+  const yCenter = padTop + plotH / 2;
+  const yDiffPos = (d) => yCenter - (d / maxDiff) * (plotH / 2);
+  const yDualPos = (v) => padTop + plotH - (v / maxDual) * plotH;
+
+  // Path generators
+  const diffLinePath = useMemo(() => {
+    if (!points.length) return "";
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDiffPos(p.netDiff)}`).join(" ");
+  }, [points, maxDiff]);
+
+  const diffAreaPath = useMemo(() => {
+    if (!points.length) return "";
+    const firstX = xPos(points[0].minutes);
+    const lastX = xPos(points[points.length - 1].minutes);
+    const line = points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDiffPos(p.netDiff)}`).join(" ");
+    return `${line} L ${lastX} ${yCenter} L ${firstX} ${yCenter} Z`;
+  }, [points, maxDiff]);
+
+  const putLinePath = useMemo(() => {
+    if (!points.length) return "";
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDualPos(p.putWriting)}`).join(" ");
+  }, [points, maxDual]);
+
+  const callLinePath = useMemo(() => {
+    if (!points.length) return "";
+    return points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDualPos(p.callWriting)}`).join(" ");
+  }, [points, maxDual]);
+
+  const putAreaPath = useMemo(() => {
+    if (!points.length) return "";
+    const firstX = xPos(points[0].minutes);
+    const lastX = xPos(points[points.length - 1].minutes);
+    const bottomY = padTop + plotH;
+    const line = points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDualPos(p.putWriting)}`).join(" ");
+    return `${line} L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
+  }, [points, maxDual]);
+
+  const callAreaPath = useMemo(() => {
+    if (!points.length) return "";
+    const firstX = xPos(points[0].minutes);
+    const lastX = xPos(points[points.length - 1].minutes);
+    const bottomY = padTop + plotH;
+    const line = points.map((p, i) => `${i === 0 ? "M" : "L"} ${xPos(p.minutes)} ${yDualPos(p.callWriting)}`).join(" ");
+    return `${line} L ${lastX} ${bottomY} L ${firstX} ${bottomY} Z`;
+  }, [points, maxDual]);
+
+  // Hourly grid points
+  const timeLabels = [
+    { label: "09:15", min: 555 },
+    { label: "10:00", min: 600 },
+    { label: "11:00", min: 660 },
+    { label: "12:00", min: 720 },
+    { label: "13:00", min: 780 },
+    { label: "14:00", min: 840 },
+    { label: "15:00", min: 900 },
+    { label: "15:30", min: 930 },
+  ];
+
+  const latestPoint = points[points.length - 1];
+  const hovered = hoverIdx !== null && points[hoverIdx] ? points[hoverIdx] : latestPoint;
+
+  const handleMouseMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * svgWidth;
+    let closestIdx = 0;
+    let minDistance = Infinity;
+    points.forEach((p, idx) => {
+      const dist = Math.abs(xPos(p.minutes) - mouseX);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestIdx = idx;
+      }
+    });
+    setHoverIdx(closestIdx);
+  };
+
+  const isNetBullish = (hovered?.netDiff || 0) >= 0;
+
+  return (
+    <div style={{
+      background: t.surface,
+      border: `1.5px solid ${t.border}`,
+      borderRadius: 12,
+      padding: "16px 18px",
+      marginBottom: 16,
+      boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
+    }}>
+      {/* HEADER & VIEW TOGGLES */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 15, fontWeight: 900, color: t.text }}>
+              📈 INTRADAY CALL vs PUT &amp; ΔOI LINE GRAPH
+            </span>
+            <span style={{
+              fontSize: 10,
+              fontWeight: 800,
+              padding: "2px 8px",
+              borderRadius: 6,
+              background: isNetBullish ? (isDark ? "#052e16" : "#dcfce7") : (isDark ? "#2d0a0a" : "#fee2e2"),
+              color: isNetBullish ? "#16a34a" : "#ef4444",
+              border: `1px solid ${isNetBullish ? "#16a34a44" : "#ef444444"}`
+            }}>
+              {isNetBullish ? "🟢 PUT WRITING LEADING (BULLISH)" : "🔴 CALL WRITING LEADING (BEARISH)"}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: t.textMuted, marginTop: 2 }}>
+            Market Open (09:15) to Market Close (15:30) · Tracks cumulative institutional writing pressure
+          </div>
+        </div>
+
+        {/* TOGGLE */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
+            <button
+              onClick={() => setMode("diff")}
+              style={{
+                background: mode === "diff" ? t.accent : "transparent",
+                color: mode === "diff" ? "#fff" : t.textMuted,
+                border: "none", borderRadius: 6, padding: "5px 10px",
+                fontSize: 11, fontWeight: 800, cursor: "pointer"
+              }}>
+              ⚡ Net Diff (Put - Call)
+            </button>
+            <button
+              onClick={() => setMode("dual")}
+              style={{
+                background: mode === "dual" ? t.accent : "transparent",
+                color: mode === "dual" ? "#fff" : t.textMuted,
+                border: "none", borderRadius: 6, padding: "5px 10px",
+                fontSize: 11, fontWeight: 800, cursor: "pointer"
+              }}>
+              📊 Put vs Call (Dual Lines)
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* SVG CHART CONTAINER */}
+      <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
+        <svg
+          viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+          style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair" }}
+          onMouseMove={handleMouseMove}
+          onMouseLeave={() => setHoverIdx(null)}
+        >
+          <defs>
+            {/* Diff area gradient */}
+            <linearGradient id="diffGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.4" />
+              <stop offset="50%" stopColor="#22c55e" stopOpacity="0.05" />
+              <stop offset="50%" stopColor="#ef4444" stopOpacity="0.05" />
+              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.4" />
+            </linearGradient>
+
+            {/* Put Area Gradient */}
+            <linearGradient id="putGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#22c55e" stopOpacity="0.02" />
+            </linearGradient>
+
+            {/* Call Area Gradient */}
+            <linearGradient id="callGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#ef4444" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+
+          {/* BACKGROUND GRID LINES & TIME LABELS */}
+          {timeLabels.map((tl, i) => {
+            const x = xPos(tl.min);
+            return (
+              <g key={tl.label}>
+                <line
+                  x1={x} y1={padTop}
+                  x2={x} y2={padTop + plotH}
+                  stroke={isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"}
+                  strokeDasharray="3 3"
+                />
+                <text
+                  x={x}
+                  y={padTop + plotH + 18}
+                  fill={t.textMuted}
+                  fontSize="10"
+                  fontFamily="monospace"
+                  textAnchor={i === 0 ? "start" : i === timeLabels.length - 1 ? "end" : "middle"}
+                >
+                  {tl.label}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* NET DIFFERENCE MODE */}
+          {mode === "diff" && (
+            <>
+              {/* ZERO BASELINE */}
+              <line
+                x1={padLeft} y1={yCenter}
+                x2={padLeft + plotW} y2={yCenter}
+                stroke={isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.25)"}
+                strokeWidth="1.5"
+                strokeDasharray="4 4"
+              />
+              <text x={padLeft - 6} y={yCenter + 3} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+                0 Neutral
+              </text>
+              <text x={padLeft - 6} y={padTop + 10} fill="#16a34a" fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
+                +{formatLots(maxDiff)}
+              </text>
+              <text x={padLeft - 6} y={padTop + plotH} fill="#ef4444" fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
+                -{formatLots(maxDiff)}
+              </text>
+
+              {/* AREA FILL */}
+              <path d={diffAreaPath} fill="url(#diffGrad)" />
+
+              {/* MAIN NET LINE */}
+              <path d={diffLinePath} fill="none" stroke="#38bdf8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+
+              {/* POINTS */}
+              {points.map((p, idx) => (
+                <circle
+                  key={idx}
+                  cx={xPos(p.minutes)}
+                  cy={yDiffPos(p.netDiff)}
+                  r={idx === points.length - 1 ? 4.5 : 2.5}
+                  fill={p.netDiff >= 0 ? "#22c55e" : "#ef4444"}
+                  stroke={isDark ? "#080f1a" : "#fff"}
+                  strokeWidth="1.5"
+                />
+              ))}
+            </>
+          )}
+
+          {/* DUAL MODE: PUT VS CALL SEPARATE CURVES */}
+          {mode === "dual" && (
+            <>
+              {/* HORIZONTAL ZERO AT BOTTOM */}
+              <line
+                x1={padLeft} y1={padTop + plotH}
+                x2={padLeft + plotW} y2={padTop + plotH}
+                stroke={isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)"}
+                strokeWidth="1"
+              />
+              <text x={padLeft - 6} y={padTop + plotH} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+                0
+              </text>
+              <text x={padLeft - 6} y={padTop + plotH / 2} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+                {formatLots(maxDual / 2)}
+              </text>
+              <text x={padLeft - 6} y={padTop + 10} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
+                {formatLots(maxDual)}
+              </text>
+
+              {/* AREA FILLS */}
+              <path d={putAreaPath} fill="url(#putGrad)" />
+              <path d={callAreaPath} fill="url(#callGrad)" />
+
+              {/* PUT LINE (GREEN) */}
+              <path d={putLinePath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+
+              {/* CALL LINE (RED) */}
+              <path d={callLinePath} fill="none" stroke="#ef4444" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+
+              {/* POINTS */}
+              {points.map((p, idx) => (
+                <g key={idx}>
+                  <circle
+                    cx={xPos(p.minutes)}
+                    cy={yDualPos(p.putWriting)}
+                    r={idx === points.length - 1 ? 4 : 2}
+                    fill="#22c55e"
+                    stroke={isDark ? "#080f1a" : "#fff"}
+                    strokeWidth="1"
+                  />
+                  <circle
+                    cx={xPos(p.minutes)}
+                    cy={yDualPos(p.callWriting)}
+                    r={idx === points.length - 1 ? 4 : 2}
+                    fill="#ef4444"
+                    stroke={isDark ? "#080f1a" : "#fff"}
+                    strokeWidth="1"
+                  />
+                </g>
+              ))}
+            </>
+          )}
+
+          {/* HOVER CROSSHAIR */}
+          {hovered && (
+            <g>
+              <line
+                x1={xPos(hovered.minutes)}
+                y1={padTop}
+                x2={xPos(hovered.minutes)}
+                y2={padTop + plotH}
+                stroke={isDark ? "#38bdf8" : "#0284c7"}
+                strokeWidth="1.5"
+                strokeDasharray="2 2"
+              />
+              {mode === "diff" ? (
+                <circle
+                  cx={xPos(hovered.minutes)}
+                  cy={yDiffPos(hovered.netDiff)}
+                  r="6"
+                  fill="#38bdf8"
+                  stroke="#fff"
+                  strokeWidth="2"
+                />
+              ) : (
+                <>
+                  <circle
+                    cx={xPos(hovered.minutes)}
+                    cy={yDualPos(hovered.putWriting)}
+                    r="5"
+                    fill="#22c55e"
+                    stroke="#fff"
+                    strokeWidth="1.5"
+                  />
+                  <circle
+                    cx={xPos(hovered.minutes)}
+                    cy={yDualPos(hovered.callWriting)}
+                    r="5"
+                    fill="#ef4444"
+                    stroke="#fff"
+                    strokeWidth="1.5"
+                  />
+                </>
+              )}
+            </g>
+          )}
+        </svg>
+      </div>
+
+      {/* HOVER TOOLTIP & CURRENT STATUS BAR */}
+      <div style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: 10,
+        padding: "8px 12px",
+        marginTop: 6,
+        background: isDark ? "#0a1628" : "#f8fafc",
+        borderRadius: 8,
+        border: `1px solid ${t.border}`,
+        fontSize: 11
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span>
+            <strong style={{ color: t.text }}>Time:</strong> <span style={{ fontFamily: "monospace" }}>{hovered?.time || "—"}</span>
+          </span>
+          {hovered?.spot && (
+            <span>
+              <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace" }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
+            </span>
+          )}
+          <span>
+            <strong style={{ color: "#16a34a" }}>Put Writing:</strong> <span style={{ fontFamily: "monospace", color: "#16a34a", fontWeight: 700 }}>+{formatLots(hovered?.putWriting)}</span>
+          </span>
+          <span>
+            <strong style={{ color: "#ef4444" }}>Call Writing:</strong> <span style={{ fontFamily: "monospace", color: "#ef4444", fontWeight: 700 }}>+{formatLots(hovered?.callWriting)}</span>
+          </span>
+          <span>
+            <strong style={{ color: t.text }}>Net ΔOI:</strong>{" "}
+            <span style={{
+              fontFamily: "monospace",
+              fontWeight: 900,
+              color: (hovered?.netDiff || 0) >= 0 ? "#16a34a" : "#ef4444"
+            }}>
+              {(hovered?.netDiff || 0) >= 0 ? "+" : ""}{formatLots(hovered?.netDiff)}
+            </span>
+          </span>
+        </div>
+
+        <div style={{ fontSize: 10.5, color: t.textMuted }}>
+          💡 <strong>Tip:</strong> Hover across graph to trace intraday writing shifts
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function NiftyFlowView({ t, isDark }) {
   const [oiData, setOiData] = useState(null);
   const [argonData, setArgonData] = useState(null);
@@ -22,6 +455,20 @@ export function NiftyFlowView({ t, isDark }) {
       const res = await fetch("/api/nifty-oi");
       if (res.ok) {
         const data = await res.json();
+        // Client-side local persistence across today's session
+        try {
+          const todayKey = `nifty_timeline_${new Date().toISOString().slice(0, 10)}`;
+          const stored = JSON.parse(localStorage.getItem(todayKey) || "[]");
+          const incoming = data.intradayTimeline || [];
+          const map = new Map();
+          incoming.forEach(p => map.set(p.minutes, p));
+          stored.forEach(p => {
+            if (!map.has(p.minutes)) map.set(p.minutes, p);
+          });
+          const merged = Array.from(map.values()).sort((a, b) => a.minutes - b.minutes);
+          localStorage.setItem(todayKey, JSON.stringify(merged));
+          data.intradayTimeline = merged;
+        } catch (_) {}
         setOiData(data);
       }
     } catch (e) {
@@ -190,6 +637,14 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
         </div>
       </div>
+
+      {/* ── INTRADAY NET OI LINE GRAPH (09:15 to 15:30) ── */}
+      <NiftyIntradayLineChart
+        timeline={oiData?.intradayTimeline}
+        spot={spot}
+        isDark={isDark}
+        t={t}
+      />
 
       {/* ── TWO-COLUMN SPLIT: HORIZONTAL CHART (LEFT) & ARGON PREDICTION (RIGHT) ── */}
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", gap: 16, alignItems: "start" }}>

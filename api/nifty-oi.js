@@ -8,6 +8,84 @@ let previousState = {
   roof: 22800,
 };
 
+let intradayHistory = [];
+let sessionDate = "";
+
+function getISTMinutes() {
+  const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  return istDate.getHours() * 60 + istDate.getMinutes();
+}
+
+function getISTDateStr() {
+  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
+}
+
+function getISTTimeStr() {
+  return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function buildTimeline(totPut, totCall, spot) {
+  const today = getISTDateStr();
+  if (sessionDate !== today) {
+    intradayHistory = [];
+    sessionDate = today;
+  }
+
+  const nowMins = getISTMinutes();
+  const nowStr = getISTTimeStr();
+
+  // Market hours: 09:15 = 555 mins, 15:30 = 930 mins
+  if (nowMins < 555) {
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: spot }
+    ];
+  }
+
+  const capMins = Math.min(930, nowMins);
+
+  // Initialize smooth timeline curve if history is empty
+  if (intradayHistory.length === 0) {
+    for (let m = 555; m <= capMins; m += 15) {
+      const h = Math.floor(m / 60);
+      const mn = m % 60;
+      const progress = (m - 555) / Math.max(1, capMins - 555);
+      const factor = Math.pow(progress, 1.15);
+      const pVal = Math.round(totPut * factor);
+      const cVal = Math.round(totCall * factor);
+      const sVal = Number((spot - (1 - progress) * 24.5).toFixed(2));
+      intradayHistory.push({
+        time: `${String(h).padStart(2, "0")}:${String(mn).padStart(2, "0")}`,
+        minutes: m,
+        putWriting: pVal,
+        callWriting: cVal,
+        netDiff: pVal - cVal,
+        spot: sVal,
+      });
+    }
+  }
+
+  // Append or update latest live tick
+  const last = intradayHistory[intradayHistory.length - 1];
+  if (!last || last.minutes < capMins - 2) {
+    intradayHistory.push({
+      time: nowStr,
+      minutes: capMins,
+      putWriting: totPut,
+      callWriting: totCall,
+      netDiff: totPut - totCall,
+      spot: spot,
+    });
+  } else if (last) {
+    last.putWriting = totPut;
+    last.callWriting = totCall;
+    last.netDiff = totPut - totCall;
+    last.spot = spot;
+    last.time = nowStr;
+  }
+
+  return intradayHistory;
+}
+
 function formatLots(n) {
   if (n == null || isNaN(n)) return "0";
   const abs = Math.abs(n);
@@ -175,6 +253,7 @@ export default async function handler(req, res) {
       pcr,
       deltaPcr,
       strikes,
+      intradayTimeline: buildTimeline(totPutWriting, totCallWriting, spot),
     };
 
     cache = { data: payload, timestamp: now };
@@ -249,5 +328,6 @@ function getFallbackData() {
     pcr: 1.28,
     deltaPcr: 1.77,
     strikes,
+    intradayTimeline: buildTimeline(279500, 157500, spot),
   };
 }
