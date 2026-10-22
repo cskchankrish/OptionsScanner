@@ -194,6 +194,7 @@ function StatBox({ label, val, color, t }) {
 const CONVICTION_DISPLAY = [
   { key:"rank",   label:"Rank",  max:null, title:"Conviction rank" },
   { key:"tier",   label:"Tier",  max:null, title:"Conviction tier" },
+  { key:"flow",   label:"Flow",  max:null, title:"Institutional Spurt Flow" },
   { key:"rs",     label:"RS",    max:10,   title:"Relative strength score" },
   { key:"volume", label:"Volume", max:15,  title:"Conviction volume score" },
   { key:"trend",  label:"Trend", max:25,   title:"Trend score" },
@@ -202,6 +203,11 @@ const CONVICTION_DISPLAY = [
 
 function convictionMetricColor(key, value, t) {
   if (key === "tier") return { A:"#16a34a", B:"#22c55e", C:"#d97706", D:t.textSub }[value] || t.textFaint;
+  if (key === "flow") {
+    if (value === "ACCUMULATION") return "#16a34a";
+    if (value === "DISTRIBUTION") return "#ef4444";
+    return t.textFaint;
+  }
   if (!Number.isFinite(value)) return t.textFaint;
   if (key === "rank") return value <= 100 ? "#16a34a" : value <= 300 ? "#d97706" : t.textSub;
   const strong = { rs:8, volume:12, trend:20, base:50 }[key];
@@ -212,14 +218,22 @@ function convictionMetricColor(key, value, t) {
 function ConvictionStrip({ metrics, t }) {
   if (!hasConvictionMetrics(metrics)) return null;
   return (
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(6,minmax(0,1fr))",
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(7,minmax(0,1fr))",
       borderTop:`1px solid ${t.border}`, marginTop:9, paddingTop:8, minHeight:34 }}>
       {CONVICTION_DISPLAY.map(({ key, label, max, title }) => {
         const value = metrics[key];
-        const available = key === "tier" ? /^[ABCD]$/.test(value || "") : Number.isFinite(value);
-        const shown = available
-          ? (key === "tier" ? value : (Number.isInteger(value) ? value : value.toFixed(1)))
-          : "—";
+        let shown = "—";
+        let available = false;
+        if (key === "tier") {
+          available = /^[ABCD]$/.test(value || "");
+          shown = available ? value : "—";
+        } else if (key === "flow") {
+          available = Boolean(value);
+          shown = value === "ACCUMULATION" ? "Acc" : value === "DISTRIBUTION" ? "Dist" : "—";
+        } else {
+          available = Number.isFinite(value);
+          shown = available ? (Number.isInteger(value) ? value : value.toFixed(1)) : "—";
+        }
         return (
           <div key={key} title={title} style={{ textAlign:"center", minWidth:0, padding:"0 2px" }}>
             <div style={{ color:t.textMuted, fontSize:8, fontWeight:700, textTransform:"uppercase",
@@ -411,6 +425,8 @@ function StockCard({ stock, onClick, t, isDark }) {
   const str      = getStrikes(stock);
   const topCombo = stock.appliedCombos?.[0];
   const tierBg   = isDark ? tier.bg : tier.bgLight;
+  const isAcc    = stock.conviction?.flow === "ACCUMULATION";
+  const isDist   = stock.conviction?.flow === "DISTRIBUTION";
 
   return (
     <div onClick={onClick} style={{ background:t.surface, border:`1.5px solid ${t.border}`,
@@ -453,16 +469,59 @@ function StockCard({ stock, onClick, t, isDark }) {
         {stock.signals.tightMCR   && <Chip label={`M ${stock.mcr?.toFixed(2)}`} color="#06b6d4" />}
       </div>
 
+      {stock.conviction?.flow && (
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          background: isAcc
+            ? (isDark ? "rgba(34,197,94,0.12)" : "#f0fdf4")
+            : (isDark ? "rgba(239,68,68,0.12)" : "#fef2f2"),
+          border: isAcc
+            ? (isDark ? "1px solid rgba(34,197,94,0.3)" : "1px solid #86efac")
+            : (isDark ? "1px solid rgba(239,68,68,0.3)" : "1px solid #fca5a5"),
+          borderRadius: 6, padding: "5px 9px", marginTop: 8, fontSize: 11
+        }}>
+          <span style={{
+            fontWeight: 800,
+            color: isAcc ? "#16a34a" : "#ef4444",
+            display: "flex", alignItems: "center", gap: 5
+          }}>
+            {isAcc ? "🟢 ACCUMULATION (Long Bias)" : "🔴 DISTRIBUTION (Short Bias)"}
+          </span>
+          <span style={{ fontFamily: "monospace", fontSize: 10, color: t.textSub }}>
+            {stock.conviction.spurtRvol ? `⚡${stock.conviction.spurtRvol}x RVOL` : ""}
+            {stock.conviction.spurtValCr ? ` • ₹${stock.conviction.spurtValCr}Cr` : ""}
+          </span>
+        </div>
+      )}
+
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginTop:10 }}>
-        <div style={{ background:isDark?"#052e16":"#f0fdf4", borderRadius:6, padding:"7px 10px",
-          border:isDark?"none":`1px solid #86efac` }}>
-          <div style={{ fontSize:9, color:"#16a34a", fontWeight:700, textTransform:"uppercase" }}>Buy Above</div>
+        <div style={{
+          background: isDark ? "#052e16" : "#f0fdf4",
+          borderRadius: 6, padding: "7px 10px",
+          border: isAcc
+            ? (isDark ? "2px solid #22c55e" : "2px solid #16a34a")
+            : (isDark ? "none" : "1px solid #86efac"),
+          boxShadow: isAcc ? (isDark ? "0 0 10px rgba(34,197,94,0.3)" : "0 0 8px rgba(22,163,74,0.25)") : "none"
+        }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <span style={{ fontSize:9, color:"#16a34a", fontWeight:700, textTransform:"uppercase" }}>Buy Above</span>
+            {isAcc && <span style={{ background:"#16a34a", color:"#fff", fontSize:8, fontWeight:800, padding:"1px 4px", borderRadius:3 }}>FLOW BIAS</span>}
+          </div>
           <div style={{ fontFamily:"monospace", fontSize:14, fontWeight:800, color:t.text }}>₹{fmt(stock.buyAbove)}</div>
           <div style={{ fontSize:9, color:t.textMuted }}>ATM Call ₹{fmt(str.atmCall)}</div>
         </div>
-        <div style={{ background:isDark?"#2d0a0a":"#fef2f2", borderRadius:6, padding:"7px 10px",
-          border:isDark?"none":`1px solid #fca5a5` }}>
-          <div style={{ fontSize:9, color:"#ef4444", fontWeight:700, textTransform:"uppercase" }}>Sell Below</div>
+        <div style={{
+          background: isDark ? "#2d0a0a" : "#fef2f2",
+          borderRadius: 6, padding: "7px 10px",
+          border: isDist
+            ? (isDark ? "2px solid #ef4444" : "2px solid #dc2626")
+            : (isDark ? "none" : "1px solid #fca5a5"),
+          boxShadow: isDist ? (isDark ? "0 0 10px rgba(239,68,68,0.3)" : "0 0 8px rgba(220,38,38,0.25)") : "none"
+        }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <span style={{ fontSize:9, color:"#ef4444", fontWeight:700, textTransform:"uppercase" }}>Sell Below</span>
+            {isDist && <span style={{ background:"#ef4444", color:"#fff", fontSize:8, fontWeight:800, padding:"1px 4px", borderRadius:3 }}>FLOW BIAS</span>}
+          </div>
           <div style={{ fontFamily:"monospace", fontSize:14, fontWeight:800, color:t.text }}>₹{fmt(stock.sellBelow)}</div>
           <div style={{ fontSize:9, color:t.textMuted }}>ATM Put ₹{fmt(str.atmPut)}</div>
         </div>
@@ -483,7 +542,7 @@ function StockCard({ stock, onClick, t, isDark }) {
 }
 
 // ─── STOCK LIST VIEW ──────────────────────────────────────────────────────────
-const SIG_FILTERS = ["All","Inside Day","Inside Value","Confluence","Tight CR","Tier A","Tier B","Tier C","Tier D"];
+const SIG_FILTERS = ["All","🟢 Accumulation","🔴 Distribution","Inside Day","Inside Value","Confluence","Tight CR","Tier A","Tier B","Tier C","Tier D"];
 const SORT_OPTIONS = [
   ["smart", "Smart Priority"],
   ["setup", "Setup Score"],
@@ -506,6 +565,8 @@ function StockListView({ stocks, t, isDark }) {
     const tierFilter = sigFilter.startsWith("Tier ") ? sigFilter.slice(-1) : null;
     return stocks.filter(s => {
       if (q && !s.sym.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) return false;
+      if (sigFilter==="🟢 Accumulation" && s.conviction?.flow !== "ACCUMULATION") return false;
+      if (sigFilter==="🔴 Distribution" && s.conviction?.flow !== "DISTRIBUTION") return false;
       if (sigFilter==="Inside Day"  && !s.signals?.insideDay)  return false;
       if (sigFilter==="Inside Value"&& !s.signals?.insideVal)  return false;
       if (sigFilter==="Confluence"  && !s.signals?.confluence) return false;
