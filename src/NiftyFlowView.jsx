@@ -45,6 +45,42 @@ function getMarketSessionStatus() {
   return { isAutoActive, reason };
 }
 
+function getIstDayInfo() {
+  try {
+    const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    return { dayName: dayNames[nowIst.getDay()], dayNum: nowIst.getDay() };
+  } catch (e) {
+    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const d = new Date();
+    return { dayName: dayNames[d.getDay()], dayNum: d.getDay() };
+  }
+}
+
+function findBestSessionIndex(sessions, serverDayName) {
+  if (!sessions || sessions.length === 0) return 0;
+  const { dayName, dayNum } = getIstDayInfo();
+  const targetDay = (serverDayName || dayName).toLowerCase();
+
+  // 1. Direct match with current day (e.g. "friday")
+  let idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes(targetDay));
+  if (idx !== -1) return idx;
+
+  // 2. Weekend logic: Saturday -> show Friday, Sunday -> show Monday
+  if (dayNum === 6) {
+    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("friday"));
+    if (idx !== -1) return idx;
+  } else if (dayNum === 0) {
+    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("monday"));
+    if (idx !== -1) return idx;
+    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("friday"));
+    if (idx !== -1) return idx;
+  }
+
+  // 3. Fallback to latest session available
+  return Math.max(0, sessions.length - 1);
+}
+
 function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
   const isMobile = useIsMobile();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
@@ -717,7 +753,7 @@ export function NiftyFlowView({ t, isDark }) {
   const [argonData, setArgonData] = useState(() => globalArgonCache);
   const [loading, setLoading] = useState(() => !globalOiCache);
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedDayIdx, setSelectedDayIdx] = useState(0);
+  const [selectedDayIdx, setSelectedDayIdx] = useState(() => findBestSessionIndex(globalArgonCache?.sessions, globalArgonCache?.currentDay));
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
@@ -762,8 +798,8 @@ export function NiftyFlowView({ t, isDark }) {
         globalArgonCache = data;
         setArgonData(data);
         if (data.sessions?.length) {
-          const todayIdx = data.sessions.findIndex(s => s.session.toLowerCase().includes("thursday"));
-          if (todayIdx !== -1) setSelectedDayIdx(todayIdx);
+          const todayIdx = findBestSessionIndex(data.sessions, data.currentDay);
+          setSelectedDayIdx(todayIdx);
         }
       }
     } catch (e) {
@@ -812,7 +848,7 @@ export function NiftyFlowView({ t, isDark }) {
     return (
       <div style={{ padding: "40px 14px", textAlign: "center", color: t.textMuted }}>
         <div style={{ fontSize: 28, marginBottom: 12 }}>⚡</div>
-        <div style={{ fontSize: 14, fontWeight: 700 }}>Connecting to Nifty Option Chain & Argon Prediction…</div>
+        <div style={{ fontSize: 14, fontWeight: 700 }}>Connecting to Nifty Option Chain & Weekly Prediction…</div>
       </div>
     );
   }
@@ -1015,7 +1051,7 @@ export function NiftyFlowView({ t, isDark }) {
               WebkitTapHighlightColor: "transparent"
             }}
           >
-            🎯 Argon Prediction
+            🎯 Weekly &amp; Daily
           </button>
           <button
             onClick={() => setMobileView("both")}
@@ -1255,10 +1291,10 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
         )}
 
-        {/* ── RIGHT: ARGON'S DAILY PREDICTION & CONFLUENCE ── */}
+        {/* ── RIGHT: WEEKLY & DAILY PREDICTION & CONFLUENCE ── */}
         {(!isMobile || mobileView === "argon" || mobileView === "both") && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {/* ARGON HEADER & DAY SELECTOR */}
+            {/* WEEKLY & DAILY PREDICTION HEADER & DAY SELECTOR */}
             <div style={{
               background: t.surface,
               border: `1.5px solid ${t.border}`,
@@ -1268,7 +1304,7 @@ export function NiftyFlowView({ t, isDark }) {
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <div>
-                  <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>🎯 ARGON DAILY &amp; WEEKLY MODEL</div>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>🎯 WEEKLY &amp; DAILY PREDICTION</div>
                   <div style={{ fontSize: 10, color: t.textMuted }}>Price Action Model &amp; Key Pivots</div>
                 </div>
                 <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
@@ -1283,6 +1319,7 @@ export function NiftyFlowView({ t, isDark }) {
                 {(argonData?.sessions || []).map((sess, idx) => {
                   const label = sess.session.split("(")[0].trim();
                   const isSelected = selectedDayIdx === idx;
+                  const isToday = sess.session.toLowerCase().includes((argonData?.currentDay || getIstDayInfo().dayName).toLowerCase());
                   return (
                     <button key={sess.session} onClick={() => setSelectedDayIdx(idx)} style={{
                       padding: "7px 12px",
@@ -1295,9 +1332,25 @@ export function NiftyFlowView({ t, isDark }) {
                       color: isSelected ? "#fff" : t.pillOffText,
                       outline: isSelected ? "none" : `1px solid ${t.border}`,
                       whiteSpace: "nowrap",
-                      WebkitTapHighlightColor: "transparent"
+                      WebkitTapHighlightColor: "transparent",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 5
                     }}>
-                      {label}
+                      <span>{label}</span>
+                      {isToday && (
+                        <span style={{
+                          fontSize: 9,
+                          padding: "1px 5px",
+                          borderRadius: 8,
+                          background: isSelected ? "rgba(255,255,255,0.28)" : (isDark ? "rgba(34, 197, 94, 0.25)" : "#dcfce7"),
+                          color: isSelected ? "#fff" : (isDark ? "#4ade80" : "#166534"),
+                          fontWeight: 800,
+                          letterSpacing: 0.3
+                        }}>
+                          TODAY
+                        </span>
+                      )}
                     </button>
                   );
                 })}

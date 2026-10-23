@@ -38,7 +38,7 @@ const FALLBACK_SESSIONS = [
     sectors: "Lead: FMCG, Pharma (defensives). Avoid: High beta metals, leveraged midcaps."
   },
   {
-    session: "Thursday (Today / Execution Focus)",
+    session: "Thursday (Execution Focus)",
     stance: "RANGEBOUND TO BEARISH BIAS (HIGH)",
     forecast: "Roof firm at 22,800. Key floor support at 22,600. Breakdown below 22,600 triggers cascade to 22,500.",
     action: "Sell calls on rallies toward 22,750–22,800. Take puts in Tier-C distribution stocks if floor shows signs of unwinding.",
@@ -60,6 +60,31 @@ const FALLBACK_SESSIONS = [
   }
 ];
 
+function getIstDayInfo() {
+  const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const dayName = dayNames[nowIst.getDay()];
+  return { dayName, dayNum: nowIst.getDay() };
+}
+
+function findBestSession(sessions, dayName, dayNum) {
+  if (!sessions || sessions.length === 0) return null;
+  const lower = dayName.toLowerCase();
+  let found = sessions.find(s => s.session && s.session.toLowerCase().includes(lower));
+  if (found) return found;
+
+  // Weekend logic: Saturday -> show Friday, Sunday -> show Monday
+  if (dayNum === 6) {
+    found = sessions.find(s => s.session && s.session.toLowerCase().includes("friday"));
+    if (found) return found;
+  } else if (dayNum === 0) {
+    found = sessions.find(s => s.session && s.session.toLowerCase().includes("monday"));
+    if (found) return found;
+  }
+
+  return sessions[sessions.length - 1] || sessions[0];
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET");
@@ -69,6 +94,8 @@ export default async function handler(req, res) {
   if (cache.data && now - cache.timestamp < 120000) {
     return res.status(200).json(cache.data);
   }
+
+  const { dayName: currentDayName, dayNum } = getIstDayInfo();
 
   try {
     const response = await fetch(DOC_URL, {
@@ -81,14 +108,7 @@ export default async function handler(req, res) {
     const rawText = await response.text();
     const sessions = parseArgonDoc(rawText);
     const validSessions = sessions.length > 0 ? sessions : FALLBACK_SESSIONS;
-
-    const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const currentDayName = dayNames[nowIst.getDay()];
-
-    const todaySession = validSessions.find(s =>
-      s.session.toLowerCase().includes(currentDayName.toLowerCase())
-    ) || validSessions[1] || validSessions[0] || null;
+    const todaySession = findBestSession(validSessions, currentDayName, dayNum);
 
     const payload = {
       success: true,
@@ -106,13 +126,14 @@ export default async function handler(req, res) {
     if (cache.data) {
       return res.status(200).json(cache.data);
     }
+    const todaySession = findBestSession(FALLBACK_SESSIONS, currentDayName, dayNum);
     const fallbackPayload = {
       success: true,
       updatedAt: new Date().toISOString(),
       docUrl: "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing",
       sessions: FALLBACK_SESSIONS,
-      todaySession: FALLBACK_SESSIONS[1],
-      currentDay: "Thursday",
+      todaySession,
+      currentDay: currentDayName,
     };
     return res.status(200).json(fallbackPayload);
   }

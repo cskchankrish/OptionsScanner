@@ -810,7 +810,7 @@ export default function App() {
   const TABS = [
     { id:"setups", label:`🎯 All (${stocks.length})` },
     { id:"top",    label:`⭐ Top (${topPicks.length})` },
-    { id:"nifty",  label:"📊 Nifty Flow & Argon" },
+    { id:"nifty",  label:"📊 Nifty Flow Data" },
     { id:"guide",  label:"📐 Scoring" },
   ];
 
@@ -908,7 +908,7 @@ export default function App() {
           {TABS.map(tab => {
             const isActive = activeTab === tab.id;
             const icon = tab.id === "setups" ? "🎯" : tab.id === "top" ? "⭐" : tab.id === "nifty" ? "📊" : "📐";
-            const shortLabel = tab.id === "setups" ? `All (${stocks.length})` : tab.id === "top" ? `Top (${topPicks.length})` : tab.id === "nifty" ? "Nifty Flow" : "Scoring";
+            const shortLabel = tab.id === "setups" ? `All (${stocks.length})` : tab.id === "top" ? `Top (${topPicks.length})` : tab.id === "nifty" ? "Nifty Flow Data" : "Scoring";
             return (
               <button
                 key={tab.id}
