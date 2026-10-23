@@ -113,8 +113,11 @@ export default async function handler(req, res) {
       "Referer": "https://www.nseindia.com/option-chain",
     };
 
-    // 1. Session warmup
-    const warmup = await fetch("https://www.nseindia.com/option-chain", { headers });
+    // 1. Session warmup with 3.5s timeout
+    const warmup = await fetch("https://www.nseindia.com/option-chain", {
+      headers,
+      signal: AbortSignal.timeout(3500),
+    });
     const rawCookies = warmup.headers.get("set-cookie") || "";
     const cookieHeader = rawCookies
       .split(",")
@@ -126,17 +129,21 @@ export default async function handler(req, res) {
       Cookie: cookieHeader,
     };
 
-    // 2. Fetch contract info to identify current expiry
+    // 2. Fetch contract info to identify current expiry with 3.5s timeout
     const contractRes = await fetch("https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY", {
       headers: sessionHeaders,
+      signal: AbortSignal.timeout(3500),
     });
     if (!contractRes.ok) throw new Error(`contract-info status ${contractRes.status}`);
     const contractData = await contractRes.json();
     const expiry = contractData.expiryDates?.[0] || "";
 
-    // 3. Fetch v3 option chain
+    // 3. Fetch v3 option chain with 3.5s timeout
     const v3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(expiry)}`;
-    const v3Res = await fetch(v3Url, { headers: sessionHeaders });
+    const v3Res = await fetch(v3Url, {
+      headers: sessionHeaders,
+      signal: AbortSignal.timeout(3500),
+    });
     if (!v3Res.ok) throw new Error(`v3 status ${v3Res.status}`);
     const v3Data = await v3Res.json();
 

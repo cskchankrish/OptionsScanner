@@ -817,6 +817,7 @@ export default function App() {
   return (
     <div style={{ minHeight:"100vh", background:t.bg, color:t.text,
       fontFamily:"system-ui,sans-serif", fontSize:13,
+      paddingBottom: mobile ? "84px" : "16px",
       transition:"background .25s, color .25s" }}>
 
       {/* HEADER */}
@@ -856,7 +857,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* TABS */}
+      {/* TOP TABS (Desktop / Tablet view) */}
       <div style={{ background:t.surface, borderBottom:`1px solid ${t.border}`, display:"flex",
         overflowX:"auto", WebkitOverflowScrolling:"touch", paddingLeft:8 }}>
         {TABS.map(tab => (
@@ -871,11 +872,73 @@ export default function App() {
         ))}
       </div>
 
-      {/* CONTENT */}
-      {activeTab==="setups" && <StockListView stocks={stocks} t={t} isDark={isDark} />}
-      {activeTab==="top"    && <StockListView stocks={topPicks} t={t} isDark={isDark} />}
-      {activeTab==="nifty"  && <NiftyFlowView t={t} isDark={isDark} />}
-      {activeTab==="guide"  && <ScoringGuide t={t} />}
+      {/* CONTENT: Keep views alive in DOM with display toggle so tab switching is 0ms without freezing or remounting */}
+      <div style={{ display: activeTab==="setups" ? "block" : "none" }}>
+        <StockListView stocks={stocks} t={t} isDark={isDark} />
+      </div>
+      <div style={{ display: activeTab==="top" ? "block" : "none" }}>
+        <StockListView stocks={topPicks} t={t} isDark={isDark} />
+      </div>
+      <div style={{ display: activeTab==="nifty" ? "block" : "none" }}>
+        <NiftyFlowView t={t} isDark={isDark} />
+      </div>
+      <div style={{ display: activeTab==="guide" ? "block" : "none" }}>
+        <ScoringGuide t={t} />
+      </div>
+
+      {/* MOBILE BOTTOM NAVIGATION BAR (Thumb-friendly native app navigation) */}
+      {mobile && (
+        <div style={{
+          position: "fixed",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          height: 60,
+          background: isDark ? "rgba(10, 22, 40, 0.96)" : "rgba(255, 255, 255, 0.96)",
+          backdropFilter: "blur(12px)",
+          WebkitBackdropFilter: "blur(12px)",
+          borderTop: `1.5px solid ${t.border}`,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-around",
+          zIndex: 9999,
+          paddingBottom: "max(env(safe-area-inset-bottom), 6px)",
+          boxShadow: isDark ? "0 -4px 20px rgba(0,0,0,0.5)" : "0 -4px 16px rgba(0,0,0,0.08)",
+        }}>
+          {TABS.map(tab => {
+            const isActive = activeTab === tab.id;
+            const icon = tab.id === "setups" ? "🎯" : tab.id === "top" ? "⭐" : tab.id === "nifty" ? "📊" : "📐";
+            const shortLabel = tab.id === "setups" ? `All (${stocks.length})` : tab.id === "top" ? `Top (${topPicks.length})` : tab.id === "nifty" ? "Nifty Flow" : "Scoring";
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                style={{
+                  flex: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: isActive ? (isDark ? "rgba(59, 130, 246, 0.16)" : "rgba(37, 99, 235, 0.1)") : "transparent",
+                  border: "none",
+                  borderRadius: 10,
+                  margin: "2px 4px",
+                  cursor: "pointer",
+                  padding: "6px 2px",
+                  color: isActive ? t.accent : t.textMuted,
+                  fontWeight: isActive ? 850 : 600,
+                  fontSize: 10,
+                  gap: 3,
+                  WebkitTapHighlightColor: "transparent"
+                }}
+              >
+                <span style={{ fontSize: 18, transform: isActive ? "scale(1.15)" : "scale(1)", transition: "transform .15s" }}>{icon}</span>
+                <span style={{ whiteSpace: "nowrap" }}>{shortLabel}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

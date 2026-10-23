@@ -1,4 +1,18 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+
+// ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
+let globalOiCache = null;
+let globalArgonCache = null;
+
+function useIsMobile() {
+  const [mobile, setMobile] = useState(() => (typeof window !== "undefined" ? window.innerWidth < 768 : false));
+  useEffect(() => {
+    const fn = () => setMobile(window.innerWidth < 768);
+    window.addEventListener("resize", fn);
+    return () => window.removeEventListener("resize", fn);
+  }, []);
+  return mobile;
+}
 
 function formatLots(n) {
   if (n == null || isNaN(n)) return "0";
@@ -32,9 +46,13 @@ function getMarketSessionStatus() {
 }
 
 function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
+  const isMobile = useIsMobile();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
   const [threshold, setThreshold] = useState(75000); // Institutional Conviction Threshold (Default: 75k)
+  const [zoom, setZoom] = useState(1); // 1 = Fit, 1.5 = 1.5x, 2 = 2x
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const chartWrapperRef = useRef(null);
 
   // Fallback points if empty
   const points = useMemo(() => {
@@ -49,9 +67,9 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
 
   // SVG dimensions
   const svgWidth = 850;
-  const svgHeight = 220;
-  const padLeft = 65;
-  const padRight = 35;
+  const svgHeight = isMobile ? (zoom > 1 ? 280 : 250) : 220;
+  const padLeft = isMobile ? 55 : 65;
+  const padRight = 30;
   const padTop = 30;
   const padBottom = 35;
   const plotW = svgWidth - padLeft - padRight;
@@ -142,9 +160,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
   const latestPoint = points[points.length - 1];
   const hovered = hoverIdx !== null && points[hoverIdx] ? points[hoverIdx] : latestPoint;
 
-  const handleMouseMove = (e) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const mouseX = ((e.clientX - rect.left) / rect.width) * svgWidth;
+  const handlePointer = (clientX, targetRect) => {
+    const mouseX = ((clientX - targetRect.left) / targetRect.width) * svgWidth;
     let closestIdx = 0;
     let minDistance = Infinity;
     points.forEach((p, idx) => {
@@ -157,411 +174,564 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
     setHoverIdx(closestIdx);
   };
 
+  const handleMouseMove = (e) => {
+    handlePointer(e.clientX, e.currentTarget.getBoundingClientRect());
+  };
+
+  const handleTouch = (e) => {
+    if (!e.touches || !e.touches[0]) return;
+    handlePointer(e.touches[0].clientX, e.currentTarget.getBoundingClientRect());
+  };
+
   const currentDiff = latestPoint?.netDiff || 0;
   const isBullBreach = currentDiff >= threshold;
   const isBearBreach = currentDiff <= -threshold;
 
-  return (
-    <div style={{
-      background: t.surface,
-      border: `1.5px solid ${t.border}`,
-      borderRadius: 12,
-      padding: "16px 18px",
-      marginBottom: 16,
-      boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
-    }}>
-      {/* HEADER & VIEW TOGGLES */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 15, fontWeight: 900, color: t.text }}>
-              📈 INTRADAY CALL vs PUT &amp; ΔOI LINE GRAPH
-            </span>
-            <span style={{
-              fontSize: 10.5,
-              fontWeight: 800,
-              padding: "3px 9px",
-              borderRadius: 6,
-              background: isBullBreach
-                ? (isDark ? "#052e16" : "#dcfce7")
-                : isBearBreach
-                ? (isDark ? "#2d0a0a" : "#fee2e2")
-                : (isDark ? "#1e293b" : "#f1f5f9"),
-              color: isBullBreach ? "#16a34a" : isBearBreach ? "#ef4444" : t.textMuted,
-              border: `1px solid ${isBullBreach ? "#16a34a55" : isBearBreach ? "#ef444455" : t.border}`
-            }}>
-              {isBullBreach
-                ? `🔥 BULL CONVICTION ACTIVE (> +${formatLots(threshold)})`
-                : isBearBreach
-                ? `🚨 BEAR CONVICTION ACTIVE (< -${formatLots(threshold)})`
-                : `⚪ CHOP / NEUTRAL ZONE (Within ±${formatLots(threshold)})`}
-            </span>
-          </div>
-          <div style={{ fontSize: 11, color: t.textMuted, marginTop: 2 }}>
-            Market Open (09:15) to Market Close (15:30) · Tracks cumulative institutional writing pressure &amp; breakout thresholds
-          </div>
-        </div>
+  const renderSvgContent = () => (
+    <svg
+      viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+      style={{
+        width: zoom === 1 ? "100%" : `${zoom * 100}%`,
+        minWidth: zoom === 1 ? "100%" : `${zoom * 650}px`,
+        height: isMobile ? (zoom > 1 ? 280 : 240) : 220,
+        display: "block",
+        cursor: "crosshair",
+        touchAction: zoom > 1 ? "pan-x" : "auto"
+      }}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setHoverIdx(null)}
+      onTouchStart={handleTouch}
+      onTouchMove={handleTouch}
+      onTouchEnd={() => setHoverIdx(null)}
+    >
+      <defs>
+        <linearGradient id="diffGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#22c55e" stopOpacity="0.4" />
+          <stop offset="50%" stopColor="#22c55e" stopOpacity="0.05" />
+          <stop offset="50%" stopColor="#ef4444" stopOpacity="0.05" />
+          <stop offset="100%" stopColor="#ef4444" stopOpacity="0.4" />
+        </linearGradient>
 
-        {/* TOGGLE & THRESHOLD SELECTOR */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          {mode === "diff" && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 3,
-              background: isDark ? "#0f172a" : "#f1f5f9",
-              padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
-            }}>
-              <span style={{ fontSize: 10, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Threshold:</span>
-              {[50000, 75000, 100000].map(val => (
-                <button
-                  key={val}
-                  onClick={() => setThreshold(val)}
-                  style={{
-                    background: threshold === val ? t.accent : "transparent",
-                    color: threshold === val ? "#fff" : t.textMuted,
-                    border: "none",
-                    borderRadius: 4, padding: "3px 7px",
-                    fontSize: 10, fontWeight: 800, cursor: "pointer"
-                  }}>
-                  {formatLots(val)}
-                </button>
-              ))}
-            </div>
-          )}
+        <linearGradient id="putGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#22c55e" stopOpacity="0.35" />
+          <stop offset="100%" stopColor="#22c55e" stopOpacity="0.02" />
+        </linearGradient>
 
-          <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
-            <button
-              onClick={() => setMode("diff")}
-              style={{
-                background: mode === "diff" ? t.accent : "transparent",
-                color: mode === "diff" ? "#fff" : t.textMuted,
-                border: "none", borderRadius: 6, padding: "5px 10px",
-                fontSize: 11, fontWeight: 800, cursor: "pointer"
-              }}>
-              ⚡ Net Diff (Put - Call)
-            </button>
-            <button
-              onClick={() => setMode("dual")}
-              style={{
-                background: mode === "dual" ? t.accent : "transparent",
-                color: mode === "dual" ? "#fff" : t.textMuted,
-                border: "none", borderRadius: 6, padding: "5px 10px",
-                fontSize: 11, fontWeight: 800, cursor: "pointer"
-              }}>
-              📊 Put vs Call (Dual Lines)
-            </button>
-          </div>
-        </div>
-      </div>
+        <linearGradient id="callGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#ef4444" stopOpacity="0.35" />
+          <stop offset="100%" stopColor="#ef4444" stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
 
-      {/* SVG CHART CONTAINER */}
-      <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
-        <svg
-          viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-          style={{ width: "100%", height: "auto", display: "block", cursor: "crosshair" }}
-          onMouseMove={handleMouseMove}
-          onMouseLeave={() => setHoverIdx(null)}
-        >
-          <defs>
-            {/* Diff area gradient */}
-            <linearGradient id="diffGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.4" />
-              <stop offset="50%" stopColor="#22c55e" stopOpacity="0.05" />
-              <stop offset="50%" stopColor="#ef4444" stopOpacity="0.05" />
-              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.4" />
-            </linearGradient>
+      {/* BACKGROUND GRID LINES & TIME LABELS */}
+      {timeLabels.map((tl, i) => {
+        const x = xPos(tl.min);
+        return (
+          <g key={tl.label}>
+            <line
+              x1={x} y1={padTop}
+              x2={x} y2={padTop + plotH}
+              stroke={isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"}
+              strokeDasharray="3 3"
+            />
+            <text
+              x={x}
+              y={padTop + plotH + (isMobile ? 16 : 18)}
+              fill={t.textMuted}
+              fontSize={isMobile ? "11" : "10"}
+              fontFamily="monospace"
+              fontWeight="600"
+              textAnchor={i === 0 ? "start" : i === timeLabels.length - 1 ? "end" : "middle"}
+            >
+              {tl.label}
+            </text>
+          </g>
+        );
+      })}
 
-            {/* Put Area Gradient */}
-            <linearGradient id="putGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#22c55e" stopOpacity="0.02" />
-            </linearGradient>
+      {/* NET DIFFERENCE MODE */}
+      {mode === "diff" && (
+        <>
+          {/* CHOP / NOISE CORRIDOR BAND */}
+          <rect
+            x={padLeft}
+            y={yDiffPos(threshold)}
+            width={plotW}
+            height={Math.max(0, yDiffPos(-threshold) - yDiffPos(threshold))}
+            fill={isDark ? "rgba(255,255,255,0.025)" : "rgba(0,0,0,0.02)"}
+          />
 
-            {/* Call Area Gradient */}
-            <linearGradient id="callGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#ef4444" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.02" />
-            </linearGradient>
-          </defs>
+          {/* BULL CONVICTION THRESHOLD (+LINE) */}
+          <line
+            x1={padLeft} y1={yDiffPos(threshold)}
+            x2={padLeft + plotW} y2={yDiffPos(threshold)}
+            stroke="#16a34a"
+            strokeWidth="1.25"
+            strokeDasharray="4 3"
+          />
+          <text
+            x={padLeft + plotW - 4}
+            y={yDiffPos(threshold) - 3}
+            fill="#16a34a"
+            fontSize={isMobile ? "9.5" : "8.5"}
+            fontWeight="800"
+            fontFamily="monospace"
+            textAnchor="end"
+          >
+            ▲ +{formatLots(threshold)} BULL CONVICTION
+          </text>
 
-          {/* BACKGROUND GRID LINES & TIME LABELS */}
-          {timeLabels.map((tl, i) => {
-            const x = xPos(tl.min);
-            return (
-              <g key={tl.label}>
-                <line
-                  x1={x} y1={padTop}
-                  x2={x} y2={padTop + plotH}
-                  stroke={isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"}
-                  strokeDasharray="3 3"
-                />
-                <text
-                  x={x}
-                  y={padTop + plotH + 18}
-                  fill={t.textMuted}
-                  fontSize="10"
-                  fontFamily="monospace"
-                  textAnchor={i === 0 ? "start" : i === timeLabels.length - 1 ? "end" : "middle"}
-                >
-                  {tl.label}
-                </text>
-              </g>
-            );
-          })}
+          {/* BEAR CONVICTION THRESHOLD (-LINE) */}
+          <line
+            x1={padLeft} y1={yDiffPos(-threshold)}
+            x2={padLeft + plotW} y2={yDiffPos(-threshold)}
+            stroke="#ef4444"
+            strokeWidth="1.25"
+            strokeDasharray="4 3"
+          />
+          <text
+            x={padLeft + plotW - 4}
+            y={yDiffPos(-threshold) + (isMobile ? 12 : 10)}
+            fill="#ef4444"
+            fontSize={isMobile ? "9.5" : "8.5"}
+            fontWeight="800"
+            fontFamily="monospace"
+            textAnchor="end"
+          >
+            ▼ -{formatLots(threshold)} BEAR CONVICTION
+          </text>
 
-          {/* NET DIFFERENCE MODE */}
-          {mode === "diff" && (
-            <>
-              {/* CHOP / NOISE CORRIDOR BAND */}
-              <rect
-                x={padLeft}
-                y={yDiffPos(threshold)}
-                width={plotW}
-                height={Math.max(0, yDiffPos(-threshold) - yDiffPos(threshold))}
-                fill={isDark ? "rgba(255,255,255,0.02)" : "rgba(0,0,0,0.02)"}
-              />
+          {/* ZERO BASELINE */}
+          <line
+            x1={padLeft} y1={yCenter}
+            x2={padLeft + plotW} y2={yCenter}
+            stroke={isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.25)"}
+            strokeWidth="1.5"
+            strokeDasharray="4 4"
+          />
+          <text x={padLeft - 6} y={yCenter + 3} fill={t.textMuted} fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace">
+            0
+          </text>
+          <text x={padLeft - 6} y={padTop + 10} fill="#16a34a" fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace" fontWeight="700">
+            +{formatLots(maxDiff)}
+          </text>
+          <text x={padLeft - 6} y={padTop + plotH} fill="#ef4444" fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace" fontWeight="700">
+            -{formatLots(maxDiff)}
+          </text>
 
-              {/* BULL CONVICTION THRESHOLD (+LINE) */}
-              <line
-                x1={padLeft} y1={yDiffPos(threshold)}
-                x2={padLeft + plotW} y2={yDiffPos(threshold)}
-                stroke="#16a34a"
-                strokeWidth="1.25"
-                strokeDasharray="4 3"
-              />
-              <text
-                x={padLeft + plotW - 4}
-                y={yDiffPos(threshold) - 3}
-                fill="#16a34a"
-                fontSize="8.5"
-                fontWeight="800"
-                fontFamily="monospace"
-                textAnchor="end"
-              >
-                ▲ +{formatLots(threshold)} BULL CONVICTION
-              </text>
+          {/* AREA FILL */}
+          <path d={diffAreaPath} fill="url(#diffGrad)" />
 
-              {/* BEAR CONVICTION THRESHOLD (-LINE) */}
-              <line
-                x1={padLeft} y1={yDiffPos(-threshold)}
-                x2={padLeft + plotW} y2={yDiffPos(-threshold)}
-                stroke="#ef4444"
-                strokeWidth="1.25"
-                strokeDasharray="4 3"
-              />
-              <text
-                x={padLeft + plotW - 4}
-                y={yDiffPos(-threshold) + 10}
-                fill="#ef4444"
-                fontSize="8.5"
-                fontWeight="800"
-                fontFamily="monospace"
-                textAnchor="end"
-              >
-                ▼ -{formatLots(threshold)} BEAR CONVICTION
-              </text>
+          {/* MAIN NET LINE */}
+          <path d={diffLinePath} fill="none" stroke="#38bdf8" strokeWidth={isMobile ? "3" : "2.5"} strokeLinecap="round" strokeLinejoin="round" />
 
-              {/* ZERO BASELINE */}
-              <line
-                x1={padLeft} y1={yCenter}
-                x2={padLeft + plotW} y2={yCenter}
-                stroke={isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.25)"}
-                strokeWidth="1.5"
-                strokeDasharray="4 4"
-              />
-              <text x={padLeft - 6} y={yCenter + 3} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
-                0 Neutral
-              </text>
-              <text x={padLeft - 6} y={padTop + 10} fill="#16a34a" fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
-                +{formatLots(maxDiff)}
-              </text>
-              <text x={padLeft - 6} y={padTop + plotH} fill="#ef4444" fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
-                -{formatLots(maxDiff)}
-              </text>
+          {/* POINTS */}
+          {points.map((p, idx) => (
+            <circle
+              key={idx}
+              cx={xPos(p.minutes)}
+              cy={yDiffPos(p.netDiff)}
+              r={idx === points.length - 1 ? (isMobile ? 5 : 4.5) : (isMobile ? 3 : 2.5)}
+              fill={p.netDiff >= 0 ? "#22c55e" : "#ef4444"}
+              stroke={isDark ? "#080f1a" : "#fff"}
+              strokeWidth="1.5"
+            />
+          ))}
+        </>
+      )}
 
-              {/* AREA FILL */}
-              <path d={diffAreaPath} fill="url(#diffGrad)" />
+      {/* DUAL MODE */}
+      {mode === "dual" && (
+        <>
+          <line
+            x1={padLeft} y1={padTop + plotH}
+            x2={padLeft + plotW} y2={padTop + plotH}
+            stroke={isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)"}
+            strokeWidth="1"
+          />
+          <text x={padLeft - 6} y={padTop + plotH} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+            0
+          </text>
+          <text x={padLeft - 6} y={padTop + plotH / 2} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+            {formatLots(maxDual / 2)}
+          </text>
+          <text x={padLeft - 6} y={padTop + 10} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
+            {formatLots(maxDual)}
+          </text>
 
-              {/* MAIN NET LINE */}
-              <path d={diffLinePath} fill="none" stroke="#38bdf8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={putAreaPath} fill="url(#putGrad)" />
+          <path d={callAreaPath} fill="url(#callGrad)" />
 
-              {/* POINTS */}
-              {points.map((p, idx) => (
-                <circle
-                  key={idx}
-                  cx={xPos(p.minutes)}
-                  cy={yDiffPos(p.netDiff)}
-                  r={idx === points.length - 1 ? 4.5 : 2.5}
-                  fill={p.netDiff >= 0 ? "#22c55e" : "#ef4444"}
-                  stroke={isDark ? "#080f1a" : "#fff"}
-                  strokeWidth="1.5"
-                />
-              ))}
-            </>
-          )}
+          <path d={putLinePath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={callLinePath} fill="none" stroke="#ef4444" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
 
-          {/* DUAL MODE: PUT VS CALL SEPARATE CURVES */}
-          {mode === "dual" && (
-            <>
-              {/* HORIZONTAL ZERO AT BOTTOM */}
-              <line
-                x1={padLeft} y1={padTop + plotH}
-                x2={padLeft + plotW} y2={padTop + plotH}
-                stroke={isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)"}
+          {points.map((p, idx) => (
+            <g key={idx}>
+              <circle
+                cx={xPos(p.minutes)}
+                cy={yDualPos(p.putWriting)}
+                r={idx === points.length - 1 ? 4 : 2}
+                fill="#22c55e"
+                stroke={isDark ? "#080f1a" : "#fff"}
                 strokeWidth="1"
               />
-              <text x={padLeft - 6} y={padTop + plotH} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
-                0
-              </text>
-              <text x={padLeft - 6} y={padTop + plotH / 2} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
-                {formatLots(maxDual / 2)}
-              </text>
-              <text x={padLeft - 6} y={padTop + 10} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
-                {formatLots(maxDual)}
-              </text>
+              <circle
+                cx={xPos(p.minutes)}
+                cy={yDualPos(p.callWriting)}
+                r={idx === points.length - 1 ? 4 : 2}
+                fill="#ef4444"
+                stroke={isDark ? "#080f1a" : "#fff"}
+                strokeWidth="1"
+              />
+            </g>
+          ))}
+        </>
+      )}
 
-              {/* AREA FILLS */}
-              <path d={putAreaPath} fill="url(#putGrad)" />
-              <path d={callAreaPath} fill="url(#callGrad)" />
-
-              {/* PUT LINE (GREEN) */}
-              <path d={putLinePath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-
-              {/* CALL LINE (RED) */}
-              <path d={callLinePath} fill="none" stroke="#ef4444" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-
-              {/* POINTS */}
-              {points.map((p, idx) => (
-                <g key={idx}>
-                  <circle
-                    cx={xPos(p.minutes)}
-                    cy={yDualPos(p.putWriting)}
-                    r={idx === points.length - 1 ? 4 : 2}
-                    fill="#22c55e"
-                    stroke={isDark ? "#080f1a" : "#fff"}
-                    strokeWidth="1"
-                  />
-                  <circle
-                    cx={xPos(p.minutes)}
-                    cy={yDualPos(p.callWriting)}
-                    r={idx === points.length - 1 ? 4 : 2}
-                    fill="#ef4444"
-                    stroke={isDark ? "#080f1a" : "#fff"}
-                    strokeWidth="1"
-                  />
-                </g>
-              ))}
+      {/* HOVER / TOUCH CROSSHAIR */}
+      {hovered && (
+        <g>
+          <line
+            x1={xPos(hovered.minutes)}
+            y1={padTop}
+            x2={xPos(hovered.minutes)}
+            y2={padTop + plotH}
+            stroke={isDark ? "#38bdf8" : "#0284c7"}
+            strokeWidth="1.5"
+            strokeDasharray="2 2"
+          />
+          {mode === "diff" ? (
+            <circle
+              cx={xPos(hovered.minutes)}
+              cy={yDiffPos(hovered.netDiff)}
+              r="6"
+              fill="#38bdf8"
+              stroke="#fff"
+              strokeWidth="2"
+            />
+          ) : (
+            <>
+              <circle
+                cx={xPos(hovered.minutes)}
+                cy={yDualPos(hovered.putWriting)}
+                r="5"
+                fill="#22c55e"
+                stroke="#fff"
+                strokeWidth="1.5"
+              />
+              <circle
+                cx={xPos(hovered.minutes)}
+                cy={yDualPos(hovered.callWriting)}
+                r="5"
+                fill="#ef4444"
+                stroke="#fff"
+                strokeWidth="1.5"
+              />
             </>
           )}
+        </g>
+      )}
+    </svg>
+  );
 
-          {/* HOVER CROSSHAIR */}
-          {hovered && (
-            <g>
-              <line
-                x1={xPos(hovered.minutes)}
-                y1={padTop}
-                x2={xPos(hovered.minutes)}
-                y2={padTop + plotH}
-                stroke={isDark ? "#38bdf8" : "#0284c7"}
-                strokeWidth="1.5"
-                strokeDasharray="2 2"
-              />
-              {mode === "diff" ? (
-                <circle
-                  cx={xPos(hovered.minutes)}
-                  cy={yDiffPos(hovered.netDiff)}
-                  r="6"
-                  fill="#38bdf8"
-                  stroke="#fff"
-                  strokeWidth="2"
-                />
-              ) : (
-                <>
-                  <circle
-                    cx={xPos(hovered.minutes)}
-                    cy={yDualPos(hovered.putWriting)}
-                    r="5"
-                    fill="#22c55e"
-                    stroke="#fff"
-                    strokeWidth="1.5"
-                  />
-                  <circle
-                    cx={xPos(hovered.minutes)}
-                    cy={yDualPos(hovered.callWriting)}
-                    r="5"
-                    fill="#ef4444"
-                    stroke="#fff"
-                    strokeWidth="1.5"
-                  />
-                </>
-              )}
-            </g>
-          )}
-        </svg>
-      </div>
-
-      {/* HOVER TOOLTIP & CURRENT STATUS BAR */}
+  return (
+    <>
       <div style={{
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        flexWrap: "wrap",
-        gap: 10,
-        padding: "8px 12px",
-        marginTop: 6,
-        background: isDark ? "#0a1628" : "#f8fafc",
-        borderRadius: 8,
-        border: `1px solid ${t.border}`,
-        fontSize: 11
+        background: t.surface,
+        border: `1.5px solid ${t.border}`,
+        borderRadius: 12,
+        padding: isMobile ? "12px 10px" : "16px 18px",
+        marginBottom: 16,
+        boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span>
-            <strong style={{ color: t.text }}>Time:</strong> <span style={{ fontFamily: "monospace" }}>{hovered?.time || "—"}</span>
-          </span>
-          {hovered?.spot && (
-            <span>
-              <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace" }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
-            </span>
-          )}
-          <span>
-            <strong style={{ color: "#16a34a" }}>Put Writing:</strong> <span style={{ fontFamily: "monospace", color: "#16a34a", fontWeight: 700 }}>+{formatLots(hovered?.putWriting)}</span>
-          </span>
-          <span>
-            <strong style={{ color: "#ef4444" }}>Call Writing:</strong> <span style={{ fontFamily: "monospace", color: "#ef4444", fontWeight: 700 }}>+{formatLots(hovered?.callWriting)}</span>
-          </span>
-          <span>
-            <strong style={{ color: t.text }}>Net ΔOI:</strong>{" "}
-            <span style={{
-              fontFamily: "monospace",
-              fontWeight: 900,
-              color: (hovered?.netDiff || 0) >= 0 ? "#16a34a" : "#ef4444"
+        {/* HEADER & VIEW TOGGLES */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: isMobile ? 14 : 15, fontWeight: 900, color: t.text }}>
+                📈 INTRADAY CALL vs PUT &amp; ΔOI
+              </span>
+              <span style={{
+                fontSize: 10,
+                fontWeight: 800,
+                padding: "3px 8px",
+                borderRadius: 6,
+                background: isBullBreach
+                  ? (isDark ? "#052e16" : "#dcfce7")
+                  : isBearBreach
+                  ? (isDark ? "#2d0a0a" : "#fee2e2")
+                  : (isDark ? "#1e293b" : "#f1f5f9"),
+                color: isBullBreach ? "#16a34a" : isBearBreach ? "#ef4444" : t.textMuted,
+                border: `1px solid ${isBullBreach ? "#16a34a55" : isBearBreach ? "#ef444455" : t.border}`
+              }}>
+                {isBullBreach
+                  ? `🔥 BULL (> +${formatLots(threshold)})`
+                  : isBearBreach
+                  ? `🚨 BEAR (< -${formatLots(threshold)})`
+                  : `⚪ CHOP (±${formatLots(threshold)})`}
+              </span>
+            </div>
+            <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 2 }}>
+              09:15 → 15:30 IST · Drag finger or pinch to inspect timeline
+            </div>
+          </div>
+
+          {/* CONTROLS BAR: MODE + THRESHOLD + ZOOM */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            {/* MODE TOGGLE */}
+            <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
+              <button
+                onClick={() => setMode("diff")}
+                style={{
+                  background: mode === "diff" ? t.accent : "transparent",
+                  color: mode === "diff" ? "#fff" : t.textMuted,
+                  border: "none", borderRadius: 6, padding: "5px 8px",
+                  fontSize: 10.5, fontWeight: 800, cursor: "pointer",
+                  WebkitTapHighlightColor: "transparent"
+                }}>
+                ⚡ Net Diff
+              </button>
+              <button
+                onClick={() => setMode("dual")}
+                style={{
+                  background: mode === "dual" ? t.accent : "transparent",
+                  color: mode === "dual" ? "#fff" : t.textMuted,
+                  border: "none", borderRadius: 6, padding: "5px 8px",
+                  fontSize: 10.5, fontWeight: 800, cursor: "pointer",
+                  WebkitTapHighlightColor: "transparent"
+                }}>
+                📊 Dual
+              </button>
+            </div>
+
+            {/* ZOOM TOGGLE (Mobile friendly) */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 2,
+              background: isDark ? "#0f172a" : "#f1f5f9",
+              padding: "2px 5px", borderRadius: 8, border: `1px solid ${t.border}`
             }}>
-              {(hovered?.netDiff || 0) >= 0 ? "+" : ""}{formatLots(hovered?.netDiff)}
-            </span>
-          </span>
+              <span style={{ fontSize: 9.5, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>🔍</span>
+              {[
+                { label: "1x", val: 1 },
+                { label: "1.5x", val: 1.5 },
+                { label: "2x", val: 2 },
+              ].map(z => (
+                <button
+                  key={z.val}
+                  onClick={() => setZoom(z.val)}
+                  style={{
+                    background: zoom === z.val ? t.accent : "transparent",
+                    color: zoom === z.val ? "#fff" : t.textMuted,
+                    border: "none",
+                    borderRadius: 4, padding: "3px 6px",
+                    fontSize: 10, fontWeight: 800, cursor: "pointer",
+                    WebkitTapHighlightColor: "transparent"
+                  }}>
+                  {z.label}
+                </button>
+              ))}
+              <button
+                onClick={() => setIsFullscreen(true)}
+                title="Fullscreen / Expanded view"
+                style={{
+                  background: "transparent",
+                  color: t.accentSub,
+                  border: "none",
+                  borderRadius: 4, padding: "3px 5px",
+                  fontSize: 11, fontWeight: 800, cursor: "pointer"
+                }}>
+                ⛶
+              </button>
+            </div>
+
+            {/* THRESHOLD SELECTOR */}
+            {mode === "diff" && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 2,
+                background: isDark ? "#0f172a" : "#f1f5f9",
+                padding: "2px 5px", borderRadius: 8, border: `1px solid ${t.border}`
+              }}>
+                <span style={{ fontSize: 9.5, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Edge:</span>
+                {[50000, 75000, 100000].map(val => (
+                  <button
+                    key={val}
+                    onClick={() => setThreshold(val)}
+                    style={{
+                      background: threshold === val ? t.accent : "transparent",
+                      color: threshold === val ? "#fff" : t.textMuted,
+                      border: "none",
+                      borderRadius: 4, padding: "3px 5px",
+                      fontSize: 10, fontWeight: 800, cursor: "pointer",
+                      WebkitTapHighlightColor: "transparent"
+                    }}>
+                    {formatLots(val)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
-        <div style={{ fontSize: 10.5, color: t.textMuted }}>
-          💡 <strong>Historical Edge:</strong> When Net ΔOI sustains beyond <strong>±{formatLots(threshold)}</strong>, trend continuation probability reaches <strong>~78–82%</strong>. Inside corridor is chop/noise.
+        {/* SVG CHART CONTAINER WITH HORIZONTAL PAN / ZOOM */}
+        <div
+          ref={chartWrapperRef}
+          style={{
+            position: "relative",
+            width: "100%",
+            overflowX: "auto",
+            WebkitOverflowScrolling: "touch",
+            border: zoom > 1 ? `1px dashed ${t.border}` : "none",
+            borderRadius: 8,
+            paddingBottom: 4
+          }}
+        >
+          {zoom > 1 && (
+            <div style={{
+              position: "absolute", top: 6, right: 8,
+              fontSize: 9.5, color: t.accentSub,
+              background: isDark ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.9)",
+              padding: "2px 8px", borderRadius: 4, pointerEvents: "none", zIndex: 5,
+              border: `1px solid ${t.border}`
+            }}>
+              👉 Swipe horizontally across timeline
+            </div>
+          )}
+          {renderSvgContent()}
+        </div>
+
+        {/* HOVER TOOLTIP & CURRENT STATUS BAR */}
+        <div style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 8,
+          padding: "8px 10px",
+          marginTop: 6,
+          background: isDark ? "#0a1628" : "#f8fafc",
+          borderRadius: 8,
+          border: `1px solid ${t.border}`,
+          fontSize: 11
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span>
+              <strong style={{ color: t.text }}>Time:</strong> <span style={{ fontFamily: "monospace" }}>{hovered?.time || "—"}</span>
+            </span>
+            {hovered?.spot && (
+              <span>
+                <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace" }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
+              </span>
+            )}
+            <span>
+              <strong style={{ color: "#16a34a" }}>Put:</strong> <span style={{ fontFamily: "monospace", color: "#16a34a", fontWeight: 700 }}>+{formatLots(hovered?.putWriting)}</span>
+            </span>
+            <span>
+              <strong style={{ color: "#ef4444" }}>Call:</strong> <span style={{ fontFamily: "monospace", color: "#ef4444", fontWeight: 700 }}>+{formatLots(hovered?.callWriting)}</span>
+            </span>
+            <span>
+              <strong style={{ color: t.text }}>Net:</strong>{" "}
+              <span style={{
+                fontFamily: "monospace",
+                fontWeight: 900,
+                color: (hovered?.netDiff || 0) >= 0 ? "#16a34a" : "#ef4444"
+              }}>
+                {(hovered?.netDiff || 0) >= 0 ? "+" : ""}{formatLots(hovered?.netDiff)}
+              </span>
+            </span>
+          </div>
+
+          <div style={{ fontSize: 10, color: t.textMuted }}>
+            {zoom > 1 ? "🔍 Zoomed (Swipe to pan)" : "💡 Tap/drag to inspect"}
+          </div>
         </div>
       </div>
-    </div>
+
+      {/* FULLSCREEN MODAL OVERLAY */}
+      {isFullscreen && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: isDark ? "#060d18" : "#ffffff",
+          zIndex: 999999,
+          padding: "14px",
+          display: "flex",
+          flexDirection: "column",
+          overflowY: "auto",
+          WebkitOverflowScrolling: "touch"
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 900, color: t.text }}>
+                📈 Fullscreen Intraday Line Graph (09:15 → 15:30)
+              </div>
+              <div style={{ fontSize: 11, color: t.textMuted }}>
+                Spot: ₹{spot.toLocaleString("en-IN")} · Swipe horizontally to pan
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                onClick={() => setZoom(z => (z === 1 ? 1.5 : z === 1.5 ? 2 : 1))}
+                style={{
+                  background: t.accentBg, border: `1px solid ${t.accent}`,
+                  color: t.accentSub, borderRadius: 8, padding: "6px 12px",
+                  fontSize: 12, fontWeight: 800, cursor: "pointer"
+                }}>
+                Zoom ({zoom}x)
+              </button>
+              <button
+                onClick={() => setIsFullscreen(false)}
+                style={{
+                  background: isDark ? "#1e293b" : "#e2e8f0", border: "none",
+                  color: t.text, borderRadius: 8, padding: "6px 14px",
+                  fontSize: 14, fontWeight: 900, cursor: "pointer"
+                }}>
+                ✕ Close
+              </button>
+            </div>
+          </div>
+
+          <div style={{
+            flex: 1,
+            overflowX: "auto",
+            WebkitOverflowScrolling: "touch",
+            border: `1.5px solid ${t.border}`,
+            borderRadius: 12,
+            padding: "10px",
+            background: t.surface
+          }}>
+            {renderSvgContent()}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
 export function NiftyFlowView({ t, isDark }) {
-  const [oiData, setOiData] = useState(null);
-  const [argonData, setArgonData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const isMobile = useIsMobile();
+  const [mobileView, setMobileView] = useState("chart"); // "chart", "argon", "both"
+  const [oiData, setOiData] = useState(() => globalOiCache);
+  const [argonData, setArgonData] = useState(() => globalArgonCache);
+  const [loading, setLoading] = useState(() => !globalOiCache);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedDayIdx, setSelectedDayIdx] = useState(0);
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
-  // Check market status every 5 seconds so live transitions (09:00 AM or 04:00 PM) reflect immediately
+  // Check market status every 5 seconds without triggering re-render if unchanged
   useEffect(() => {
     const statusTimer = setInterval(() => {
-      setMarketStatus(getMarketSessionStatus());
+      setMarketStatus(prev => {
+        const next = getMarketSessionStatus();
+        if (prev.isAutoActive !== next.isAutoActive || prev.reason !== next.reason) {
+          return next;
+        }
+        return prev;
+      });
     }, 5000);
     return () => clearInterval(statusTimer);
   }, []);
@@ -576,20 +746,7 @@ export function NiftyFlowView({ t, isDark }) {
       const res = await fetch("/api/nifty-oi");
       if (res.ok) {
         const data = await res.json();
-        // Client-side local persistence across today's session
-        try {
-          const todayKey = `nifty_timeline_${new Date().toISOString().slice(0, 10)}`;
-          const stored = JSON.parse(localStorage.getItem(todayKey) || "[]");
-          const incoming = data.intradayTimeline || [];
-          const map = new Map();
-          incoming.forEach(p => map.set(p.minutes, p));
-          stored.forEach(p => {
-            if (!map.has(p.minutes)) map.set(p.minutes, p);
-          });
-          const merged = Array.from(map.values()).sort((a, b) => a.minutes - b.minutes);
-          localStorage.setItem(todayKey, JSON.stringify(merged));
-          data.intradayTimeline = merged;
-        } catch (_) {}
+        globalOiCache = data;
         setOiData(data);
       }
     } catch (e) {
@@ -602,9 +759,9 @@ export function NiftyFlowView({ t, isDark }) {
       const res = await fetch("/api/argon");
       if (res.ok) {
         const data = await res.json();
+        globalArgonCache = data;
         setArgonData(data);
         if (data.sessions?.length) {
-          // Default to Thursday or today's session if found
           const todayIdx = data.sessions.findIndex(s => s.session.toLowerCase().includes("thursday"));
           if (todayIdx !== -1) setSelectedDayIdx(todayIdx);
         }
@@ -654,8 +811,8 @@ export function NiftyFlowView({ t, isDark }) {
   if (loading && !oiData) {
     return (
       <div style={{ padding: "40px 14px", textAlign: "center", color: t.textMuted }}>
-        <div style={{ fontSize: 24, marginBottom: 12 }}>⚡</div>
-        <div style={{ fontSize: 14, fontWeight: 700 }}>Loading Nifty Option Chain & Argon Prediction…</div>
+        <div style={{ fontSize: 28, marginBottom: 12 }}>⚡</div>
+        <div style={{ fontSize: 14, fontWeight: 700 }}>Connecting to Nifty Option Chain & Argon Prediction…</div>
       </div>
     );
   }
@@ -670,20 +827,20 @@ export function NiftyFlowView({ t, isDark }) {
   const isResistanceHeavier = oiData?.balanceStatus?.toLowerCase().includes("resistance");
 
   return (
-    <div style={{ padding: "14px", maxWidth: 1300, margin: "0 auto" }}>
+    <div style={{ padding: isMobile ? "10px" : "14px", maxWidth: 1300, margin: "0 auto" }}>
       {/* ── TOP LIVE CONSOLIDATOR BANNER ── */}
       <div style={{
         background: t.surface,
         border: `1.5px solid ${t.border}`,
         borderRadius: 12,
-        padding: "16px 18px",
+        padding: isMobile ? "12px 14px" : "16px 18px",
         marginBottom: 16,
         boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
       }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 18, fontWeight: 900, color: t.text }}>⚡ NIFTY LIVE OI CONSOLIDATOR</span>
+              <span style={{ fontSize: isMobile ? 16 : 18, fontWeight: 900, color: t.text }}>⚡ NIFTY LIVE OI CONSOLIDATOR</span>
               <span style={{
                 background: isSupportHeavier ? (isDark ? "#052e16" : "#dcfce7") : isResistanceHeavier ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#1e293b" : "#f1f5f9"),
                 color: isSupportHeavier ? "#16a34a" : isResistanceHeavier ? "#ef4444" : "#d97706",
@@ -696,13 +853,13 @@ export function NiftyFlowView({ t, isDark }) {
                 ● {oiData?.timestamp || "Live"} · Expiry {oiData?.expiryDate || "Near"}
               </span>
             </div>
-            <div style={{ fontSize: 12, color: t.textSub, marginTop: 4 }}>
+            <div style={{ fontSize: 11.5, color: t.textSub, marginTop: 4 }}>
               <strong>Action Bias:</strong> {oiData?.recommendation || "Evaluate support/resistance before entering stock options."}
             </div>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            {/* INTERVAL SELECTOR (ACTIVE ONLY DURING MARKET WINDOW 09:00 - 16:00 IST) */}
+            {/* INTERVAL SELECTOR */}
             {marketStatus.isAutoActive && (
               <div style={{
                 display: "flex", alignItems: "center", gap: 3,
@@ -723,7 +880,8 @@ export function NiftyFlowView({ t, isDark }) {
                       color: refreshIntervalSec === opt.sec ? "#fff" : t.textMuted,
                       border: "none",
                       borderRadius: 4, padding: "3px 7px",
-                      fontSize: 10, fontWeight: 800, cursor: "pointer"
+                      fontSize: 10, fontWeight: 800, cursor: "pointer",
+                      WebkitTapHighlightColor: "transparent"
                     }}>
                     {opt.label}
                   </button>
@@ -761,17 +919,18 @@ export function NiftyFlowView({ t, isDark }) {
             <button onClick={loadAll} disabled={refreshing} style={{
               background: t.accentBg, border: `1px solid ${t.accent}`,
               color: t.accentSub, borderRadius: 8, padding: "7px 12px",
-              fontSize: 12, fontWeight: 700, cursor: refreshing ? "default" : "pointer"
+              fontSize: 12, fontWeight: 700, cursor: refreshing ? "default" : "pointer",
+              WebkitTapHighlightColor: "transparent"
             }}>
-              {refreshing ? "Refreshing…" : "🔄 Refresh Now"}
+              {refreshing ? "Refreshing…" : "🔄 Refresh"}
             </button>
           </div>
         </div>
 
-        {/* METRICS ROW */}
+        {/* METRICS ROW (2x2 on mobile, 4-col on desktop) */}
         <div style={{
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(auto-fit, minmax(180px, 1fr))",
           gap: 10,
           marginTop: 14,
           paddingTop: 12,
@@ -779,33 +938,33 @@ export function NiftyFlowView({ t, isDark }) {
         }}>
           <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
             <div style={{ fontSize: 10, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Nifty Spot</div>
-            <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 900, color: t.text }}>₹{spot.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-            <div style={{ fontSize: 10, color: t.textSub }}>Current Index Market Price</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: t.text }}>₹{spot.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+            <div style={{ fontSize: 9.5, color: t.textSub }}>Current Index Price</div>
           </div>
 
           <div style={{ background: isDark ? "#052e16" : "#f0fdf4", padding: "10px 12px", borderRadius: 8, border: "1px solid #16a34a44" }}>
             <div style={{ fontSize: 10, color: "#16a34a", textTransform: "uppercase", fontWeight: 800 }}>Floor (Support)</div>
-            <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 900, color: "#16a34a" }}>{floor}</div>
-            <div style={{ fontSize: 10, color: isDark ? "#86efac" : "#15803d" }}>{oiData?.floorShift || "Support holding"}</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: "#16a34a" }}>{floor}</div>
+            <div style={{ fontSize: 9.5, color: isDark ? "#86efac" : "#15803d" }}>{oiData?.floorShift || "Support holding"}</div>
           </div>
 
           <div style={{ background: isDark ? "#2d0a0a" : "#fef2f2", padding: "10px 12px", borderRadius: 8, border: "1px solid #ef444444" }}>
             <div style={{ fontSize: 10, color: "#ef4444", textTransform: "uppercase", fontWeight: 800 }}>Roof (Resistance)</div>
-            <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 900, color: "#ef4444" }}>{roof}</div>
-            <div style={{ fontSize: 10, color: isDark ? "#fca5a5" : "#b91c1c" }}>{oiData?.roofShift || "Resistance holding"}</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: "#ef4444" }}>{roof}</div>
+            <div style={{ fontSize: 9.5, color: isDark ? "#fca5a5" : "#b91c1c" }}>{oiData?.roofShift || "Resistance holding"}</div>
           </div>
 
           <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
             <div style={{ fontSize: 10, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Put vs Call Writing</div>
-            <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 800, color: t.text, marginTop: 4 }}>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 13 : 15, fontWeight: 800, color: t.text, marginTop: 4 }}>
               <span style={{ color: "#16a34a" }}>P: {oiData?.totalPutWritingFormatted || "—"}</span> vs <span style={{ color: "#ef4444" }}>C: {oiData?.totalCallWritingFormatted || "—"}</span>
             </div>
-            <div style={{ fontSize: 10, color: t.textSub }}>PCR: {oiData?.pcr || 1.0} · ΔPCR: {oiData?.deltaPcr || 1.0}</div>
+            <div style={{ fontSize: 9.5, color: t.textSub }}>PCR: {oiData?.pcr || 1.0} · ΔPCR: {oiData?.deltaPcr || 1.0}</div>
           </div>
         </div>
       </div>
 
-      {/* ── INTRADAY NET OI LINE GRAPH (09:15 to 15:30) ── */}
+      {/* ── INTRADAY NET OI LINE GRAPH (WITH ZOOM & PAN) ── */}
       <NiftyIntradayLineChart
         timeline={oiData?.intradayTimeline}
         spot={spot}
@@ -813,350 +972,420 @@ export function NiftyFlowView({ t, isDark }) {
         t={t}
       />
 
-      {/* ── TWO-COLUMN SPLIT: HORIZONTAL CHART (LEFT) & ARGON PREDICTION (RIGHT) ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", gap: 16, alignItems: "start" }}>
+      {/* MOBILE SEGMENT SELECTOR (Strike Profile vs Argon Prediction) */}
+      {isMobile && (
+        <div style={{
+          display: "flex",
+          gap: 6,
+          background: t.surface,
+          padding: "5px",
+          borderRadius: 10,
+          border: `1.5px solid ${t.border}`,
+          marginBottom: 14,
+        }}>
+          <button
+            onClick={() => setMobileView("chart")}
+            style={{
+              flex: 1,
+              padding: "10px 6px",
+              borderRadius: 7,
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+              border: "none",
+              background: mobileView === "chart" ? t.accent : "transparent",
+              color: mobileView === "chart" ? "#ffffff" : t.textMuted,
+              WebkitTapHighlightColor: "transparent"
+            }}
+          >
+            📊 Strike ΔOI Profile
+          </button>
+          <button
+            onClick={() => setMobileView("argon")}
+            style={{
+              flex: 1,
+              padding: "10px 6px",
+              borderRadius: 7,
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+              border: "none",
+              background: mobileView === "argon" ? t.accent : "transparent",
+              color: mobileView === "argon" ? "#ffffff" : t.textMuted,
+              WebkitTapHighlightColor: "transparent"
+            }}
+          >
+            🎯 Argon Prediction
+          </button>
+          <button
+            onClick={() => setMobileView("both")}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 7,
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+              border: "none",
+              background: mobileView === "both" ? t.accent : "transparent",
+              color: mobileView === "both" ? "#ffffff" : t.textMuted,
+              WebkitTapHighlightColor: "transparent"
+            }}
+          >
+            Both
+          </button>
+        </div>
+      )}
+
+      {/* ── LOWER SECTION: STRIKE PROFILE & ARGON PREDICTION ── */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: (!isMobile || mobileView === "both") ? (isMobile ? "1fr" : "minmax(0, 1.4fr) minmax(0, 1fr)") : "1fr",
+        gap: 16,
+        alignItems: "start"
+      }}>
 
         {/* ── LEFT: BI-DIRECTIONAL STRIKE ΔOI PROFILE CHART ── */}
-        <div style={{
-          background: isDark ? "#080f1a" : "#ffffff",
-          border: `1.5px solid ${t.border}`,
-          borderRadius: 12,
-          padding: "16px",
-          overflowX: "auto"
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>
-                NIFTY OI change today (contracts) · expiry {oiData?.expiryDate || "Current"}
-              </div>
-              <div style={{ fontSize: 10, color: t.textMuted }}>
-                Live institutional strike additions and unwinding
-              </div>
-            </div>
-            <span style={{ fontSize: 10, color: t.textMuted, fontFamily: "monospace" }}>{oiData?.timestamp}</span>
-          </div>
-
-          {/* TABLE HEADER */}
+        {(!isMobile || mobileView === "chart" || mobileView === "both") && (
           <div style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 90px 1fr",
-            padding: "8px 0",
-            fontSize: 10,
-            fontWeight: 800,
-            textTransform: "uppercase",
-            borderBottom: `1px solid ${t.border}`,
-            color: t.textMuted,
-            textAlign: "center"
-          }}>
-            <div style={{ textAlign: "right", paddingRight: 10 }}>put writers ΔOI</div>
-            <div>strike</div>
-            <div style={{ textAlign: "left", paddingLeft: 10 }}>ΔOI call writers</div>
-          </div>
-
-          {/* STRIKE ROWS */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6 }}>
-            {strikes.map((s, idx) => {
-              const strike = s.strike;
-              const isRoof = strike === roof;
-              const isFloor = strike === floor;
-
-              // Spot indicator insertion between rows
-              const prevStrike = idx > 0 ? strikes[idx - 1].strike : 999999;
-              const nextStrike = idx < strikes.length - 1 ? strikes[idx + 1].strike : 0;
-              const showSpotAbove = prevStrike > spot && strike <= spot;
-
-              const pDoi = s.putDeltaOI;
-              const cDoi = s.callDeltaOI;
-
-              // Bar width percentages
-              const pWidth = Math.min(100, Math.round((Math.abs(pDoi) / maxBarVal) * 95));
-              const cWidth = Math.min(100, Math.round((Math.abs(cDoi) / maxBarVal) * 95));
-
-              const isPutBuilt = pDoi > 0;
-              const isPutRemoved = pDoi < 0;
-              const isCallBuilt = cDoi > 0;
-              const isCallRemoved = cDoi < 0;
-
-              return (
-                <div key={strike}>
-                  {showSpotAbove && (
-                    <div style={{
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      margin: "4px 0", padding: "2px 0",
-                      borderTop: "1.5px dashed #38bdf8",
-                      borderBottom: "1.5px dashed #38bdf8",
-                      background: isDark ? "rgba(56, 189, 248, 0.08)" : "rgba(14, 165, 233, 0.08)"
-                    }}>
-                      <span style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 900, color: "#38bdf8" }}>
-                        - - - - - - - - - - - - - - - - {spot.toFixed(2)} SPOT - - - - - - - - - - - - - - - -
-                      </span>
-                    </div>
-                  )}
-
-                  <div style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr 90px 1fr",
-                    alignItems: "center",
-                    minHeight: 24,
-                    fontSize: 11,
-                    background: (isRoof || isFloor) ? (isDark ? "rgba(255,255,255,0.03)" : "#f8fafc") : "transparent"
-                  }}>
-                    {/* LEFT: PUT WRITERS BAR (EXTENDS LEFT) */}
-                    <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6, minWidth: 0, paddingRight: 6 }}>
-                      {isFloor && (
-                        <span style={{ background: "#16a34a", color: "#fff", fontSize: 8, fontWeight: 900, padding: "1px 5px", borderRadius: 3 }}>
-                          FLOOR
-                        </span>
-                      )}
-                      <span style={{
-                        fontFamily: "monospace",
-                        fontSize: 10,
-                        fontWeight: 700,
-                        color: isPutBuilt ? "#16a34a" : isPutRemoved ? (isDark ? "#86efac" : "#65a30d") : t.textMuted,
-                        whiteSpace: "nowrap"
-                      }}>
-                        {s.putDeltaFormatted}
-                      </span>
-                      <div style={{ width: "65%", display: "flex", justifyContent: "flex-end" }}>
-                        <div style={{
-                          width: `${Math.max(2, pWidth)}%`,
-                          height: 14,
-                          borderRadius: "3px 0 0 3px",
-                          background: isPutBuilt
-                            ? "#22c55e"
-                            : isPutRemoved
-                            ? (isDark ? "repeating-linear-gradient(45deg, #166534, #166534 3px, #052e16 3px, #052e16 6px)" : "repeating-linear-gradient(45deg, #86efac, #86efac 3px, #f0fdf4 3px, #f0fdf4 6px)")
-                            : "#64748b",
-                          border: isPutRemoved ? "1px solid #16a34a" : "none"
-                        }} />
-                      </div>
-                    </div>
-
-                    {/* CENTER: STRIKE PRICE */}
-                    <div style={{
-                      textAlign: "center",
-                      fontFamily: "monospace",
-                      fontWeight: (isRoof || isFloor) ? 900 : 700,
-                      color: isRoof ? "#ef4444" : isFloor ? "#16a34a" : t.text,
-                      fontSize: 11,
-                      padding: "2px 0",
-                      borderRadius: 4,
-                      background: isRoof ? (isDark ? "#2d0a0a" : "#fee2e2") : isFloor ? (isDark ? "#052e16" : "#dcfce7") : "transparent"
-                    }}>
-                      {strike}
-                    </div>
-
-                    {/* RIGHT: CALL WRITERS BAR (EXTENDS RIGHT) */}
-                    <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "center", gap: 6, minWidth: 0, paddingLeft: 6 }}>
-                      <div style={{ width: "65%", display: "flex", justifyContent: "flex-start" }}>
-                        <div style={{
-                          width: `${Math.max(2, cWidth)}%`,
-                          height: 14,
-                          borderRadius: "0 3px 3px 0",
-                          background: isCallBuilt
-                            ? "#ef4444"
-                            : isCallRemoved
-                            ? (isDark ? "repeating-linear-gradient(45deg, #991b1b, #991b1b 3px, #2d0a0a 3px, #2d0a0a 6px)" : "repeating-linear-gradient(45deg, #fca5a5, #fca5a5 3px, #fef2f2 3px, #fef2f2 6px)")
-                            : "#64748b",
-                          border: isCallRemoved ? "1px solid #ef4444" : "none"
-                        }} />
-                      </div>
-                      <span style={{
-                        fontFamily: "monospace",
-                        fontSize: 10,
-                        fontWeight: 700,
-                        color: isCallBuilt ? "#ef4444" : isCallRemoved ? (isDark ? "#fca5a5" : "#b91c1c") : t.textMuted,
-                        whiteSpace: "nowrap"
-                      }}>
-                        {s.callDeltaFormatted}
-                      </span>
-                      {isRoof && (
-                        <span style={{ background: "#ef4444", color: "#fff", fontSize: 8, fontWeight: 900, padding: "1px 5px", borderRadius: 3 }}>
-                          ROOF
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* LEGEND BAR */}
-          <div style={{
-            display: "flex",
-            justifyContent: "center",
-            gap: 14,
-            flexWrap: "wrap",
-            paddingTop: 12,
-            marginTop: 12,
-            borderTop: `1px solid ${t.border}`,
-            fontSize: 10,
-            color: t.textMuted
-          }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ display: "inline-block", width: 12, height: 10, background: "#22c55e", borderRadius: 2 }} />
-              floor being built (Put writing)
-            </span>
-            <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ display: "inline-block", width: 12, height: 10, border: "1px solid #22c55e", background: isDark ? "#052e16" : "#f0fdf4", borderRadius: 2 }} />
-              floor being removed (unwinding)
-            </span>
-            <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ display: "inline-block", width: 12, height: 10, background: "#ef4444", borderRadius: 2 }} />
-              roof being built (Call writing)
-            </span>
-            <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ display: "inline-block", width: 12, height: 10, border: "1px solid #ef4444", background: isDark ? "#2d0a0a" : "#fef2f2", borderRadius: 2 }} />
-              roof being removed (covering)
-            </span>
-          </div>
-
-          {/* SUMMARY STRIP */}
-          <div style={{
-            background: isDark ? "#040810" : "#f8fafc",
-            border: `1px solid ${t.border}`,
-            borderRadius: 6,
-            padding: "8px 10px",
-            marginTop: 10,
-            fontSize: 11,
-            color: t.textSub,
-            textAlign: "center",
-            fontFamily: "monospace"
-          }}>
-            Floor <strong style={{ color: "#16a34a" }}>{floor}</strong> · Roof <strong style={{ color: "#ef4444" }}>{roof}</strong> · put writing <span style={{ color: "#16a34a" }}>{oiData?.totalPutWritingFormatted}</span> vs call writing <span style={{ color: "#ef4444" }}>{oiData?.totalCallWritingFormatted}</span> · {oiData?.balanceStatus} · PCR <strong>{oiData?.pcr}</strong> · ΔPCR <strong>{oiData?.deltaPcr}</strong>
-          </div>
-        </div>
-
-        {/* ── RIGHT: ARGON'S DAILY PREDICTION & CONFLUENCE ── */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-
-          {/* ARGON HEADER & DAY SELECTOR */}
-          <div style={{
-            background: t.surface,
+            background: isDark ? "#080f1a" : "#ffffff",
             border: `1.5px solid ${t.border}`,
             borderRadius: 12,
-            padding: "16px",
-            boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
+            padding: isMobile ? "12px 8px" : "16px",
+            overflowX: "auto"
           }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, padding: "0 6px" }}>
               <div>
-                <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>🎯 ARGON WEEKLY & DAILY PREDICTION</div>
-                <div style={{ fontSize: 10, color: t.textMuted }}>Price Action Model & Execution Triggers</div>
+                <div style={{ fontSize: isMobile ? 13 : 14, fontWeight: 800, color: t.text }}>
+                  NIFTY OI change today (contracts) · expiry {oiData?.expiryDate || "Current"}
+                </div>
+                <div style={{ fontSize: 10, color: t.textMuted }}>
+                  Live institutional strike additions and unwinding
+                </div>
               </div>
-              <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
-                target="_blank" rel="noreferrer"
-                style={{ fontSize: 11, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
-                Doc ↗
-              </a>
+              <span style={{ fontSize: 10, color: t.textMuted, fontFamily: "monospace" }}>{oiData?.timestamp}</span>
             </div>
 
-            {/* DAY SELECTOR BUTTONS */}
-            <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
-              {(argonData?.sessions || []).map((sess, idx) => {
-                const label = sess.session.split("(")[0].trim();
-                const isSelected = selectedDayIdx === idx;
+            {/* TABLE HEADER */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 85px 1fr",
+              padding: "8px 0",
+              fontSize: 10,
+              fontWeight: 800,
+              textTransform: "uppercase",
+              borderBottom: `1px solid ${t.border}`,
+              color: t.textMuted,
+              textAlign: "center"
+            }}>
+              <div style={{ textAlign: "right", paddingRight: 8 }}>put writers ΔOI</div>
+              <div>strike</div>
+              <div style={{ textAlign: "left", paddingLeft: 8 }}>ΔOI call writers</div>
+            </div>
+
+            {/* STRIKE ROWS */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 6 }}>
+              {strikes.map((s, idx) => {
+                const strike = s.strike;
+                const isRoof = strike === roof;
+                const isFloor = strike === floor;
+
+                const prevStrike = idx > 0 ? strikes[idx - 1].strike : 999999;
+                const showSpotAbove = prevStrike > spot && strike <= spot;
+
+                const pDoi = s.putDeltaOI;
+                const cDoi = s.callDeltaOI;
+
+                const pWidth = Math.min(100, Math.round((Math.abs(pDoi) / maxBarVal) * 95));
+                const cWidth = Math.min(100, Math.round((Math.abs(cDoi) / maxBarVal) * 95));
+
+                const isPutBuilt = pDoi > 0;
+                const isPutRemoved = pDoi < 0;
+                const isCallBuilt = cDoi > 0;
+                const isCallRemoved = cDoi < 0;
+
                 return (
-                  <button key={sess.session} onClick={() => setSelectedDayIdx(idx)} style={{
-                    padding: "6px 12px",
-                    borderRadius: 20,
-                    fontSize: 11,
-                    fontWeight: 700,
-                    cursor: "pointer",
-                    border: "none",
-                    background: isSelected ? t.accent : t.pillOff,
-                    color: isSelected ? "#fff" : t.pillOffText,
-                    outline: isSelected ? "none" : `1px solid ${t.border}`,
-                    whiteSpace: "nowrap"
-                  }}>
-                    {label}
-                  </button>
+                  <div key={strike}>
+                    {showSpotAbove && (
+                      <div style={{
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        margin: "4px 0", padding: "3px 0",
+                        borderTop: "1.5px dashed #38bdf8",
+                        borderBottom: "1.5px dashed #38bdf8",
+                        background: isDark ? "rgba(56, 189, 248, 0.08)" : "rgba(14, 165, 233, 0.08)"
+                      }}>
+                        <span style={{ fontFamily: "monospace", fontSize: 10.5, fontWeight: 900, color: "#38bdf8" }}>
+                          - - - - - - {spot.toFixed(2)} SPOT - - - - - -
+                        </span>
+                      </div>
+                    )}
+
+                    <div style={{
+                      display: "grid",
+                      gridTemplateColumns: "1fr 85px 1fr",
+                      alignItems: "center",
+                      minHeight: 26,
+                      fontSize: 11,
+                      background: (isRoof || isFloor) ? (isDark ? "rgba(255,255,255,0.04)" : "#f8fafc") : "transparent"
+                    }}>
+                      {/* LEFT: PUT WRITERS BAR */}
+                      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 5, minWidth: 0, paddingRight: 4 }}>
+                        {isFloor && (
+                          <span style={{ background: "#16a34a", color: "#fff", fontSize: 7.5, fontWeight: 900, padding: "1px 4px", borderRadius: 3 }}>
+                            FLOOR
+                          </span>
+                        )}
+                        <span style={{
+                          fontFamily: "monospace",
+                          fontSize: isMobile ? 9 : 10,
+                          fontWeight: 700,
+                          color: isPutBuilt ? "#16a34a" : isPutRemoved ? (isDark ? "#86efac" : "#65a30d") : t.textMuted,
+                          whiteSpace: "nowrap"
+                        }}>
+                          {s.putDeltaFormatted}
+                        </span>
+                        <div style={{ width: "60%", display: "flex", justifyContent: "flex-end" }}>
+                          <div style={{
+                            width: `${Math.max(2, pWidth)}%`,
+                            height: 14,
+                            borderRadius: "3px 0 0 3px",
+                            background: isPutBuilt
+                              ? "#22c55e"
+                              : isPutRemoved
+                              ? (isDark ? "repeating-linear-gradient(45deg, #166534, #166534 3px, #052e16 3px, #052e16 6px)" : "repeating-linear-gradient(45deg, #86efac, #86efac 3px, #f0fdf4 3px, #f0fdf4 6px)")
+                              : "#64748b",
+                            border: isPutRemoved ? "1px solid #16a34a" : "none"
+                          }} />
+                        </div>
+                      </div>
+
+                      {/* CENTER: STRIKE PRICE */}
+                      <div style={{
+                        textAlign: "center",
+                        fontFamily: "monospace",
+                        fontWeight: (isRoof || isFloor) ? 900 : 700,
+                        color: isRoof ? "#ef4444" : isFloor ? "#16a34a" : t.text,
+                        fontSize: isMobile ? 11 : 11.5,
+                        padding: "2px 0",
+                        borderRadius: 4,
+                        background: isRoof ? (isDark ? "#2d0a0a" : "#fee2e2") : isFloor ? (isDark ? "#052e16" : "#dcfce7") : "transparent"
+                      }}>
+                        {strike}
+                      </div>
+
+                      {/* RIGHT: CALL WRITERS BAR */}
+                      <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "center", gap: 5, minWidth: 0, paddingLeft: 4 }}>
+                        <div style={{ width: "60%", display: "flex", justifyContent: "flex-start" }}>
+                          <div style={{
+                            width: `${Math.max(2, cWidth)}%`,
+                            height: 14,
+                            borderRadius: "0 3px 3px 0",
+                            background: isCallBuilt
+                              ? "#ef4444"
+                              : isCallRemoved
+                              ? (isDark ? "repeating-linear-gradient(45deg, #991b1b, #991b1b 3px, #2d0a0a 3px, #2d0a0a 6px)" : "repeating-linear-gradient(45deg, #fca5a5, #fca5a5 3px, #fef2f2 3px, #fef2f2 6px)")
+                              : "#64748b",
+                            border: isCallRemoved ? "1px solid #ef4444" : "none"
+                          }} />
+                        </div>
+                        <span style={{
+                          fontFamily: "monospace",
+                          fontSize: isMobile ? 9 : 10,
+                          fontWeight: 700,
+                          color: isCallBuilt ? "#ef4444" : isCallRemoved ? (isDark ? "#fca5a5" : "#b91c1c") : t.textMuted,
+                          whiteSpace: "nowrap"
+                        }}>
+                          {s.callDeltaFormatted}
+                        </span>
+                        {isRoof && (
+                          <span style={{ background: "#ef4444", color: "#fff", fontSize: 7.5, fontWeight: 900, padding: "1px 4px", borderRadius: 3 }}>
+                            ROOF
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 );
               })}
             </div>
 
-            {/* ACTIVE DAY CARD */}
-            {currentSession && (
-              <div style={{ marginTop: 14 }}>
-                <div style={{
-                  padding: "10px 12px",
-                  borderRadius: 8,
-                  background: isDark ? "#0f1f38" : "#f1f5f9",
-                  borderLeft: `4px solid ${t.accent}`,
-                  marginBottom: 10
-                }}>
-                  <div style={{ fontSize: 13, fontWeight: 900, color: t.text }}>{currentSession.session}</div>
+            {/* LEGEND BAR */}
+            <div style={{
+              display: "flex",
+              justifyContent: "center",
+              gap: 12,
+              flexWrap: "wrap",
+              paddingTop: 12,
+              marginTop: 12,
+              borderTop: `1px solid ${t.border}`,
+              fontSize: 9.5,
+              color: t.textMuted
+            }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ display: "inline-block", width: 10, height: 9, background: "#22c55e", borderRadius: 2 }} />
+                floor built (Put writing)
+              </span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ display: "inline-block", width: 10, height: 9, border: "1px solid #22c55e", background: isDark ? "#052e16" : "#f0fdf4", borderRadius: 2 }} />
+                floor unwound
+              </span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ display: "inline-block", width: 10, height: 9, background: "#ef4444", borderRadius: 2 }} />
+                roof built (Call writing)
+              </span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ display: "inline-block", width: 10, height: 9, border: "1px solid #ef4444", background: isDark ? "#2d0a0a" : "#fef2f2", borderRadius: 2 }} />
+                roof covered
+              </span>
+            </div>
+
+            {/* SUMMARY STRIP */}
+            <div style={{
+              background: isDark ? "#040810" : "#f8fafc",
+              border: `1px solid ${t.border}`,
+              borderRadius: 6,
+              padding: "8px 10px",
+              marginTop: 10,
+              fontSize: 10.5,
+              color: t.textSub,
+              textAlign: "center",
+              fontFamily: "monospace"
+            }}>
+              Floor <strong style={{ color: "#16a34a" }}>{floor}</strong> · Roof <strong style={{ color: "#ef4444" }}>{roof}</strong> · P: <span style={{ color: "#16a34a" }}>{oiData?.totalPutWritingFormatted}</span> vs C: <span style={{ color: "#ef4444" }}>{oiData?.totalCallWritingFormatted}</span> · {oiData?.balanceStatus} · PCR <strong>{oiData?.pcr}</strong>
+            </div>
+          </div>
+        )}
+
+        {/* ── RIGHT: ARGON'S DAILY PREDICTION & CONFLUENCE ── */}
+        {(!isMobile || mobileView === "argon" || mobileView === "both") && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {/* ARGON HEADER & DAY SELECTOR */}
+            <div style={{
+              background: t.surface,
+              border: `1.5px solid ${t.border}`,
+              borderRadius: 12,
+              padding: isMobile ? "14px 12px" : "16px",
+              boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>🎯 ARGON DAILY &amp; WEEKLY MODEL</div>
+                  <div style={{ fontSize: 10, color: t.textMuted }}>Price Action Model &amp; Key Pivots</div>
+                </div>
+                <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
+                  target="_blank" rel="noreferrer"
+                  style={{ fontSize: 11, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
+                  Doc ↗
+                </a>
+              </div>
+
+              {/* DAY SELECTOR BUTTONS */}
+              <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
+                {(argonData?.sessions || []).map((sess, idx) => {
+                  const label = sess.session.split("(")[0].trim();
+                  const isSelected = selectedDayIdx === idx;
+                  return (
+                    <button key={sess.session} onClick={() => setSelectedDayIdx(idx)} style={{
+                      padding: "7px 12px",
+                      borderRadius: 20,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                      border: "none",
+                      background: isSelected ? t.accent : t.pillOff,
+                      color: isSelected ? "#fff" : t.pillOffText,
+                      outline: isSelected ? "none" : `1px solid ${t.border}`,
+                      whiteSpace: "nowrap",
+                      WebkitTapHighlightColor: "transparent"
+                    }}>
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* ACTIVE DAY CARD */}
+              {currentSession && (
+                <div style={{ marginTop: 14 }}>
                   <div style={{
-                    display: "inline-block",
-                    marginTop: 4,
-                    fontSize: 11,
-                    fontWeight: 800,
-                    color: currentSession.stance.includes("BEARISH") ? "#ef4444" : currentSession.stance.includes("BOUNCE") ? "#16a34a" : "#d97706",
-                    background: currentSession.stance.includes("BEARISH") ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#052e16" : "#dcfce7"),
-                    padding: "2px 7px",
-                    borderRadius: 4
+                    padding: "10px 12px",
+                    borderRadius: 8,
+                    background: isDark ? "#0f1f38" : "#f1f5f9",
+                    borderLeft: `4px solid ${t.accent}`,
+                    marginBottom: 10
                   }}>
-                    {currentSession.stance}
+                    <div style={{ fontSize: 13, fontWeight: 900, color: t.text }}>{currentSession.session}</div>
+                    <div style={{
+                      display: "inline-block",
+                      marginTop: 4,
+                      fontSize: 11,
+                      fontWeight: 800,
+                      color: currentSession.stance.includes("BEARISH") ? "#ef4444" : currentSession.stance.includes("BOUNCE") ? "#16a34a" : "#d97706",
+                      background: currentSession.stance.includes("BEARISH") ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#052e16" : "#dcfce7"),
+                      padding: "2px 7px",
+                      borderRadius: 4
+                    }}>
+                      {currentSession.stance}
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginBottom: 12 }}>
+                    <strong style={{ color: t.accentSub }}>Forecast &amp; Key Levels:</strong><br />
+                    {currentSession.forecast}
+                  </div>
+
+                  <div style={{
+                    background: isDark ? "rgba(220, 38, 38, 0.08)" : "#fef2f2",
+                    border: "1px solid rgba(220, 38, 38, 0.2)",
+                    borderRadius: 6,
+                    padding: "10px",
+                    fontSize: 11.5,
+                    lineHeight: 1.5,
+                    color: isDark ? "#fca5a5" : "#b91c1c",
+                    marginBottom: 10
+                  }}>
+                    <strong>Execution Rule (Day Before):</strong><br />
+                    {currentSession.action}
+                  </div>
+
+                  <div style={{ fontSize: 11, color: t.textMuted, lineHeight: 1.5 }}>
+                    <strong style={{ color: t.text }}>Sectors Guidance:</strong><br />
+                    {currentSession.sectors}
                   </div>
                 </div>
-
-                <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginBottom: 12 }}>
-                  <strong style={{ color: t.accentSub }}>Forecast & Key Levels:</strong><br />
-                  {currentSession.forecast}
-                </div>
-
-                <div style={{
-                  background: isDark ? "rgba(220, 38, 38, 0.08)" : "#fef2f2",
-                  border: "1px solid rgba(220, 38, 38, 0.2)",
-                  borderRadius: 6,
-                  padding: "10px",
-                  fontSize: 11.5,
-                  lineHeight: 1.5,
-                  color: isDark ? "#fca5a5" : "#b91c1c",
-                  marginBottom: 10
-                }}>
-                  <strong>Execution Rule (Day Before):</strong><br />
-                  {currentSession.action}
-                </div>
-
-                <div style={{ fontSize: 11, color: t.textMuted, lineHeight: 1.5 }}>
-                  <strong style={{ color: t.text }}>Sectors Guidance:</strong><br />
-                  {currentSession.sectors}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* ── CONFLUENCE VERDICT BOX: PRICE ACTION vs OPTIONS OI ── */}
-          <div style={{
-            background: isDark ? "#081b2e" : "#f0fdf4",
-            border: `1.5px solid ${isDark ? "#1e3a5f" : "#86efac"}`,
-            borderRadius: 12,
-            padding: "14px 16px"
-          }}>
-            <div style={{ fontSize: 12, fontWeight: 900, color: isDark ? "#38bdf8" : "#166534", textTransform: "uppercase" }}>
-              ⚡ LIVE CONFLUENCE VERDICT (Price Action + OI)
-            </div>
-            <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginTop: 8 }}>
-              • <strong>Roof Alignment:</strong> Call resistance wall at <strong>{roof}</strong> ({oiData?.totalCallWritingFormatted} calls built) acts as the hard ceiling.<br />
-              • <strong>Floor Alignment:</strong> Put support cushion at <strong>{floor}</strong> ({oiData?.totalPutWritingFormatted} puts built) is the active battleground.<br />
-              • <strong>Decision Rule:</strong>
-              {isSupportHeavier ? (
-                <span style={{ color: "#16a34a", fontWeight: 700 }}>
-                  {" "}Support is heavier. Favorable to take CALLS in strong accumulation stocks on dips toward {floor}.
-                </span>
-              ) : isResistanceHeavier ? (
-                <span style={{ color: "#ef4444", fontWeight: 700 }}>
-                  {" "}Resistance is heavier. Do not chase long stock calls into {roof}. Favor PUT setups in high distribution stocks.
-                </span>
-              ) : (
-                <span style={{ color: "#d97706", fontWeight: 700 }}>
-                  {" "}Market is balanced within {floor}–{roof}. Play quick range-reversals or stay selective in Tier A names.
-                </span>
               )}
             </div>
+
+            {/* ── CONFLUENCE VERDICT BOX ── */}
+            <div style={{
+              background: isDark ? "#081b2e" : "#f0fdf4",
+              border: `1.5px solid ${isDark ? "#1e3a5f" : "#86efac"}`,
+              borderRadius: 12,
+              padding: "14px 16px"
+            }}>
+              <div style={{ fontSize: 12, fontWeight: 900, color: isDark ? "#38bdf8" : "#166534", textTransform: "uppercase" }}>
+                ⚡ LIVE CONFLUENCE VERDICT (Price Action + OI)
+              </div>
+              <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginTop: 8 }}>
+                • <strong>Roof Alignment:</strong> Call resistance wall at <strong>{roof}</strong> ({oiData?.totalCallWritingFormatted} calls built) acts as the hard ceiling.<br />
+                • <strong>Floor Alignment:</strong> Put support cushion at <strong>{floor}</strong> ({oiData?.totalPutWritingFormatted} puts built) is the active battleground.<br />
+                • <strong>Decision Rule:</strong>
+                {isSupportHeavier ? (
+                  <span style={{ color: "#16a34a", fontWeight: 700 }}>
+                    {" "}Support is heavier. Favorable to take CALLS in strong accumulation stocks on dips toward {floor}.
+                  </span>
+                ) : isResistanceHeavier ? (
+                  <span style={{ color: "#ef4444", fontWeight: 700 }}>
+                    {" "}Resistance is heavier. Do not chase long stock calls into {roof}. Favor PUT setups in high distribution stocks.
+                  </span>
+                ) : (
+                  <span style={{ color: "#d97706", fontWeight: 700 }}>
+                    {" "}Market is balanced within {floor}–{roof}. Play quick range-reversals or stay selective in Tier A names.
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
-        </div>
+        )}
 
       </div>
     </div>
