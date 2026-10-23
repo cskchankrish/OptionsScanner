@@ -4,14 +4,36 @@ import { useState, useEffect, useMemo, useRef } from "react";
 let globalOiCache = null;
 let globalArgonCache = null;
 
-function useIsMobile() {
-  const [mobile, setMobile] = useState(() => (typeof window !== "undefined" ? window.innerWidth < 768 : false));
+function useResponsive() {
+  const [dim, setDim] = useState(() => {
+    const w = typeof window !== "undefined" ? window.innerWidth : 1200;
+    return {
+      isMobile: w < 768,
+      isTablet: w >= 768 && w < 1024,
+      isDesktop: w >= 1024,
+      width: w,
+    };
+  });
+
   useEffect(() => {
-    const fn = () => setMobile(window.innerWidth < 768);
+    const fn = () => {
+      const w = window.innerWidth;
+      setDim({
+        isMobile: w < 768,
+        isTablet: w >= 768 && w < 1024,
+        isDesktop: w >= 1024,
+        width: w,
+      });
+    };
     window.addEventListener("resize", fn);
     return () => window.removeEventListener("resize", fn);
   }, []);
-  return mobile;
+
+  return dim;
+}
+
+function useIsMobile() {
+  return useResponsive().isMobile;
 }
 
 function formatLots(n) {
@@ -82,7 +104,7 @@ function findBestSessionIndex(sessions, serverDayName) {
 }
 
 function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
-  const isMobile = useIsMobile();
+  const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
   const [threshold, setThreshold] = useState(75000); // Institutional Conviction Threshold (Default: 75k)
@@ -101,13 +123,13 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
     ];
   }, [timeline, spot]);
 
-  // SVG dimensions
-  const svgWidth = 850;
-  const svgHeight = isMobile ? (zoom > 1 ? 280 : 250) : 220;
-  const padLeft = isMobile ? 55 : 65;
-  const padRight = 30;
-  const padTop = 30;
-  const padBottom = 35;
+  // Responsive SVG canvas dimensions
+  const svgWidth = isMobile ? 850 : isTablet ? 980 : 1100;
+  const svgHeight = isMobile ? 260 : isTablet ? 300 : 340;
+  const padLeft = isMobile ? 55 : isTablet ? 65 : 75;
+  const padRight = isMobile ? 25 : isTablet ? 30 : 35;
+  const padTop = isMobile ? 26 : isTablet ? 30 : 34;
+  const padBottom = isMobile ? 36 : isTablet ? 40 : 44;
   const plotW = svgWidth - padLeft - padRight;
   const plotH = svgHeight - padTop - padBottom;
 
@@ -223,13 +245,45 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
   const isBullBreach = currentDiff >= threshold;
   const isBearBreach = currentDiff <= -threshold;
 
+  // Responsive chart height in CSS pixels
+  const chartHeightPx = useMemo(() => {
+    if (isFullscreen) return "calc(100vh - 170px)";
+    if (isMobile) {
+      if (zoom === 1) return "260px";
+      if (zoom === 1.5) return "310px";
+      return "360px"; // 2x
+    }
+    if (isTablet) {
+      if (zoom === 1) return "320px";
+      if (zoom === 1.5) return "390px";
+      return "460px"; // 2x
+    }
+    // Desktop (>= 1024px)
+    if (zoom === 1) return "380px";
+    if (zoom === 1.5) return "460px";
+    return "540px"; // 2x! Expands both vertically and horizontally
+  }, [isFullscreen, isMobile, isTablet, zoom]);
+
+  const getSvgWidth = () => {
+    if (zoom === 1) return "100%";
+    if (zoom === 1.5) return "150%";
+    return "200%";
+  };
+
+  const getSvgMinWidth = () => {
+    if (zoom === 1) return "100%";
+    if (isMobile) return zoom === 1.5 ? "900px" : "1200px";
+    if (isTablet) return zoom === 1.5 ? "1200px" : "1600px";
+    return zoom === 1.5 ? "1600px" : "2200px";
+  };
+
   const renderSvgContent = () => (
     <svg
       viewBox={`0 0 ${svgWidth} ${svgHeight}`}
       style={{
-        width: zoom === 1 ? "100%" : `${zoom * 100}%`,
-        minWidth: zoom === 1 ? "100%" : `${zoom * 650}px`,
-        height: isMobile ? (zoom > 1 ? 280 : 240) : 220,
+        width: getSvgWidth(),
+        minWidth: getSvgMinWidth(),
+        height: chartHeightPx,
         display: "block",
         cursor: "crosshair",
         touchAction: zoom > 1 ? "pan-x" : "auto"
@@ -272,11 +326,11 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             />
             <text
               x={x}
-              y={padTop + plotH + (isMobile ? 16 : 18)}
+              y={padTop + plotH + (isMobile ? 18 : 22)}
               fill={t.textMuted}
-              fontSize={isMobile ? "11" : "10"}
+              fontSize={isMobile ? "10.5" : isTablet ? "12" : "13"}
               fontFamily="monospace"
-              fontWeight="600"
+              fontWeight="700"
               textAnchor={i === 0 ? "start" : i === timeLabels.length - 1 ? "end" : "middle"}
             >
               {tl.label}
@@ -302,14 +356,14 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             x1={padLeft} y1={yDiffPos(threshold)}
             x2={padLeft + plotW} y2={yDiffPos(threshold)}
             stroke="#16a34a"
-            strokeWidth="1.25"
+            strokeWidth={isMobile ? "1.25" : "1.75"}
             strokeDasharray="4 3"
           />
           <text
             x={padLeft + plotW - 4}
-            y={yDiffPos(threshold) - 3}
+            y={yDiffPos(threshold) - 4}
             fill="#16a34a"
-            fontSize={isMobile ? "9.5" : "8.5"}
+            fontSize={isMobile ? "9.5" : isTablet ? "11" : "12"}
             fontWeight="800"
             fontFamily="monospace"
             textAnchor="end"
@@ -322,14 +376,14 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             x1={padLeft} y1={yDiffPos(-threshold)}
             x2={padLeft + plotW} y2={yDiffPos(-threshold)}
             stroke="#ef4444"
-            strokeWidth="1.25"
+            strokeWidth={isMobile ? "1.25" : "1.75"}
             strokeDasharray="4 3"
           />
           <text
             x={padLeft + plotW - 4}
-            y={yDiffPos(-threshold) + (isMobile ? 12 : 10)}
+            y={yDiffPos(-threshold) + (isMobile ? 12 : 14)}
             fill="#ef4444"
-            fontSize={isMobile ? "9.5" : "8.5"}
+            fontSize={isMobile ? "9.5" : isTablet ? "11" : "12"}
             fontWeight="800"
             fontFamily="monospace"
             textAnchor="end"
@@ -342,16 +396,16 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             x1={padLeft} y1={yCenter}
             x2={padLeft + plotW} y2={yCenter}
             stroke={isDark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.25)"}
-            strokeWidth="1.5"
+            strokeWidth={isMobile ? "1.5" : "2"}
             strokeDasharray="4 4"
           />
-          <text x={padLeft - 6} y={yCenter + 3} fill={t.textMuted} fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace">
+          <text x={padLeft - 8} y={yCenter + 4} fill={t.textMuted} fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace" fontWeight="700">
             0
           </text>
-          <text x={padLeft - 6} y={padTop + 10} fill="#16a34a" fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace" fontWeight="700">
+          <text x={padLeft - 8} y={padTop + 12} fill="#16a34a" fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace" fontWeight="800">
             +{formatLots(maxDiff)}
           </text>
-          <text x={padLeft - 6} y={padTop + plotH} fill="#ef4444" fontSize={isMobile ? "10" : "9"} textAnchor="end" fontFamily="monospace" fontWeight="700">
+          <text x={padLeft - 8} y={padTop + plotH} fill="#ef4444" fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace" fontWeight="800">
             -{formatLots(maxDiff)}
           </text>
 
@@ -359,7 +413,7 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
           <path d={diffAreaPath} fill="url(#diffGrad)" />
 
           {/* MAIN NET LINE */}
-          <path d={diffLinePath} fill="none" stroke="#38bdf8" strokeWidth={isMobile ? "3" : "2.5"} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={diffLinePath} fill="none" stroke="#38bdf8" strokeWidth={isMobile ? "3" : isTablet ? "3.5" : "4"} strokeLinecap="round" strokeLinejoin="round" />
 
           {/* POINTS */}
           {points.map((p, idx) => (
@@ -367,10 +421,10 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
               key={idx}
               cx={xPos(p.minutes)}
               cy={yDiffPos(p.netDiff)}
-              r={idx === points.length - 1 ? (isMobile ? 5 : 4.5) : (isMobile ? 3 : 2.5)}
+              r={idx === points.length - 1 ? (isMobile ? 5.5 : isTablet ? 7 : 8) : (isMobile ? 3 : isTablet ? 4 : 5)}
               fill={p.netDiff >= 0 ? "#22c55e" : "#ef4444"}
               stroke={isDark ? "#080f1a" : "#fff"}
-              strokeWidth="1.5"
+              strokeWidth={isMobile ? "1.5" : "2"}
             />
           ))}
         </>
@@ -383,41 +437,41 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             x1={padLeft} y1={padTop + plotH}
             x2={padLeft + plotW} y2={padTop + plotH}
             stroke={isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)"}
-            strokeWidth="1"
+            strokeWidth="1.5"
           />
-          <text x={padLeft - 6} y={padTop + plotH} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+          <text x={padLeft - 8} y={padTop + plotH} fill={t.textMuted} fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace">
             0
           </text>
-          <text x={padLeft - 6} y={padTop + plotH / 2} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace">
+          <text x={padLeft - 8} y={padTop + plotH / 2} fill={t.textMuted} fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace">
             {formatLots(maxDual / 2)}
           </text>
-          <text x={padLeft - 6} y={padTop + 10} fill={t.textMuted} fontSize="9" textAnchor="end" fontFamily="monospace" fontWeight="700">
+          <text x={padLeft - 8} y={padTop + 12} fill={t.textMuted} fontSize={isMobile ? "10" : "12"} textAnchor="end" fontFamily="monospace" fontWeight="800">
             {formatLots(maxDual)}
           </text>
 
           <path d={putAreaPath} fill="url(#putGrad)" />
           <path d={callAreaPath} fill="url(#callGrad)" />
 
-          <path d={putLinePath} fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-          <path d={callLinePath} fill="none" stroke="#ef4444" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={putLinePath} fill="none" stroke="#22c55e" strokeWidth={isMobile ? "2.5" : isTablet ? "3" : "3.5"} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={callLinePath} fill="none" stroke="#ef4444" strokeWidth={isMobile ? "2.5" : isTablet ? "3" : "3.5"} strokeLinecap="round" strokeLinejoin="round" />
 
           {points.map((p, idx) => (
             <g key={idx}>
               <circle
                 cx={xPos(p.minutes)}
                 cy={yDualPos(p.putWriting)}
-                r={idx === points.length - 1 ? 4 : 2}
+                r={idx === points.length - 1 ? (isMobile ? 5 : 6.5) : (isMobile ? 3 : 4)}
                 fill="#22c55e"
                 stroke={isDark ? "#080f1a" : "#fff"}
-                strokeWidth="1"
+                strokeWidth="1.5"
               />
               <circle
                 cx={xPos(p.minutes)}
                 cy={yDualPos(p.callWriting)}
-                r={idx === points.length - 1 ? 4 : 2}
+                r={idx === points.length - 1 ? (isMobile ? 5 : 6.5) : (isMobile ? 3 : 4)}
                 fill="#ef4444"
                 stroke={isDark ? "#080f1a" : "#fff"}
-                strokeWidth="1"
+                strokeWidth="1.5"
               />
             </g>
           ))}
@@ -433,35 +487,35 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             x2={xPos(hovered.minutes)}
             y2={padTop + plotH}
             stroke={isDark ? "#38bdf8" : "#0284c7"}
-            strokeWidth="1.5"
-            strokeDasharray="2 2"
+            strokeWidth={isMobile ? "1.5" : "2"}
+            strokeDasharray="3 3"
           />
           {mode === "diff" ? (
             <circle
               cx={xPos(hovered.minutes)}
               cy={yDiffPos(hovered.netDiff)}
-              r="6"
+              r={isMobile ? 6 : 8}
               fill="#38bdf8"
               stroke="#fff"
-              strokeWidth="2"
+              strokeWidth="2.5"
             />
           ) : (
             <>
               <circle
                 cx={xPos(hovered.minutes)}
                 cy={yDualPos(hovered.putWriting)}
-                r="5"
+                r={isMobile ? 5 : 7}
                 fill="#22c55e"
                 stroke="#fff"
-                strokeWidth="1.5"
+                strokeWidth="2"
               />
               <circle
                 cx={xPos(hovered.minutes)}
                 cy={yDualPos(hovered.callWriting)}
-                r="5"
+                r={isMobile ? 5 : 7}
                 fill="#ef4444"
                 stroke="#fff"
-                strokeWidth="1.5"
+                strokeWidth="2"
               />
             </>
           )}
@@ -484,11 +538,11 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: isMobile ? 14 : 15, fontWeight: 900, color: t.text }}>
+              <span style={{ fontSize: isMobile ? 14 : isTablet ? 16 : 17, fontWeight: 900, color: t.text }}>
                 📈 INTRADAY CALL vs PUT &amp; ΔOI
               </span>
               <span style={{
-                fontSize: 10,
+                fontSize: isMobile ? 10 : 11,
                 fontWeight: 800,
                 padding: "3px 8px",
                 borderRadius: 6,
@@ -507,13 +561,13 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                   : `⚪ CHOP (±${formatLots(threshold)})`}
               </span>
             </div>
-            <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 2 }}>
-              09:15 → 15:30 IST · Drag finger or pinch to inspect timeline
+            <div style={{ fontSize: isMobile ? 10.5 : 12, color: t.textMuted, marginTop: 3 }}>
+              09:15 → 15:30 IST · Drag timeline to inspect live 5-minute cumulative writing delta
             </div>
           </div>
 
           {/* CONTROLS BAR: MODE + THRESHOLD + ZOOM */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             {/* MODE TOGGLE */}
             <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
               <button
@@ -521,8 +575,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                 style={{
                   background: mode === "diff" ? t.accent : "transparent",
                   color: mode === "diff" ? "#fff" : t.textMuted,
-                  border: "none", borderRadius: 6, padding: "5px 8px",
-                  fontSize: 10.5, fontWeight: 800, cursor: "pointer",
+                  border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
+                  fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
                   WebkitTapHighlightColor: "transparent"
                 }}>
                 ⚡ Net Diff
@@ -532,25 +586,25 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                 style={{
                   background: mode === "dual" ? t.accent : "transparent",
                   color: mode === "dual" ? "#fff" : t.textMuted,
-                  border: "none", borderRadius: 6, padding: "5px 8px",
-                  fontSize: 10.5, fontWeight: 800, cursor: "pointer",
+                  border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
+                  fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
                   WebkitTapHighlightColor: "transparent"
                 }}>
                 📊 Dual
               </button>
             </div>
 
-            {/* ZOOM TOGGLE (Mobile friendly) */}
+            {/* ZOOM TOGGLE (Mobile, Tablet, Desktop) */}
             <div style={{
-              display: "flex", alignItems: "center", gap: 2,
+              display: "flex", alignItems: "center", gap: 3,
               background: isDark ? "#0f172a" : "#f1f5f9",
-              padding: "2px 5px", borderRadius: 8, border: `1px solid ${t.border}`
+              padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
             }}>
-              <span style={{ fontSize: 9.5, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>🔍</span>
+              <span style={{ fontSize: isMobile ? 9.5 : 11, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>🔍 Zoom:</span>
               {[
-                { label: "1x", val: 1 },
-                { label: "1.5x", val: 1.5 },
-                { label: "2x", val: 2 },
+                { label: isMobile ? "1x" : "1x Fit", val: 1 },
+                { label: isMobile ? "1.5x" : "1.5x", val: 1.5 },
+                { label: isMobile ? "2x" : "2x Zoom", val: 2 },
               ].map(z => (
                 <button
                   key={z.val}
@@ -559,8 +613,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                     background: zoom === z.val ? t.accent : "transparent",
                     color: zoom === z.val ? "#fff" : t.textMuted,
                     border: "none",
-                    borderRadius: 4, padding: "3px 6px",
-                    fontSize: 10, fontWeight: 800, cursor: "pointer",
+                    borderRadius: 4, padding: isMobile ? "3px 6px" : "5px 10px",
+                    fontSize: isMobile ? 10 : 12, fontWeight: 800, cursor: "pointer",
                     WebkitTapHighlightColor: "transparent"
                   }}>
                   {z.label}
@@ -573,8 +627,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                   background: "transparent",
                   color: t.accentSub,
                   border: "none",
-                  borderRadius: 4, padding: "3px 5px",
-                  fontSize: 11, fontWeight: 800, cursor: "pointer"
+                  borderRadius: 4, padding: isMobile ? "3px 5px" : "5px 8px",
+                  fontSize: isMobile ? 11 : 13, fontWeight: 800, cursor: "pointer"
                 }}>
                 ⛶
               </button>
@@ -583,11 +637,11 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             {/* THRESHOLD SELECTOR */}
             {mode === "diff" && (
               <div style={{
-                display: "flex", alignItems: "center", gap: 2,
+                display: "flex", alignItems: "center", gap: 3,
                 background: isDark ? "#0f172a" : "#f1f5f9",
-                padding: "2px 5px", borderRadius: 8, border: `1px solid ${t.border}`
+                padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
               }}>
-                <span style={{ fontSize: 9.5, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Edge:</span>
+                <span style={{ fontSize: isMobile ? 9.5 : 11, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Edge:</span>
                 {[50000, 75000, 100000].map(val => (
                   <button
                     key={val}
@@ -596,8 +650,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                       background: threshold === val ? t.accent : "transparent",
                       color: threshold === val ? "#fff" : t.textMuted,
                       border: "none",
-                      borderRadius: 4, padding: "3px 5px",
-                      fontSize: 10, fontWeight: 800, cursor: "pointer",
+                      borderRadius: 4, padding: isMobile ? "3px 5px" : "5px 9px",
+                      fontSize: isMobile ? 10 : 11.5, fontWeight: 800, cursor: "pointer",
                       WebkitTapHighlightColor: "transparent"
                     }}>
                     {formatLots(val)}
@@ -614,22 +668,24 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
           style={{
             position: "relative",
             width: "100%",
-            overflowX: "auto",
+            overflowX: zoom > 1 ? "auto" : "hidden",
             WebkitOverflowScrolling: "touch",
-            border: zoom > 1 ? `1px dashed ${t.border}` : "none",
+            border: zoom > 1 ? `1.5px dashed ${t.accent}` : "none",
             borderRadius: 8,
             paddingBottom: 4
           }}
         >
           {zoom > 1 && (
             <div style={{
-              position: "absolute", top: 6, right: 8,
-              fontSize: 9.5, color: t.accentSub,
-              background: isDark ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.9)",
-              padding: "2px 8px", borderRadius: 4, pointerEvents: "none", zIndex: 5,
-              border: `1px solid ${t.border}`
+              position: "absolute", top: 8, right: 10,
+              fontSize: isMobile ? 9.5 : 11.5, fontWeight: 700,
+              color: isDark ? "#38bdf8" : "#0284c7",
+              background: isDark ? "rgba(15, 23, 42, 0.92)" : "rgba(255, 255, 255, 0.95)",
+              padding: "4px 10px", borderRadius: 6, pointerEvents: "none", zIndex: 5,
+              border: `1px solid ${isDark ? "#1e3a5f" : "#bae6fd"}`,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.15)"
             }}>
-              👉 Swipe horizontally across timeline
+              {isMobile ? "👉 Swipe horizontally to inspect" : "↔️ Scroll or drag horizontally across timeline"}
             </div>
           )}
           {renderSvgContent()}
@@ -641,28 +697,28 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
           justifyContent: "space-between",
           alignItems: "center",
           flexWrap: "wrap",
-          gap: 8,
-          padding: "8px 10px",
-          marginTop: 6,
+          gap: 10,
+          padding: isMobile ? "8px 10px" : "12px 16px",
+          marginTop: 8,
           background: isDark ? "#0a1628" : "#f8fafc",
           borderRadius: 8,
-          border: `1px solid ${t.border}`,
-          fontSize: 11
+          border: `1.5px solid ${t.border}`,
+          fontSize: isMobile ? 11 : 13
         }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 8 : 16, flexWrap: "wrap" }}>
             <span>
-              <strong style={{ color: t.text }}>Time:</strong> <span style={{ fontFamily: "monospace" }}>{hovered?.time || "—"}</span>
+              <strong style={{ color: t.text }}>Time:</strong> <span style={{ fontFamily: "monospace", fontWeight: 700 }}>{hovered?.time || "—"}</span>
             </span>
             {hovered?.spot && (
               <span>
-                <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace" }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
+                <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace", fontWeight: 700 }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
               </span>
             )}
             <span>
-              <strong style={{ color: "#16a34a" }}>Put:</strong> <span style={{ fontFamily: "monospace", color: "#16a34a", fontWeight: 700 }}>+{formatLots(hovered?.putWriting)}</span>
+              <strong style={{ color: "#16a34a" }}>Put:</strong> <span style={{ fontFamily: "monospace", color: "#16a34a", fontWeight: 800 }}>+{formatLots(hovered?.putWriting)}</span>
             </span>
             <span>
-              <strong style={{ color: "#ef4444" }}>Call:</strong> <span style={{ fontFamily: "monospace", color: "#ef4444", fontWeight: 700 }}>+{formatLots(hovered?.callWriting)}</span>
+              <strong style={{ color: "#ef4444" }}>Call:</strong> <span style={{ fontFamily: "monospace", color: "#ef4444", fontWeight: 800 }}>+{formatLots(hovered?.callWriting)}</span>
             </span>
             <span>
               <strong style={{ color: t.text }}>Net:</strong>{" "}
@@ -676,8 +732,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
             </span>
           </div>
 
-          <div style={{ fontSize: 10, color: t.textMuted }}>
-            {zoom > 1 ? "🔍 Zoomed (Swipe to pan)" : "💡 Tap/drag to inspect"}
+          <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, fontWeight: 600 }}>
+            {zoom > 1 ? `🔍 Zoom Active (${zoom}x) · Drag timeline to inspect` : "💡 Hover or drag to inspect any 5m bar"}
           </div>
         </div>
       </div>
@@ -747,7 +803,7 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
 }
 
 export function NiftyFlowView({ t, isDark }) {
-  const isMobile = useIsMobile();
+  const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mobileView, setMobileView] = useState("chart"); // "chart", "argon", "both"
   const [oiData, setOiData] = useState(() => globalOiCache);
   const [argonData, setArgonData] = useState(() => globalArgonCache);
@@ -863,33 +919,33 @@ export function NiftyFlowView({ t, isDark }) {
   const isResistanceHeavier = oiData?.balanceStatus?.toLowerCase().includes("resistance");
 
   return (
-    <div style={{ padding: isMobile ? "10px" : "14px", maxWidth: 1300, margin: "0 auto" }}>
+    <div style={{ padding: isMobile ? "10px" : "16px 20px", maxWidth: 1400, margin: "0 auto" }}>
       {/* ── TOP LIVE CONSOLIDATOR BANNER ── */}
       <div style={{
         background: t.surface,
         border: `1.5px solid ${t.border}`,
         borderRadius: 12,
-        padding: isMobile ? "12px 14px" : "16px 18px",
+        padding: isMobile ? "12px 14px" : "16px 20px",
         marginBottom: 16,
         boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
       }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ fontSize: isMobile ? 16 : 18, fontWeight: 900, color: t.text }}>⚡ NIFTY LIVE OI CONSOLIDATOR</span>
+              <span style={{ fontSize: isMobile ? 16 : isTablet ? 18 : 20, fontWeight: 900, color: t.text }}>⚡ NIFTY LIVE OI CONSOLIDATOR</span>
               <span style={{
                 background: isSupportHeavier ? (isDark ? "#052e16" : "#dcfce7") : isResistanceHeavier ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#1e293b" : "#f1f5f9"),
                 color: isSupportHeavier ? "#16a34a" : isResistanceHeavier ? "#ef4444" : "#d97706",
-                padding: "3px 8px", borderRadius: 6, fontSize: 11, fontWeight: 800,
+                padding: "3px 8px", borderRadius: 6, fontSize: isMobile ? 11 : 12, fontWeight: 800,
                 border: `1px solid ${isSupportHeavier ? "#16a34a44" : isResistanceHeavier ? "#ef444444" : "#d9770644"}`
               }}>
                 {oiData?.balanceStatus || "Balanced"}
               </span>
-              <span style={{ fontSize: 11, color: t.textMuted }}>
+              <span style={{ fontSize: isMobile ? 11 : 12, color: t.textMuted }}>
                 ● {oiData?.timestamp || "Live"} · Expiry {oiData?.expiryDate || "Near"}
               </span>
             </div>
-            <div style={{ fontSize: 11.5, color: t.textSub, marginTop: 4 }}>
+            <div style={{ fontSize: isMobile ? 11.5 : 12.5, color: t.textSub, marginTop: 4 }}>
               <strong>Action Bias:</strong> {oiData?.recommendation || "Evaluate support/resistance before entering stock options."}
             </div>
           </div>
@@ -900,9 +956,9 @@ export function NiftyFlowView({ t, isDark }) {
               <div style={{
                 display: "flex", alignItems: "center", gap: 3,
                 background: isDark ? "#0f172a" : "#f1f5f9",
-                padding: "2px 6px", borderRadius: 8, border: `1px solid ${t.border}`
+                padding: "3px 6px", borderRadius: 8, border: `1px solid ${t.border}`
               }}>
-                <span style={{ fontSize: 10, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Auto:</span>
+                <span style={{ fontSize: isMobile ? 10 : 11, color: t.textMuted, fontWeight: 700, marginRight: 2 }}>Auto:</span>
                 {[
                   { label: "1 min", sec: 60 },
                   { label: "2 min", sec: 120 },
@@ -915,8 +971,8 @@ export function NiftyFlowView({ t, isDark }) {
                       background: refreshIntervalSec === opt.sec ? t.accent : "transparent",
                       color: refreshIntervalSec === opt.sec ? "#fff" : t.textMuted,
                       border: "none",
-                      borderRadius: 4, padding: "3px 7px",
-                      fontSize: 10, fontWeight: 800, cursor: "pointer",
+                      borderRadius: 4, padding: isMobile ? "3px 7px" : "4px 9px",
+                      fontSize: isMobile ? 10 : 11.5, fontWeight: 800, cursor: "pointer",
                       WebkitTapHighlightColor: "transparent"
                     }}>
                     {opt.label}
@@ -929,9 +985,9 @@ export function NiftyFlowView({ t, isDark }) {
             {marketStatus.isAutoActive ? (
               <div style={{
                 display: "flex", alignItems: "center", gap: 6,
-                fontSize: 11, color: t.textMuted,
+                fontSize: isMobile ? 11 : 12, color: t.textMuted,
                 background: isDark ? "#0f172a" : "#f1f5f9",
-                padding: "5px 9px", borderRadius: 6,
+                padding: isMobile ? "5px 9px" : "6px 12px", borderRadius: 6,
                 border: `1px solid ${t.border}`,
                 fontFamily: "monospace"
               }}>
@@ -941,9 +997,9 @@ export function NiftyFlowView({ t, isDark }) {
             ) : (
               <div style={{
                 display: "flex", alignItems: "center", gap: 6,
-                fontSize: 11, color: isDark ? "#fbbf24" : "#b45309",
+                fontSize: isMobile ? 11 : 12, color: isDark ? "#fbbf24" : "#b45309",
                 background: isDark ? "#291e05" : "#fefce8",
-                padding: "5px 10px", borderRadius: 6,
+                padding: isMobile ? "5px 10px" : "6px 12px", borderRadius: 6,
                 border: `1px solid ${isDark ? "#78350f" : "#fef08a"}`,
                 fontFamily: "monospace", fontWeight: 700
               }}>
@@ -954,8 +1010,8 @@ export function NiftyFlowView({ t, isDark }) {
 
             <button onClick={loadAll} disabled={refreshing} style={{
               background: t.accentBg, border: `1px solid ${t.accent}`,
-              color: t.accentSub, borderRadius: 8, padding: "7px 12px",
-              fontSize: 12, fontWeight: 700, cursor: refreshing ? "default" : "pointer",
+              color: t.accentSub, borderRadius: 8, padding: isMobile ? "7px 12px" : "8px 14px",
+              fontSize: isMobile ? 12 : 13, fontWeight: 700, cursor: refreshing ? "default" : "pointer",
               WebkitTapHighlightColor: "transparent"
             }}>
               {refreshing ? "Refreshing…" : "🔄 Refresh"}
@@ -963,39 +1019,45 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
         </div>
 
-        {/* METRICS ROW (2x2 on mobile, 4-col on desktop) */}
+        {/* METRICS ROW (2x2 on mobile, 2x2 on tablet, 4-col on desktop) */}
         <div style={{
           display: "grid",
-          gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(auto-fit, minmax(180px, 1fr))",
-          gap: 10,
+          gridTemplateColumns: isMobile ? "1fr 1fr" : isTablet ? "repeat(2, 1fr)" : "repeat(4, 1fr)",
+          gap: isMobile ? 8 : 12,
           marginTop: 14,
-          paddingTop: 12,
+          paddingTop: 14,
           borderTop: `1px solid ${t.border}`
         }}>
-          <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
-            <div style={{ fontSize: 10, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Nifty Spot</div>
-            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: t.text }}>₹{spot.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-            <div style={{ fontSize: 9.5, color: t.textSub }}>Current Index Price</div>
+          <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: `1px solid ${t.border}` }}>
+            <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Nifty Spot</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : isTablet ? 22 : 25, fontWeight: 900, color: t.text, margin: "3px 0" }}>
+              ₹{spot.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </div>
+            <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub }}>Current Index Price</div>
           </div>
 
-          <div style={{ background: isDark ? "#052e16" : "#f0fdf4", padding: "10px 12px", borderRadius: 8, border: "1px solid #16a34a44" }}>
-            <div style={{ fontSize: 10, color: "#16a34a", textTransform: "uppercase", fontWeight: 800 }}>Floor (Support)</div>
-            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: "#16a34a" }}>{floor}</div>
-            <div style={{ fontSize: 9.5, color: isDark ? "#86efac" : "#15803d" }}>{oiData?.floorShift || "Support holding"}</div>
+          <div style={{ background: isDark ? "#052e16" : "#f0fdf4", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: "1px solid #16a34a44" }}>
+            <div style={{ fontSize: isMobile ? 10 : 11.5, color: "#16a34a", textTransform: "uppercase", fontWeight: 800 }}>Floor (Support)</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : isTablet ? 22 : 25, fontWeight: 900, color: "#16a34a", margin: "3px 0" }}>
+              {floor}
+            </div>
+            <div style={{ fontSize: isMobile ? 9.5 : 11, color: isDark ? "#86efac" : "#15803d" }}>{oiData?.floorShift || "Support holding"}</div>
           </div>
 
-          <div style={{ background: isDark ? "#2d0a0a" : "#fef2f2", padding: "10px 12px", borderRadius: 8, border: "1px solid #ef444444" }}>
-            <div style={{ fontSize: 10, color: "#ef4444", textTransform: "uppercase", fontWeight: 800 }}>Roof (Resistance)</div>
-            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : 20, fontWeight: 900, color: "#ef4444" }}>{roof}</div>
-            <div style={{ fontSize: 9.5, color: isDark ? "#fca5a5" : "#b91c1c" }}>{oiData?.roofShift || "Resistance holding"}</div>
+          <div style={{ background: isDark ? "#2d0a0a" : "#fef2f2", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: "1px solid #ef444444" }}>
+            <div style={{ fontSize: isMobile ? 10 : 11.5, color: "#ef4444", textTransform: "uppercase", fontWeight: 800 }}>Roof (Resistance)</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 17 : isTablet ? 22 : 25, fontWeight: 900, color: "#ef4444", margin: "3px 0" }}>
+              {roof}
+            </div>
+            <div style={{ fontSize: isMobile ? 9.5 : 11, color: isDark ? "#fca5a5" : "#b91c1c" }}>{oiData?.roofShift || "Resistance holding"}</div>
           </div>
 
-          <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
-            <div style={{ fontSize: 10, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Put vs Call Writing</div>
-            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 13 : 15, fontWeight: 800, color: t.text, marginTop: 4 }}>
+          <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: `1px solid ${t.border}` }}>
+            <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Put vs Call Writing</div>
+            <div style={{ fontFamily: "monospace", fontSize: isMobile ? 13 : isTablet ? 15 : 17, fontWeight: 800, color: t.text, margin: "4px 0" }}>
               <span style={{ color: "#16a34a" }}>P: {oiData?.totalPutWritingFormatted || "—"}</span> vs <span style={{ color: "#ef4444" }}>C: {oiData?.totalCallWritingFormatted || "—"}</span>
             </div>
-            <div style={{ fontSize: 9.5, color: t.textSub }}>PCR: {oiData?.pcr || 1.0} · ΔPCR: {oiData?.deltaPcr || 1.0}</div>
+            <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub }}>PCR: {oiData?.pcr || 1.0} · ΔPCR: {oiData?.deltaPcr || 1.0}</div>
           </div>
         </div>
       </div>
@@ -1072,11 +1134,13 @@ export function NiftyFlowView({ t, isDark }) {
         </div>
       )}
 
-      {/* ── LOWER SECTION: STRIKE PROFILE & ARGON PREDICTION ── */}
+      {/* ── LOWER SECTION: STRIKE PROFILE & WEEKLY PREDICTION ── */}
       <div style={{
         display: "grid",
-        gridTemplateColumns: (!isMobile || mobileView === "both") ? (isMobile ? "1fr" : "minmax(0, 1.4fr) minmax(0, 1fr)") : "1fr",
-        gap: 16,
+        gridTemplateColumns: isDesktop
+          ? "minmax(0, 1.35fr) minmax(0, 1fr)"
+          : "1fr",
+        gap: isDesktop ? 20 : 16,
         alignItems: "start"
       }}>
 
@@ -1086,36 +1150,36 @@ export function NiftyFlowView({ t, isDark }) {
             background: isDark ? "#080f1a" : "#ffffff",
             border: `1.5px solid ${t.border}`,
             borderRadius: 12,
-            padding: isMobile ? "12px 8px" : "16px",
+            padding: isMobile ? "12px 8px" : "18px 16px",
             overflowX: "auto"
           }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, padding: "0 6px" }}>
               <div>
-                <div style={{ fontSize: isMobile ? 13 : 14, fontWeight: 800, color: t.text }}>
-                  NIFTY OI change today (contracts) · expiry {oiData?.expiryDate || "Current"}
+                <div style={{ fontSize: isMobile ? 13 : isTablet ? 15 : 16, fontWeight: 900, color: t.text }}>
+                  NIFTY OI CHANGE TODAY (CONTRACTS) · EXPIRY {oiData?.expiryDate || "CURRENT"}
                 </div>
-                <div style={{ fontSize: 10, color: t.textMuted }}>
+                <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted }}>
                   Live institutional strike additions and unwinding
                 </div>
               </div>
-              <span style={{ fontSize: 10, color: t.textMuted, fontFamily: "monospace" }}>{oiData?.timestamp}</span>
+              <span style={{ fontSize: isMobile ? 10 : 12, color: t.textMuted, fontFamily: "monospace" }}>{oiData?.timestamp}</span>
             </div>
 
             {/* TABLE HEADER */}
             <div style={{
               display: "grid",
-              gridTemplateColumns: "1fr 85px 1fr",
-              padding: "8px 0",
-              fontSize: 10,
+              gridTemplateColumns: isMobile ? "1fr 80px 1fr" : "1fr 100px 1fr",
+              padding: isMobile ? "8px 0" : "10px 0",
+              fontSize: isMobile ? 10 : 12,
               fontWeight: 800,
               textTransform: "uppercase",
-              borderBottom: `1px solid ${t.border}`,
+              borderBottom: `1.5px solid ${t.border}`,
               color: t.textMuted,
               textAlign: "center"
             }}>
-              <div style={{ textAlign: "right", paddingRight: 8 }}>put writers ΔOI</div>
+              <div style={{ textAlign: "right", paddingRight: 10 }}>put writers ΔOI</div>
               <div>strike</div>
-              <div style={{ textAlign: "left", paddingLeft: 8 }}>ΔOI call writers</div>
+              <div style={{ textAlign: "left", paddingLeft: 10 }}>ΔOI call writers</div>
             </div>
 
             {/* STRIKE ROWS */}
@@ -1144,12 +1208,12 @@ export function NiftyFlowView({ t, isDark }) {
                     {showSpotAbove && (
                       <div style={{
                         display: "flex", alignItems: "center", justifyContent: "center",
-                        margin: "4px 0", padding: "3px 0",
+                        margin: "5px 0", padding: isMobile ? "3px 0" : "6px 0",
                         borderTop: "1.5px dashed #38bdf8",
                         borderBottom: "1.5px dashed #38bdf8",
                         background: isDark ? "rgba(56, 189, 248, 0.08)" : "rgba(14, 165, 233, 0.08)"
                       }}>
-                        <span style={{ fontFamily: "monospace", fontSize: 10.5, fontWeight: 900, color: "#38bdf8" }}>
+                        <span style={{ fontFamily: "monospace", fontSize: isMobile ? 10.5 : 12.5, fontWeight: 900, color: "#38bdf8" }}>
                           - - - - - - {spot.toFixed(2)} SPOT - - - - - -
                         </span>
                       </div>
@@ -1157,32 +1221,32 @@ export function NiftyFlowView({ t, isDark }) {
 
                     <div style={{
                       display: "grid",
-                      gridTemplateColumns: "1fr 85px 1fr",
+                      gridTemplateColumns: isMobile ? "1fr 80px 1fr" : "1fr 100px 1fr",
                       alignItems: "center",
-                      minHeight: 26,
-                      fontSize: 11,
+                      minHeight: isMobile ? 26 : 32,
+                      fontSize: isMobile ? 11 : 13,
                       background: (isRoof || isFloor) ? (isDark ? "rgba(255,255,255,0.04)" : "#f8fafc") : "transparent"
                     }}>
                       {/* LEFT: PUT WRITERS BAR */}
-                      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 5, minWidth: 0, paddingRight: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6, minWidth: 0, paddingRight: 6 }}>
                         {isFloor && (
-                          <span style={{ background: "#16a34a", color: "#fff", fontSize: 7.5, fontWeight: 900, padding: "1px 4px", borderRadius: 3 }}>
+                          <span style={{ background: "#16a34a", color: "#fff", fontSize: isMobile ? 7.5 : 9, fontWeight: 900, padding: isMobile ? "1px 4px" : "2px 6px", borderRadius: 3 }}>
                             FLOOR
                           </span>
                         )}
                         <span style={{
                           fontFamily: "monospace",
-                          fontSize: isMobile ? 9 : 10,
+                          fontSize: isMobile ? 9 : 11.5,
                           fontWeight: 700,
                           color: isPutBuilt ? "#16a34a" : isPutRemoved ? (isDark ? "#86efac" : "#65a30d") : t.textMuted,
                           whiteSpace: "nowrap"
                         }}>
                           {s.putDeltaFormatted}
                         </span>
-                        <div style={{ width: "60%", display: "flex", justifyContent: "flex-end" }}>
+                        <div style={{ width: isMobile ? "60%" : "66%", display: "flex", justifyContent: "flex-end" }}>
                           <div style={{
                             width: `${Math.max(2, pWidth)}%`,
-                            height: 14,
+                            height: isMobile ? 13 : 16,
                             borderRadius: "3px 0 0 3px",
                             background: isPutBuilt
                               ? "#22c55e"
@@ -1200,8 +1264,8 @@ export function NiftyFlowView({ t, isDark }) {
                         fontFamily: "monospace",
                         fontWeight: (isRoof || isFloor) ? 900 : 700,
                         color: isRoof ? "#ef4444" : isFloor ? "#16a34a" : t.text,
-                        fontSize: isMobile ? 11 : 11.5,
-                        padding: "2px 0",
+                        fontSize: isMobile ? 11 : 13.5,
+                        padding: isMobile ? "2px 0" : "4px 0",
                         borderRadius: 4,
                         background: isRoof ? (isDark ? "#2d0a0a" : "#fee2e2") : isFloor ? (isDark ? "#052e16" : "#dcfce7") : "transparent"
                       }}>
@@ -1209,11 +1273,11 @@ export function NiftyFlowView({ t, isDark }) {
                       </div>
 
                       {/* RIGHT: CALL WRITERS BAR */}
-                      <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "center", gap: 5, minWidth: 0, paddingLeft: 4 }}>
-                        <div style={{ width: "60%", display: "flex", justifyContent: "flex-start" }}>
+                      <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "center", gap: 6, minWidth: 0, paddingLeft: 6 }}>
+                        <div style={{ width: isMobile ? "60%" : "66%", display: "flex", justifyContent: "flex-start" }}>
                           <div style={{
                             width: `${Math.max(2, cWidth)}%`,
-                            height: 14,
+                            height: isMobile ? 13 : 16,
                             borderRadius: "0 3px 3px 0",
                             background: isCallBuilt
                               ? "#ef4444"
@@ -1225,7 +1289,7 @@ export function NiftyFlowView({ t, isDark }) {
                         </div>
                         <span style={{
                           fontFamily: "monospace",
-                          fontSize: isMobile ? 9 : 10,
+                          fontSize: isMobile ? 9 : 11.5,
                           fontWeight: 700,
                           color: isCallBuilt ? "#ef4444" : isCallRemoved ? (isDark ? "#fca5a5" : "#b91c1c") : t.textMuted,
                           whiteSpace: "nowrap"
@@ -1233,7 +1297,7 @@ export function NiftyFlowView({ t, isDark }) {
                           {s.callDeltaFormatted}
                         </span>
                         {isRoof && (
-                          <span style={{ background: "#ef4444", color: "#fff", fontSize: 7.5, fontWeight: 900, padding: "1px 4px", borderRadius: 3 }}>
+                          <span style={{ background: "#ef4444", color: "#fff", fontSize: isMobile ? 7.5 : 9, fontWeight: 900, padding: isMobile ? "1px 4px" : "2px 6px", borderRadius: 3 }}>
                             ROOF
                           </span>
                         )}
@@ -1248,28 +1312,28 @@ export function NiftyFlowView({ t, isDark }) {
             <div style={{
               display: "flex",
               justifyContent: "center",
-              gap: 12,
+              gap: isMobile ? 10 : 16,
               flexWrap: "wrap",
               paddingTop: 12,
               marginTop: 12,
               borderTop: `1px solid ${t.border}`,
-              fontSize: 9.5,
+              fontSize: isMobile ? 9.5 : 11.5,
               color: t.textMuted
             }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={{ display: "inline-block", width: 10, height: 9, background: "#22c55e", borderRadius: 2 }} />
+              <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ display: "inline-block", width: 12, height: 10, background: "#22c55e", borderRadius: 2 }} />
                 floor built (Put writing)
               </span>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={{ display: "inline-block", width: 10, height: 9, border: "1px solid #22c55e", background: isDark ? "#052e16" : "#f0fdf4", borderRadius: 2 }} />
+              <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ display: "inline-block", width: 12, height: 10, border: "1px solid #22c55e", background: isDark ? "#052e16" : "#f0fdf4", borderRadius: 2 }} />
                 floor unwound
               </span>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={{ display: "inline-block", width: 10, height: 9, background: "#ef4444", borderRadius: 2 }} />
+              <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ display: "inline-block", width: 12, height: 10, background: "#ef4444", borderRadius: 2 }} />
                 roof built (Call writing)
               </span>
-              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={{ display: "inline-block", width: 10, height: 9, border: "1px solid #ef4444", background: isDark ? "#2d0a0a" : "#fef2f2", borderRadius: 2 }} />
+              <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ display: "inline-block", width: 12, height: 10, border: "1px solid #ef4444", background: isDark ? "#2d0a0a" : "#fef2f2", borderRadius: 2 }} />
                 roof covered
               </span>
             </div>
@@ -1278,15 +1342,15 @@ export function NiftyFlowView({ t, isDark }) {
             <div style={{
               background: isDark ? "#040810" : "#f8fafc",
               border: `1px solid ${t.border}`,
-              borderRadius: 6,
-              padding: "8px 10px",
+              borderRadius: 8,
+              padding: isMobile ? "8px 10px" : "12px 14px",
               marginTop: 10,
-              fontSize: 10.5,
+              fontSize: isMobile ? 10.5 : 12,
               color: t.textSub,
               textAlign: "center",
               fontFamily: "monospace"
             }}>
-              Floor <strong style={{ color: "#16a34a" }}>{floor}</strong> · Roof <strong style={{ color: "#ef4444" }}>{roof}</strong> · P: <span style={{ color: "#16a34a" }}>{oiData?.totalPutWritingFormatted}</span> vs C: <span style={{ color: "#ef4444" }}>{oiData?.totalCallWritingFormatted}</span> · {oiData?.balanceStatus} · PCR <strong>{oiData?.pcr}</strong>
+              Floor <strong style={{ color: "#16a34a" }}>{floor}</strong> · Roof <strong style={{ color: "#ef4444" }}>{roof}</strong> · P: <span style={{ color: "#16a34a", fontWeight: 700 }}>{oiData?.totalPutWritingFormatted}</span> vs C: <span style={{ color: "#ef4444", fontWeight: 700 }}>{oiData?.totalCallWritingFormatted}</span> · {oiData?.balanceStatus} · PCR <strong>{oiData?.pcr}</strong>
             </div>
           </div>
         )}
@@ -1299,17 +1363,17 @@ export function NiftyFlowView({ t, isDark }) {
               background: t.surface,
               border: `1.5px solid ${t.border}`,
               borderRadius: 12,
-              padding: isMobile ? "14px 12px" : "16px",
+              padding: isMobile ? "14px 12px" : "18px 20px",
               boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <div>
-                  <div style={{ fontSize: 14, fontWeight: 800, color: t.text }}>🎯 WEEKLY &amp; DAILY PREDICTION</div>
-                  <div style={{ fontSize: 10, color: t.textMuted }}>Price Action Model &amp; Key Pivots</div>
+                  <div style={{ fontSize: isMobile ? 14 : isTablet ? 16 : 17, fontWeight: 900, color: t.text }}>🎯 WEEKLY &amp; DAILY PREDICTION</div>
+                  <div style={{ fontSize: isMobile ? 10 : 12, color: t.textMuted }}>Price Action Model &amp; Key Pivots</div>
                 </div>
                 <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
                   target="_blank" rel="noreferrer"
-                  style={{ fontSize: 11, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
+                  style={{ fontSize: isMobile ? 11 : 12.5, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
                   Doc ↗
                 </a>
               </div>
@@ -1322,9 +1386,9 @@ export function NiftyFlowView({ t, isDark }) {
                   const isToday = sess.session.toLowerCase().includes((argonData?.currentDay || getIstDayInfo().dayName).toLowerCase());
                   return (
                     <button key={sess.session} onClick={() => setSelectedDayIdx(idx)} style={{
-                      padding: "7px 12px",
+                      padding: isMobile ? "7px 12px" : "9px 16px",
                       borderRadius: 20,
-                      fontSize: 11,
+                      fontSize: isMobile ? 11 : 12.5,
                       fontWeight: 700,
                       cursor: "pointer",
                       border: "none",
@@ -1335,13 +1399,13 @@ export function NiftyFlowView({ t, isDark }) {
                       WebkitTapHighlightColor: "transparent",
                       display: "flex",
                       alignItems: "center",
-                      gap: 5
+                      gap: 6
                     }}>
                       <span>{label}</span>
                       {isToday && (
                         <span style={{
-                          fontSize: 9,
-                          padding: "1px 5px",
+                          fontSize: isMobile ? 9 : 10,
+                          padding: "1px 6px",
                           borderRadius: 8,
                           background: isSelected ? "rgba(255,255,255,0.28)" : (isDark ? "rgba(34, 197, 94, 0.25)" : "#dcfce7"),
                           color: isSelected ? "#fff" : (isDark ? "#4ade80" : "#166534"),
@@ -1360,17 +1424,17 @@ export function NiftyFlowView({ t, isDark }) {
               {currentSession && (
                 <div style={{ marginTop: 14 }}>
                   <div style={{
-                    padding: "10px 12px",
+                    padding: isMobile ? "10px 12px" : "12px 14px",
                     borderRadius: 8,
                     background: isDark ? "#0f1f38" : "#f1f5f9",
                     borderLeft: `4px solid ${t.accent}`,
-                    marginBottom: 10
+                    marginBottom: 12
                   }}>
-                    <div style={{ fontSize: 13, fontWeight: 900, color: t.text }}>{currentSession.session}</div>
+                    <div style={{ fontSize: isMobile ? 13 : 15, fontWeight: 900, color: t.text }}>{currentSession.session}</div>
                     <div style={{
                       display: "inline-block",
                       marginTop: 4,
-                      fontSize: 11,
+                      fontSize: isMobile ? 11 : 12,
                       fontWeight: 800,
                       color: currentSession.stance.includes("BEARISH") ? "#ef4444" : currentSession.stance.includes("BOUNCE") ? "#16a34a" : "#d97706",
                       background: currentSession.stance.includes("BEARISH") ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#052e16" : "#dcfce7"),
@@ -1381,7 +1445,7 @@ export function NiftyFlowView({ t, isDark }) {
                     </div>
                   </div>
 
-                  <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginBottom: 12 }}>
+                  <div style={{ fontSize: isMobile ? 12 : 13.5, lineHeight: 1.65, color: t.text, marginBottom: 12 }}>
                     <strong style={{ color: t.accentSub }}>Forecast &amp; Key Levels:</strong><br />
                     {currentSession.forecast}
                   </div>
@@ -1389,18 +1453,18 @@ export function NiftyFlowView({ t, isDark }) {
                   <div style={{
                     background: isDark ? "rgba(220, 38, 38, 0.08)" : "#fef2f2",
                     border: "1px solid rgba(220, 38, 38, 0.2)",
-                    borderRadius: 6,
-                    padding: "10px",
-                    fontSize: 11.5,
-                    lineHeight: 1.5,
+                    borderRadius: 8,
+                    padding: isMobile ? "10px" : "12px 14px",
+                    fontSize: isMobile ? 11.5 : 13,
+                    lineHeight: 1.6,
                     color: isDark ? "#fca5a5" : "#b91c1c",
-                    marginBottom: 10
+                    marginBottom: 12
                   }}>
                     <strong>Execution Rule (Day Before):</strong><br />
                     {currentSession.action}
                   </div>
 
-                  <div style={{ fontSize: 11, color: t.textMuted, lineHeight: 1.5 }}>
+                  <div style={{ fontSize: isMobile ? 11 : 12.5, color: t.textMuted, lineHeight: 1.6 }}>
                     <strong style={{ color: t.text }}>Sectors Guidance:</strong><br />
                     {currentSession.sectors}
                   </div>
@@ -1413,12 +1477,12 @@ export function NiftyFlowView({ t, isDark }) {
               background: isDark ? "#081b2e" : "#f0fdf4",
               border: `1.5px solid ${isDark ? "#1e3a5f" : "#86efac"}`,
               borderRadius: 12,
-              padding: "14px 16px"
+              padding: isMobile ? "14px 16px" : "16px 20px"
             }}>
-              <div style={{ fontSize: 12, fontWeight: 900, color: isDark ? "#38bdf8" : "#166534", textTransform: "uppercase" }}>
+              <div style={{ fontSize: isMobile ? 12 : 14, fontWeight: 900, color: isDark ? "#38bdf8" : "#166534", textTransform: "uppercase" }}>
                 ⚡ LIVE CONFLUENCE VERDICT (Price Action + OI)
               </div>
-              <div style={{ fontSize: 12, lineHeight: 1.6, color: t.text, marginTop: 8 }}>
+              <div style={{ fontSize: isMobile ? 12 : 13.5, lineHeight: 1.7, color: t.text, marginTop: 8 }}>
                 • <strong>Roof Alignment:</strong> Call resistance wall at <strong>{roof}</strong> ({oiData?.totalCallWritingFormatted} calls built) acts as the hard ceiling.<br />
                 • <strong>Floor Alignment:</strong> Put support cushion at <strong>{floor}</strong> ({oiData?.totalPutWritingFormatted} puts built) is the active battleground.<br />
                 • <strong>Decision Rule:</strong>
