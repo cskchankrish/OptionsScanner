@@ -79,28 +79,66 @@ function getIstDayInfo() {
   }
 }
 
-function findBestSessionIndex(sessions, serverDayName) {
+function getSessionDayAndDate(sess) {
+  if (!sess) return { day: "Day", date: "", label: "Day" };
+  if (sess.day && sess.date) {
+    return { day: sess.day, date: sess.date, label: sess.label || `${sess.day} · ${sess.date}` };
+  }
+  const sessStr = sess.session || "";
+  const dayMatch = sessStr.match(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/i);
+  const day = dayMatch ? (dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1).toLowerCase()) : sessStr.split("(")[0].trim();
+  const m1 = sessStr.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})\b/i);
+  let date = "";
+  if (m1) {
+    date = `${m1[2]} ${m1[1].slice(0, 3).charAt(0).toUpperCase() + m1[1].slice(1, 3).toLowerCase()}`;
+  } else {
+    const m2 = sessStr.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b/i);
+    if (m2) date = `${m2[1]} ${m2[2].slice(0, 3).charAt(0).toUpperCase() + m2[2].slice(1, 3).toLowerCase()}`;
+  }
+  return { day, date, label: date ? `${day} · ${date}` : day };
+}
+
+function findBestSessionIndex(sessions, serverDayName, todaySession) {
   if (!sessions || sessions.length === 0) return 0;
-  const { dayName, dayNum } = getIstDayInfo();
-  const targetDay = (serverDayName || dayName).toLowerCase();
 
-  // 1. Direct match with current day (e.g. "friday")
-  let idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes(targetDay));
-  if (idx !== -1) return idx;
-
-  // 2. Weekend logic: Saturday -> show Friday, Sunday -> show Monday
-  if (dayNum === 6) {
-    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("friday"));
-    if (idx !== -1) return idx;
-  } else if (dayNum === 0) {
-    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("monday"));
-    if (idx !== -1) return idx;
-    idx = sessions.findIndex(s => s.session && s.session.toLowerCase().includes("friday"));
+  // 1. If todaySession provided from server, match directly
+  if (todaySession) {
+    const todayStr = typeof todaySession === "string" ? todaySession : todaySession.session;
+    const todayDay = typeof todaySession === "object" ? todaySession.day : null;
+    const idx = sessions.findIndex(s =>
+      (todayStr && s.session === todayStr) ||
+      (todayDay && s.day && s.day.toLowerCase() === todayDay.toLowerCase())
+    );
     if (idx !== -1) return idx;
   }
 
-  // 3. Fallback to latest session available
-  return Math.max(0, sessions.length - 1);
+  const { dayName, dayNum } = getIstDayInfo();
+  const targetDay = (serverDayName || dayName).toLowerCase();
+
+  // 2. Direct match with current day (e.g. "friday" or "monday")
+  let idx = sessions.findIndex(s =>
+    (s.day && s.day.toLowerCase() === targetDay) ||
+    (s.session && s.session.toLowerCase().includes(targetDay))
+  );
+  if (idx !== -1) return idx;
+
+  // 3. Weekend logic: Saturday -> show Friday, Sunday -> show Monday
+  if (dayNum === 6) {
+    idx = sessions.findIndex(s =>
+      (s.day && s.day.toLowerCase() === "friday") ||
+      (s.session && s.session.toLowerCase().includes("friday"))
+    );
+    if (idx !== -1) return idx;
+  } else if (dayNum === 0) {
+    idx = sessions.findIndex(s =>
+      (s.day && s.day.toLowerCase() === "monday") ||
+      (s.session && s.session.toLowerCase().includes("monday"))
+    );
+    if (idx !== -1) return idx;
+  }
+
+  // 4. Default to first session
+  return 0;
 }
 
 function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
@@ -809,7 +847,7 @@ export function NiftyFlowView({ t, isDark }) {
   const [argonData, setArgonData] = useState(() => globalArgonCache);
   const [loading, setLoading] = useState(() => !globalOiCache);
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedDayIdx, setSelectedDayIdx] = useState(() => findBestSessionIndex(globalArgonCache?.sessions, globalArgonCache?.currentDay));
+  const [selectedDayIdx, setSelectedDayIdx] = useState(() => findBestSessionIndex(globalArgonCache?.sessions, globalArgonCache?.currentDay, globalArgonCache?.todaySession));
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
@@ -854,7 +892,7 @@ export function NiftyFlowView({ t, isDark }) {
         globalArgonCache = data;
         setArgonData(data);
         if (data.sessions?.length) {
-          const todayIdx = findBestSessionIndex(data.sessions, data.currentDay);
+          const todayIdx = findBestSessionIndex(data.sessions, data.currentDay, data.todaySession);
           setSelectedDayIdx(todayIdx);
         }
       }
@@ -1381,12 +1419,14 @@ export function NiftyFlowView({ t, isDark }) {
               {/* DAY SELECTOR BUTTONS */}
               <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
                 {(argonData?.sessions || []).map((sess, idx) => {
-                  const label = sess.session.split("(")[0].trim();
+                  const { day, date } = getSessionDayAndDate(sess);
                   const isSelected = selectedDayIdx === idx;
-                  const isToday = sess.session.toLowerCase().includes((argonData?.currentDay || getIstDayInfo().dayName).toLowerCase());
+                  const isToday = argonData?.todaySession
+                    ? (argonData.todaySession.session === sess.session || (argonData.todaySession.day && argonData.todaySession.day === sess.day))
+                    : sess.session.toLowerCase().includes((argonData?.currentDay || getIstDayInfo().dayName).toLowerCase());
                   return (
-                    <button key={sess.session} onClick={() => setSelectedDayIdx(idx)} style={{
-                      padding: isMobile ? "7px 12px" : "9px 16px",
+                    <button key={sess.session || idx} onClick={() => setSelectedDayIdx(idx)} style={{
+                      padding: isMobile ? "7px 12px" : "8px 15px",
                       borderRadius: 20,
                       fontSize: isMobile ? 11 : 12.5,
                       fontWeight: 700,
@@ -1397,17 +1437,30 @@ export function NiftyFlowView({ t, isDark }) {
                       outline: isSelected ? "none" : `1px solid ${t.border}`,
                       whiteSpace: "nowrap",
                       WebkitTapHighlightColor: "transparent",
-                      display: "flex",
+                      display: "inline-flex",
                       alignItems: "center",
-                      gap: 6
+                      gap: 6,
+                      transition: "all 0.15s ease"
                     }}>
-                      <span>{label}</span>
+                      <span style={{ fontWeight: 800 }}>{day}</span>
+                      {date && (
+                        <span style={{
+                          fontSize: isMobile ? 10 : 11,
+                          fontWeight: 600,
+                          opacity: isSelected ? 0.95 : 0.8,
+                          padding: "1px 5px",
+                          borderRadius: 6,
+                          background: isSelected ? "rgba(255,255,255,0.22)" : (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)")
+                        }}>
+                          {date}
+                        </span>
+                      )}
                       {isToday && (
                         <span style={{
-                          fontSize: isMobile ? 9 : 10,
-                          padding: "1px 6px",
-                          borderRadius: 8,
-                          background: isSelected ? "rgba(255,255,255,0.28)" : (isDark ? "rgba(34, 197, 94, 0.25)" : "#dcfce7"),
+                          fontSize: isMobile ? 8.5 : 9.5,
+                          padding: "1px 5px",
+                          borderRadius: 6,
+                          background: isSelected ? "rgba(255,255,255,0.3)" : (isDark ? "rgba(34, 197, 94, 0.25)" : "#dcfce7"),
                           color: isSelected ? "#fff" : (isDark ? "#4ade80" : "#166534"),
                           fontWeight: 800,
                           letterSpacing: 0.3
@@ -1436,8 +1489,16 @@ export function NiftyFlowView({ t, isDark }) {
                       marginTop: 4,
                       fontSize: isMobile ? 11 : 12,
                       fontWeight: 800,
-                      color: currentSession.stance.includes("BEARISH") ? "#ef4444" : currentSession.stance.includes("BOUNCE") ? "#16a34a" : "#d97706",
-                      background: currentSession.stance.includes("BEARISH") ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#052e16" : "#dcfce7"),
+                      color: (currentSession.stance || "").toUpperCase().includes("BEAR") || (currentSession.stance || "").toUpperCase().includes("EXIT")
+                        ? "#ef4444"
+                        : (currentSession.stance || "").toUpperCase().includes("BOUNCE") || (currentSession.stance || "").toUpperCase().includes("MOMENTUM") || (currentSession.stance || "").toUpperCase().includes("BULL")
+                        ? "#16a34a"
+                        : "#d97706",
+                      background: (currentSession.stance || "").toUpperCase().includes("BEAR") || (currentSession.stance || "").toUpperCase().includes("EXIT")
+                        ? (isDark ? "#2d0a0a" : "#fee2e2")
+                        : (currentSession.stance || "").toUpperCase().includes("BOUNCE") || (currentSession.stance || "").toUpperCase().includes("MOMENTUM") || (currentSession.stance || "").toUpperCase().includes("BULL")
+                        ? (isDark ? "#052e16" : "#dcfce7")
+                        : (isDark ? "#2a1b0a" : "#fef3c7"),
                       padding: "2px 7px",
                       borderRadius: 4
                     }}>
