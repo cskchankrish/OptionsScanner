@@ -141,7 +141,7 @@ function findBestSessionIndex(sessions, serverDayName, todaySession) {
   return 0;
 }
 
-function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
+function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, hasRedis }) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
@@ -599,8 +599,23 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
                   : `⚪ CHOP (±${formatLots(threshold)})`}
               </span>
             </div>
-            <div style={{ fontSize: isMobile ? 10.5 : 12, color: t.textMuted, marginTop: 3 }}>
-              09:15 → 15:30 IST · Drag timeline to inspect live 5-minute cumulative writing delta
+            <div style={{ fontSize: isMobile ? 10.5 : 12, color: t.textMuted, marginTop: 3, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <span>09:15 → 15:30 IST · Drag timeline to inspect live 5-minute cumulative writing delta</span>
+              {hasRedis && (
+                <span style={{
+                  fontSize: isMobile ? 9.5 : 10.5,
+                  padding: "1px 6px",
+                  borderRadius: 6,
+                  background: isDark ? "rgba(34, 197, 94, 0.2)" : "#dcfce7",
+                  color: isDark ? "#4ade80" : "#166534",
+                  fontWeight: 800,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4
+                }}>
+                  ● ☁️ Cloud Sync Active
+                </span>
+              )}
             </div>
           </div>
 
@@ -1319,6 +1334,7 @@ export function NiftyFlowView({ t, isDark }) {
         spot={spot}
         isDark={isDark}
         t={t}
+        hasRedis={oiData?.hasRedis}
       />
 
       {/* MOBILE SEGMENT SELECTOR (Strike Profile vs Argon Prediction) */}
