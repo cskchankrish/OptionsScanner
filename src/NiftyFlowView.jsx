@@ -840,6 +840,31 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t }) {
   );
 }
 
+function getTodayDateKey() {
+  try {
+    return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
+  } catch (e) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function mergeTimelineArrays(localArr = [], serverArr = []) {
+  if (!Array.isArray(localArr) || localArr.length === 0) return serverArr || [];
+  if (!Array.isArray(serverArr) || serverArr.length === 0) return localArr || [];
+
+  const map = new Map();
+  for (const item of localArr) {
+    if (item && item.time) map.set(item.time, item);
+  }
+  for (const item of serverArr) {
+    if (item && item.time) map.set(item.time, item);
+  }
+
+  const merged = Array.from(map.values());
+  merged.sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+  return merged;
+}
+
 export function NiftyFlowView({ t, isDark }) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mobileView, setMobileView] = useState("chart"); // "chart", "argon", "both"
@@ -851,6 +876,26 @@ export function NiftyFlowView({ t, isDark }) {
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
+
+  // Restore timeline from localStorage on mount (preserves full day points across browser close/refresh)
+  useEffect(() => {
+    try {
+      const todayKey = getTodayDateKey();
+      const stored = localStorage.getItem(`nifty_timeline_${todayKey}`);
+      if (stored) {
+        const localArr = JSON.parse(stored);
+        if (Array.isArray(localArr) && localArr.length > 0) {
+          setOiData(prev => {
+            if (!prev) return { intradayTimeline: localArr, strikes: [] };
+            const merged = mergeTimelineArrays(localArr, prev.intradayTimeline || []);
+            return { ...prev, intradayTimeline: merged };
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("Could not load local timeline:", e);
+    }
+  }, []);
 
   // Check market status every 5 seconds without triggering re-render if unchanged
   useEffect(() => {
@@ -876,8 +921,38 @@ export function NiftyFlowView({ t, isDark }) {
       const res = await fetch("/api/nifty-oi");
       if (res.ok) {
         const data = await res.json();
-        globalOiCache = data;
-        setOiData(data);
+        const todayKey = getTodayDateKey();
+        let finalTimeline = data.intradayTimeline || [];
+
+        // Check local storage to merge past points collected during the day
+        try {
+          const stored = localStorage.getItem(`nifty_timeline_${todayKey}`);
+          if (stored) {
+            const localArr = JSON.parse(stored);
+            if (Array.isArray(localArr) && localArr.length > 0) {
+              const prevLen = finalTimeline.length;
+              finalTimeline = mergeTimelineArrays(localArr, finalTimeline);
+
+              // If client has more points than server (e.g. serverless cold start), sync back to server
+              if (localArr.length > prevLen + 5) {
+                fetch("/api/nifty-oi", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ timeline: finalTimeline })
+                }).catch(() => {});
+              }
+            }
+          }
+          if (finalTimeline.length > 0) {
+            localStorage.setItem(`nifty_timeline_${todayKey}`, JSON.stringify(finalTimeline));
+          }
+        } catch (e) {
+          // ignore localStorage errors (e.g. incognito)
+        }
+
+        const fullData = { ...data, intradayTimeline: finalTimeline };
+        globalOiCache = fullData;
+        setOiData(fullData);
       }
     } catch (e) {
       console.error("Failed to load /api/nifty-oi:", e);
@@ -1099,6 +1174,144 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
         </div>
       </div>
+
+      {/* ── 🧠 SMART MONEY & INSTITUTIONAL RADAR ── */}
+      {oiData?.smartMoney && (
+        <div style={{
+          background: t.surface,
+          border: `1.5px solid ${t.border}`,
+          borderRadius: 12,
+          padding: isMobile ? "12px 14px" : "16px 20px",
+          marginBottom: 16,
+          boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
+        }}>
+          {/* Header Row */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: isMobile ? 14 : 16, fontWeight: 900, color: t.text }}>
+                🧠 SMART MONEY &amp; INSTITUTIONAL RADAR
+              </span>
+              <span style={{
+                fontSize: isMobile ? 10.5 : 11.5,
+                fontWeight: 800,
+                padding: "3px 9px",
+                borderRadius: 6,
+                background: oiData.smartMoney.bias === "BULLISH"
+                  ? (isDark ? "#052e16" : "#dcfce7")
+                  : oiData.smartMoney.bias === "BEARISH"
+                  ? (isDark ? "#2d0a0a" : "#fee2e2")
+                  : (isDark ? "#1e293b" : "#f1f5f9"),
+                color: oiData.smartMoney.bias === "BULLISH"
+                  ? "#16a34a"
+                  : oiData.smartMoney.bias === "BEARISH"
+                  ? "#ef4444"
+                  : "#d97706",
+                border: `1px solid ${
+                  oiData.smartMoney.bias === "BULLISH" ? "#16a34a44" : oiData.smartMoney.bias === "BEARISH" ? "#ef444444" : "#d9770644"
+                }`
+              }}>
+                {oiData.smartMoney.stance}
+              </span>
+            </div>
+
+            <div style={{
+              fontSize: isMobile ? 11 : 12.5,
+              fontWeight: 800,
+              color: oiData.smartMoney.conviction >= 75 ? "#16a34a" : oiData.smartMoney.conviction >= 65 ? "#d97706" : t.textMuted,
+              display: "flex",
+              alignItems: "center",
+              gap: 5
+            }}>
+              <span>Conviction:</span>
+              <span style={{ fontFamily: "monospace", fontSize: isMobile ? 12 : 13.5, background: isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.05)", padding: "2px 6px", borderRadius: 4 }}>
+                {oiData.smartMoney.conviction}%
+              </span>
+            </div>
+          </div>
+
+          {/* Action Interpretation Text */}
+          <div style={{
+            fontSize: isMobile ? 11.5 : 13,
+            lineHeight: 1.55,
+            color: t.text,
+            background: isDark ? "#081324" : "#f8fafc",
+            padding: isMobile ? "8px 10px" : "10px 14px",
+            borderRadius: 8,
+            borderLeft: `4px solid ${
+              oiData.smartMoney.bias === "BULLISH" ? "#16a34a" : oiData.smartMoney.bias === "BEARISH" ? "#ef4444" : t.accent
+            }`,
+            marginBottom: 12
+          }}>
+            <strong style={{ color: t.accentSub }}>Institutional Footprint: </strong>
+            {oiData.smartMoney.action}
+          </div>
+
+          {/* 4 Footprint Metric Tiles */}
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: isMobile ? "1fr 1fr" : isTablet ? "repeat(2, 1fr)" : "repeat(4, 1fr)",
+            gap: isMobile ? 8 : 10,
+            marginBottom: 10
+          }}>
+            {/* Tile 1: Support Floor Migration */}
+            <div style={{ background: isDark ? "#061a10" : "#f0fdf4", padding: "10px 12px", borderRadius: 8, border: "1px solid #16a34a33" }}>
+              <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: "#16a34a", fontWeight: 800, textTransform: "uppercase" }}>Floor Migration</div>
+              <div style={{ fontSize: isMobile ? 11 : 12, fontWeight: 700, color: t.text, marginTop: 3 }}>
+                {oiData.smartMoney.floorMigration}
+              </div>
+            </div>
+
+            {/* Tile 2: Ceiling Migration */}
+            <div style={{ background: isDark ? "#1f0909" : "#fef2f2", padding: "10px 12px", borderRadius: 8, border: "1px solid #ef444433" }}>
+              <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: "#ef4444", fontWeight: 800, textTransform: "uppercase" }}>Ceiling Migration</div>
+              <div style={{ fontSize: isMobile ? 11 : 12, fontWeight: 700, color: t.text, marginTop: 3 }}>
+                {oiData.smartMoney.roofMigration}
+              </div>
+            </div>
+
+            {/* Tile 3: ATM Corridor Flow (±200 pts) */}
+            <div style={{ background: isDark ? "#0b1526" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
+              <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textMuted, fontWeight: 800, textTransform: "uppercase" }}>ATM Corridor (±200)</div>
+              <div style={{ fontSize: isMobile ? 11 : 12, fontWeight: 800, marginTop: 3, fontFamily: "monospace" }}>
+                <span style={{ color: "#16a34a" }}>P: {oiData.smartMoney.instPutWritingFormatted}</span> vs <span style={{ color: "#ef4444" }}>C: {oiData.smartMoney.instCallWritingFormatted}</span>
+              </div>
+              <div style={{ fontSize: isMobile ? 9 : 10, color: t.textSub, marginTop: 2 }}>{oiData.smartMoney.putDominance}% Put Dominance</div>
+            </div>
+
+            {/* Tile 4: Max Pain Pinning Target */}
+            <div style={{ background: isDark ? "#0b1526" : "#f8fafc", padding: "10px 12px", borderRadius: 8, border: `1px solid ${t.border}` }}>
+              <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textMuted, fontWeight: 800, textTransform: "uppercase" }}>Max Pain (Writers' Pin)</div>
+              <div style={{ fontSize: isMobile ? 15 : 17, fontWeight: 900, color: t.text, fontFamily: "monospace", marginTop: 2 }}>
+                {oiData.smartMoney.maxPainStrike}
+              </div>
+              <div style={{ fontSize: isMobile ? 9 : 10, color: t.textSub }}>Minimum Loss Target</div>
+            </div>
+          </div>
+
+          {/* Divergence / Trap Alert Strip */}
+          <div style={{
+            fontSize: isMobile ? 10.5 : 11.5,
+            padding: "6px 10px",
+            borderRadius: 6,
+            background: oiData.smartMoney.trapAlert.includes("WARNING")
+              ? (isDark ? "rgba(239, 68, 68, 0.15)" : "#fee2e2")
+              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
+              ? (isDark ? "rgba(34, 197, 94, 0.15)" : "#dcfce7")
+              : (isDark ? "#0a1322" : "#f1f5f9"),
+            color: oiData.smartMoney.trapAlert.includes("WARNING")
+              ? "#ef4444"
+              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
+              ? "#16a34a"
+              : t.textMuted,
+            fontWeight: 700,
+            display: "flex",
+            alignItems: "center",
+            gap: 6
+          }}>
+            {oiData.smartMoney.trapAlert}
+          </div>
+        </div>
+      )}
 
       {/* ── INTRADAY NET OI LINE GRAPH (WITH ZOOM & PAN) ── */}
       <NiftyIntradayLineChart

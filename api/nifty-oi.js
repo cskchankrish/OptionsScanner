@@ -11,13 +11,64 @@ let previousState = {
 let intradayHistory = [];
 let sessionDate = "";
 
+// Upstash Redis / Vercel KV REST integration (Zero extra npm packages needed)
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+
+async function getRedisTimeline(dateKey) {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  try {
+    const cleanKey = dateKey.replace(/\//g, "-");
+    const res = await fetch(`${REDIS_URL}/get/nifty_timeline_${encodeURIComponent(cleanKey)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.result) return null;
+    return typeof json.result === "string" ? JSON.parse(json.result) : json.result;
+  } catch (e) {
+    console.warn("Redis timeline fetch error:", e.message);
+    return null;
+  }
+}
+
+async function setRedisTimeline(dateKey, timelineArray) {
+  if (!REDIS_URL || !REDIS_TOKEN || !Array.isArray(timelineArray) || timelineArray.length === 0) return false;
+  try {
+    const cleanKey = dateKey.replace(/\//g, "-");
+    const res = await fetch(`${REDIS_URL}/set/nifty_timeline_${encodeURIComponent(cleanKey)}?ex=86400`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify(timelineArray),
+      signal: AbortSignal.timeout(2500),
+    });
+    return res.ok;
+  } catch (e) {
+    console.warn("Redis timeline save error:", e.message);
+    return false;
+  }
+}
+
+async function syncRedisHistory(today) {
+  if (REDIS_URL && (!intradayHistory || intradayHistory.length === 0)) {
+    const remote = await getRedisTimeline(today);
+    if (Array.isArray(remote) && remote.length > 0) {
+      intradayHistory = remote;
+    }
+  }
+}
+
 function getISTMinutes() {
   const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   return istDate.getHours() * 60 + istDate.getMinutes();
 }
 
 function getISTDateStr() {
-  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
+  return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
 }
 
 function getISTTimeStr() {
@@ -66,6 +117,7 @@ function buildTimeline(totPut, totCall, spot) {
 
   // Append or update latest live tick (1-min granularity)
   const last = intradayHistory[intradayHistory.length - 1];
+  let didUpdate = false;
   if (!last || last.minutes < capMins || (last.time !== nowStr && Math.abs(totPut - last.putWriting) > 200)) {
     intradayHistory.push({
       time: nowStr,
@@ -75,12 +127,19 @@ function buildTimeline(totPut, totCall, spot) {
       netDiff: totPut - totCall,
       spot: spot,
     });
+    didUpdate = true;
   } else if (last) {
     last.putWriting = totPut;
     last.callWriting = totCall;
     last.netDiff = totPut - totCall;
     last.spot = spot;
     last.time = nowStr;
+    didUpdate = true;
+  }
+
+  // Fire-and-forget save to Redis if available
+  if (didUpdate && REDIS_URL) {
+    setRedisTimeline(today, intradayHistory).catch(() => {});
   }
 
   return intradayHistory;
@@ -95,15 +154,204 @@ function formatLots(n) {
   return `${sign}${abs.toLocaleString("en-IN")}`;
 }
 
+// ── SMART MONEY / INSTITUTIONAL CALCULATIONS ──
+function calculateMaxPain(strikes) {
+  if (!strikes || strikes.length === 0) return 22700;
+  let minLoss = Infinity;
+  let maxPainStrike = strikes[0].strike;
+
+  for (const target of strikes) {
+    const sTarget = target.strike;
+    let totalLoss = 0;
+    for (const s of strikes) {
+      if (s.strike < sTarget) {
+        // Call options are In-The-Money for writers
+        totalLoss += (sTarget - s.strike) * (s.callOI || 0);
+      } else if (s.strike > sTarget) {
+        // Put options are In-The-Money for writers
+        totalLoss += (s.strike - sTarget) * (s.putOI || 0);
+      }
+    }
+    if (totalLoss < minLoss) {
+      minLoss = totalLoss;
+      maxPainStrike = sTarget;
+    }
+  }
+  return maxPainStrike;
+}
+
+function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHistory }) {
+  if (!strikes || strikes.length === 0) {
+    return {
+      stance: "RANGE-BOUND (DELTA NEUTRAL)",
+      bias: "NEUTRAL",
+      conviction: 60,
+      action: "Institutions writing both wings. Range-bound pinning expected.",
+      atmStrike: 22700,
+      maxPainStrike: 22700,
+      instPutWritingFormatted: "+0",
+      instCallWritingFormatted: "+0",
+      putDominance: 50,
+      floorMigration: `● Defending ${floorStrike}`,
+      roofMigration: `● Capping at ${roofStrike}`,
+      trapAlert: "● Flow In-Sync: Price action aligned with writing delta.",
+    };
+  }
+
+  // Find ATM strike (closest to spot)
+  const atmStrike = strikes.reduce((prev, curr) =>
+    Math.abs(curr.strike - spot) < Math.abs(prev.strike - spot) ? curr : prev,
+    strikes[0]
+  ).strike;
+
+  const maxPainStrike = calculateMaxPain(strikes);
+
+  // Focus on the high-liquidity Institutional Zone: ATM +/- 200 points
+  const corridorStrikes = strikes.filter(s => Math.abs(s.strike - atmStrike) <= 200);
+
+  let instPutWriting = 0;
+  let instCallWriting = 0;
+  let instPutUnwinding = 0;
+  let instCallUnwinding = 0;
+
+  for (const s of corridorStrikes) {
+    if (s.putDeltaOI > 0) instPutWriting += s.putDeltaOI;
+    else if (s.putDeltaOI < 0) instPutUnwinding += Math.abs(s.putDeltaOI);
+
+    if (s.callDeltaOI > 0) instCallWriting += s.callDeltaOI;
+    else if (s.callDeltaOI < 0) instCallUnwinding += Math.abs(s.callDeltaOI);
+  }
+
+  const totalInst = instPutWriting + instCallWriting;
+  const putDominance = totalInst > 0 ? Math.round((instPutWriting / totalInst) * 100) : 50;
+
+  let stance = "RANGE-BOUND (DELTA NEUTRAL)";
+  let bias = "NEUTRAL";
+  let conviction = 60;
+  let action = `Institutions writing both calls & puts near ATM ${atmStrike}. Expect index to pin within ${floorStrike} – ${roofStrike}.`;
+
+  if (instCallUnwinding > 25000 && instPutWriting > instCallWriting) {
+    stance = "SHORT COVERING SQUEEZE";
+    bias = "BULLISH";
+    conviction = Math.min(95, 75 + Math.round(instCallUnwinding / 5000));
+    action = "Call writers actively exiting short hedges under upside pressure. Favorable for momentum upside continuation.";
+  } else if (instPutUnwinding > 25000 && instCallWriting > instPutWriting) {
+    stance = "SUPPORT COLLAPSE / LONG UNWINDING";
+    bias = "BEARISH";
+    conviction = Math.min(95, 75 + Math.round(instPutUnwinding / 5000));
+    action = "Put writers abandoning support strikes and cutting loss. Downside slippage risk elevated.";
+  } else if (instPutWriting > 1.35 * instCallWriting) {
+    stance = "INSTITUTIONAL ACCUMULATION";
+    bias = "BULLISH";
+    conviction = Math.min(98, putDominance);
+    action = `Big players heavily underwriting Put strikes near ${floorStrike} (${putDominance}% dominance). Dips toward support are institutional buying zones.`;
+  } else if (instCallWriting > 1.35 * instPutWriting) {
+    stance = "INSTITUTIONAL CAPPING (DISTRIBUTION)";
+    bias = "BEARISH";
+    conviction = Math.min(98, 100 - putDominance);
+    action = `Big players building aggressive Call resistance at ${roofStrike} (${100 - putDominance}% call dominance). Overhead rallies are capped by institutional supply.`;
+  } else {
+    stance = "RANGE-BOUND (DELTA NEUTRAL STRADDLE)";
+    bias = "NEUTRAL";
+    conviction = 65;
+    action = `Institutions writing both Calls and Puts around ATM ${atmStrike}. High theta-decay zone; pin expected between ${floorStrike} and ${roofStrike}.`;
+  }
+
+  // Floor & Roof Migration
+  let floorMigration = `● ROCK SOLID at ${floorStrike} (Institutional Base)`;
+  if (previousState.floor && previousState.floor !== floorStrike) {
+    if (floorStrike > previousState.floor) {
+      floorMigration = `▲ MIGRATED UP from ${previousState.floor} to ${floorStrike} (+${floorStrike - previousState.floor} pts) · Raising Support`;
+    } else {
+      floorMigration = `▼ MIGRATED DOWN from ${previousState.floor} to ${floorStrike} (-${previousState.floor - floorStrike} pts) · Lowering Defense`;
+    }
+  }
+
+  let roofMigration = `● ROCK SOLID at ${roofStrike} (Institutional Cap)`;
+  if (previousState.roof && previousState.roof !== roofStrike) {
+    if (roofStrike > previousState.roof) {
+      roofMigration = `▲ CEILING LIFTED from ${previousState.roof} to ${roofStrike} (+${roofStrike - previousState.roof} pts) · Room for Expansion`;
+    } else {
+      roofMigration = `▼ CEILING LOWERED from ${previousState.roof} to ${roofStrike} (-${previousState.roof - roofStrike} pts) · Compressing Range`;
+    }
+  }
+
+  // Divergence / Trap detection from intraday timeline history
+  let trapAlert = "● Flow In-Sync: Price action is aligned with institutional writing flow.";
+  if (intradayHistory && intradayHistory.length >= 3) {
+    const last = intradayHistory[intradayHistory.length - 1];
+    const prev = intradayHistory[Math.max(0, intradayHistory.length - 3)];
+    if (last && prev) {
+      const deltaSpot = last.spot - prev.spot;
+      const deltaDiff = last.netDiff - prev.netDiff;
+      if (deltaSpot > 12 && deltaDiff < -12000) {
+        trapAlert = `⚠️ BULL TRAP WARNING: Spot pushed higher (+${deltaSpot.toFixed(1)} pts), but Net Writing Delta dropped. Smart money is fading the rally with Call writing.`;
+      } else if (deltaSpot < -12 && deltaDiff > 12000) {
+        trapAlert = `🟢 BEAR TRAP / ABSORPTION: Spot dipped (${deltaSpot.toFixed(1)} pts), but Put writing expanded. Smart money is quietly absorbing selling pressure.`;
+      }
+    }
+  }
+
+  return {
+    stance,
+    bias,
+    conviction,
+    action,
+    atmStrike,
+    maxPainStrike,
+    instPutWritingFormatted: formatLots(instPutWriting),
+    instCallWritingFormatted: formatLots(instCallWriting),
+    putDominance,
+    floorMigration,
+    roofMigration,
+    trapAlert,
+  };
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=60");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  const today = getISTDateStr();
+
+  // Handle client-to-server sync via POST (e.g. mobile or desktop sharing gathered 1-min ticks)
+  if (req.method === "POST") {
+    try {
+      const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const incoming = body?.timeline;
+      if (Array.isArray(incoming) && incoming.length > 0) {
+        const map = new Map();
+        for (const pt of intradayHistory) {
+          if (pt && pt.time) map.set(pt.time, pt);
+        }
+        for (const pt of incoming) {
+          if (pt && pt.time) map.set(pt.time, pt);
+        }
+        intradayHistory = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+        if (REDIS_URL) {
+          await setRedisTimeline(today, intradayHistory);
+        }
+        return res.status(200).json({ success: true, count: intradayHistory.length });
+      }
+      return res.status(200).json({ success: true, count: intradayHistory.length });
+    } catch (e) {
+      return res.status(400).json({ error: "Invalid sync payload" });
+    }
+  }
 
   const now = Date.now();
   if (cache.data && now - cache.timestamp < 30000) {
     return res.status(200).json(cache.data);
   }
+
+  // Preload history from Redis if memory is empty
+  await syncRedisHistory(today);
 
   try {
     const headers = {
@@ -152,7 +400,7 @@ export default async function handler(req, res) {
     const expiryDate = expiry;
     const timestampStr = v3Data.records?.timestamp || new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
 
-    // Focus on strikes near spot (e.g. +/- 500-600 points)
+    // Focus on strikes near spot (e.g. +/- 550 points)
     const filteredRows = records.filter(r => {
       const st = Number(r.strikePrice);
       return st && Math.abs(st - spot) <= 550;
@@ -240,6 +488,17 @@ export default async function handler(req, res) {
     const pcr = totCallOI > 0 ? Number((totPutOI / totCallOI).toFixed(2)) : 1.0;
     const deltaPcr = totCallWriting > 0 ? Number((totPutWriting / totCallWriting).toFixed(2)) : 1.0;
 
+    const timeline = buildTimeline(totPutWriting, totCallWriting, spot);
+
+    // Compute Smart Money / Institutional Analysis
+    const smartMoney = analyzeSmartMoney({
+      strikes,
+      spot,
+      floorStrike,
+      roofStrike,
+      intradayHistory: timeline,
+    });
+
     const payload = {
       success: true,
       isLive: true,
@@ -260,7 +519,9 @@ export default async function handler(req, res) {
       pcr,
       deltaPcr,
       strikes,
-      intradayTimeline: buildTimeline(totPutWriting, totCallWriting, spot),
+      smartMoney,
+      intradayTimeline: timeline,
+      hasRedis: Boolean(REDIS_URL),
     };
 
     cache = { data: payload, timestamp: now };
@@ -314,6 +575,15 @@ function getFallbackData() {
     callType: r.cDoi > 0 ? "BUILT" : r.cDoi < 0 ? "REMOVED" : "UNCLEAR",
   }));
 
+  const timeline = buildTimeline(279500, 157500, spot);
+  const smartMoney = analyzeSmartMoney({
+    strikes,
+    spot,
+    floorStrike: 22600,
+    roofStrike: 22800,
+    intradayHistory: timeline,
+  });
+
   return {
     success: true,
     isLive: false,
@@ -335,6 +605,8 @@ function getFallbackData() {
     pcr: 1.28,
     deltaPcr: 1.77,
     strikes,
-    intradayTimeline: buildTimeline(279500, 157500, spot),
+    smartMoney,
+    intradayTimeline: timeline,
+    hasRedis: Boolean(REDIS_URL),
   };
 }
