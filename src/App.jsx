@@ -762,7 +762,7 @@ function ScoringGuide({ t, isDark }) {
             🎯 3. 30-Minute Macro Reversal Engine (Capturing 50–100 Pt Turns)
           </div>
           <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6, marginBottom:8 }}>
-            To filter out 1-minute micro-noise and capture high-probability <strong>50–100 point index turns</strong>, the radar continuously audits two consecutive 15-minute candles (30-minute macro span):
+            To filter out 1-minute micro-noise and capture high-probability <strong>50–100 point index turns</strong>, the radar continuously audits two consecutive clock-aligned 15-minute candles (e.g. 13:00–13:15, 13:15–13:30) strictly matching NSE exchange candlestick intervals:
             <br />• <strong>Candle 1 (Buildup):</strong> Smart money initiates heavy contra-writing against retail momentum.
             <br />• <strong>Candle 2 (Confirmation):</strong> Price attempts another push, but writing delta fails completely and accelerates in opposite direction.
           </div>

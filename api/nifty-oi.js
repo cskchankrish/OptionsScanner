@@ -154,6 +154,12 @@ function formatLots(n) {
   return `${sign}${abs.toLocaleString("en-IN")}`;
 }
 
+function toClockTimeStr(m) {
+  const h = Math.floor(m / 60);
+  const mn = m % 60;
+  return `${String(h).padStart(2, "0")}:${String(mn).padStart(2, "0")}`;
+}
+
 function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPainStrike }) {
   if (!timeline || timeline.length < 12) {
     return {
@@ -166,30 +172,55 @@ function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPain
   const tNow = timeline[timeline.length - 1];
   const nowMins = tNow.minutes || 0;
 
-  const target15 = nowMins - 15;
-  const target30 = nowMins - 30;
+  // Standard NSE 15-minute clock slots (:00, :15, :30, :45)
+  // Market starts at 09:15 IST (555 mins)
+  const currentSlotStart = Math.floor(nowMins / 15) * 15;
+  const currentSlotEnd = currentSlotStart + 15;
+  const minsIntoSlot = nowMins - currentSlotStart;
 
-  let pt15 = timeline[0];
-  let pt30 = timeline[0];
-  let minDiff15 = Infinity;
-  let minDiff30 = Infinity;
+  let c1Start, c1End, c2Start, c2End;
+
+  // If current slot has just started (< 3 mins), use the two previously completed 15m candles
+  if (minsIntoSlot < 3) {
+    c2Start = currentSlotStart - 15;
+    c2End = currentSlotStart;
+    c1Start = c2Start - 15;
+    c1End = c2Start;
+  } else {
+    // C1 is the prior completed 15m candle (e.g. 13:00 - 13:15)
+    // C2 is the currently forming 15m candle (e.g. 13:15 - 13:30)
+    c1Start = currentSlotStart - 15;
+    c1End = currentSlotStart;
+    c2Start = currentSlotStart;
+    c2End = currentSlotEnd;
+  }
+
+  // Find timeline points matching exact clock boundaries
+  let p0 = timeline[0];
+  let minDiff0 = Infinity;
+  let p1 = timeline[0];
+  let minDiff1 = Infinity;
+  let p2 = timeline[timeline.length - 1];
 
   for (const pt of timeline) {
     const m = pt.minutes || 0;
-    const diff15 = Math.abs(m - target15);
-    const diff30 = Math.abs(m - target30);
-    if (diff15 < minDiff15) {
-      minDiff15 = diff15;
-      pt15 = pt;
+    const d0 = Math.abs(m - c1Start);
+    const d1 = Math.abs(m - c1End);
+    if (d0 < minDiff0) {
+      minDiff0 = d0;
+      p0 = pt;
     }
-    if (diff30 < minDiff30) {
-      minDiff30 = diff30;
-      pt30 = pt;
+    if (d1 < minDiff1) {
+      minDiff1 = d1;
+      p1 = pt;
+    }
+    if (m <= c2End) {
+      p2 = pt;
     }
   }
 
-  const spanMins = (tNow.minutes || 0) - (pt30.minutes || 0);
-  if (spanMins < 20) {
+  const spanMins = (p2.minutes || nowMins) - (p0.minutes || 0);
+  if (spanMins < 18) {
     return {
       isTriggered: false,
       status: "ACCUMULATING",
@@ -197,67 +228,67 @@ function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPain
     };
   }
 
-  const c1SpotDelta = pt15.spot - pt30.spot;
-  const c1NetDelta = pt15.netDiff - pt30.netDiff;
+  // Candle 1 (Clock aligned: e.g. 13:00 - 13:15)
+  const c1SpotDelta = p1.spot - p0.spot;
+  const c1NetDelta = p1.netDiff - p0.netDiff;
 
-  const c2SpotDelta = tNow.spot - pt15.spot;
-  const c2NetDelta = tNow.netDiff - pt15.netDiff;
+  // Candle 2 (Clock aligned: e.g. 13:15 - 13:30)
+  const c2SpotDelta = p2.spot - p1.spot;
+  const c2NetDelta = p2.netDiff - p1.netDiff;
 
-  const totalSpotDelta = tNow.spot - pt30.spot;
-  const totalNetDelta = tNow.netDiff - pt30.netDiff;
+  // 30-Minute Cumulative Total
+  const totalSpotDelta = p2.spot - p0.spot;
+  const totalNetDelta = p2.netDiff - p0.netDiff;
+
+  const c1Label = `C1 (${toClockTimeStr(c1Start)}-${toClockTimeStr(c1End)})`;
+  const c2Label = `C2 (${toClockTimeStr(c2Start)}-${toClockTimeStr(c2End)})`;
 
   // Criteria for Concrete Macro Bull Trap (50–100 pt reversal down):
-  // 1. Spot pushed up by >= 22 pts over 30m window (or tested near Roof)
-  // 2. Net Writing Delta dropped significantly (<= -26,000 lots)
-  // 3. Candle 2 confirmed ongoing/accelerating Call writing
   if (totalSpotDelta >= 22 && totalNetDelta <= -26000 && (c1NetDelta < -7000 || c2NetDelta < -14000)) {
     const targetDrop = Math.max(50, Math.min(100, Math.round(spot - floorStrike)));
     const targetPrice = Math.round(spot - targetDrop);
-    const invPrice = Math.round(Math.max(tNow.spot, pt15.spot, pt30.spot) + 15);
+    const invPrice = Math.round(Math.max(p2.spot, p1.spot, p0.spot) + 15);
     return {
       isTriggered: true,
       type: "BULL_TRAP_REVERSAL",
       direction: "BEARISH_TURN",
-      title: "🚨 30-MIN MACRO BULL TRAP CONFIRMED (2x 15m Candles)",
+      title: `🚨 30-MIN MACRO BULL TRAP CONFIRMED (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)})`,
       action: "High-Probability 50–100 pt Reversal Down. Smart money heavily shorted the 30m rally with Call writing.",
       targetMove: `50–80 pts (Target: ~${targetPrice})`,
       invalidation: `Above ${invPrice} (30m high + 15 pts)`,
-      candle1: `C1 (${pt30.time}-${pt15.time}): Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
-      candle2: `C2 (${pt15.time}-${tNow.time}): Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
-      summary: `30m Total: Spot +${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
-      message: `🚨 30-MIN MACRO BULL TRAP: Spot pushed +${totalSpotDelta.toFixed(1)} pts across 2x15m candles, but Net Writing Delta plunged ${formatLots(totalNetDelta)}. High-probability 50–80 pt drop toward ~${targetPrice}. Invalidation: Above ${invPrice}.`,
+      candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
+      candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
+      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot +${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
+      message: `🚨 30-MIN MACRO BULL TRAP (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot pushed +${totalSpotDelta.toFixed(1)} pts, but Net Writing Delta plunged ${formatLots(totalNetDelta)}. High-probability 50–80 pt drop toward ~${targetPrice}. Invalidation: Above ${invPrice}.`,
     };
   }
 
   // Criteria for Concrete Macro Bear Trap (50–100 pt bounce up):
-  // 1. Spot dropped by <= -22 pts over 30m window (or tested near Floor)
-  // 2. Net Writing Delta surged significantly (>= +26,000 lots)
-  // 3. Put writers aggressively absorbed the dip across both candles
   if (totalSpotDelta <= -22 && totalNetDelta >= 28000 && (c1NetDelta > 7000 || c2NetDelta > 14000)) {
     const targetBounce = Math.max(50, Math.min(100, Math.round(roofStrike - spot)));
     const targetPrice = Math.round(spot + targetBounce);
-    const invPrice = Math.round(Math.min(tNow.spot, pt15.spot, pt30.spot) - 15);
+    const invPrice = Math.round(Math.min(p2.spot, p1.spot, p0.spot) - 15);
     return {
       isTriggered: true,
       type: "BEAR_TRAP_REVERSAL",
       direction: "BULLISH_TURN",
-      title: "🟢 30-MIN MACRO BEAR TRAP / ABSORPTION CONFIRMED (2x 15m Candles)",
+      title: `🟢 30-MIN MACRO BEAR TRAP / ABSORPTION CONFIRMED (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)})`,
       action: "High-Probability 50–100 pt Reversal Up. Smart money heavily absorbed the 30m dip with Put writing.",
       targetMove: `50–80 pts (Target: ~${targetPrice})`,
       invalidation: `Below ${invPrice} (30m low - 15 pts)`,
-      candle1: `C1 (${pt30.time}-${pt15.time}): Spot ${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
-      candle2: `C2 (${pt15.time}-${tNow.time}): Spot ${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
-      summary: `30m Total: Spot ${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
-      message: `🟢 30-MIN MACRO BEAR TRAP: Spot dipped ${totalSpotDelta.toFixed(1)} pts across 2x15m candles, but Put writers absorbed ${formatLots(totalNetDelta)}. High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.`,
+      candle1: `${c1Label}: Spot ${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
+      candle2: `${c2Label}: Spot ${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
+      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
+      message: `🟢 30-MIN MACRO BEAR TRAP (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot dipped ${totalSpotDelta.toFixed(1)} pts, but Put writers absorbed ${formatLots(totalNetDelta)}. High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.`,
     };
   }
 
   return {
     isTriggered: false,
     type: "IN_SYNC",
-    message: `● 30-Min Flow In-Sync (${spanMins}m): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts | Net Delta ${formatLots(totalNetDelta)}. Price & writing delta aligned.`,
-    candle1: `C1: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} | Delta ${formatLots(c1NetDelta)}`,
-    candle2: `C2: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} | Delta ${formatLots(c2NetDelta)}`,
+    message: `● 30-Min Flow In-Sync (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts | Net Delta ${formatLots(totalNetDelta)}. Price & writing delta aligned.`,
+    candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} | Delta ${formatLots(c1NetDelta)}`,
+    candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} | Delta ${formatLots(c2NetDelta)}`,
     totalSpotDelta: Number(totalSpotDelta.toFixed(1)),
     totalNetDelta: Math.round(totalNetDelta),
   };
