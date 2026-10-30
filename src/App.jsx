@@ -808,6 +808,39 @@ function ScoringGuide({ t, isDark }) {
             • <strong>Max Pain:</strong> The mathematically calculated strike price where option buyers experience maximum cumulative financial loss (and option writers keep the maximum premium). It acts as a gravitational anchor near expiry.
           </div>
         </div>
+
+        {/* 5. End-of-Day (EOD) Overnight Carry Framework */}
+        <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12, marginTop:10 }}>
+          <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
+            🌙 5. End-of-Day (EOD) Overnight Carry Framework (BTST / STBT)
+          </div>
+          <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6, marginBottom:8 }}>
+            Whether you should hold a Nifty CE (BTST) or PE (STBT) overnight into the next morning open is decided by an institutional 4-pillar audit calculated directly from full-day OI accumulation and late-session closing flow:
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:6, fontSize:11 }}>
+            <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
+              <strong>1. Full-Day Writing Dominance (±2 pts):</strong> Put writing &gt; 1.35× Call writing (+2) signals institutional downside underwriting. Call writing &gt; 1.35× Put writing (-2) signals capping overhead supply.
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
+              <strong>2. Closing Hour Flow 14:15–15:25 IST (±2 pts):</strong> Proprietary desks execute overnight positioning in the final 75 minutes. Net Put writing delta surge &gt;+20k lots (+2) indicates BTST accumulation; Call writing surge &gt;+20k lots (-2) indicates STBT distribution.
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
+              <strong>3. PCR &amp; ΔPCR Confluence (±1 pt):</strong> Closing PCR ≥ 1.20 with ΔPCR ≥ 1.30 confirms bullish positioning (+1). PCR ≤ 0.85 with ΔPCR ≤ 0.75 confirms bearish pressure (-1).
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
+              <strong>4. Spot Price vs Floor / Roof (±1 pt):</strong> Spot holding comfortably above the Floor (+1) protects longs. Spot pinned under Roof (-1) or testing breakdown (-1) penalizes longs.
+            </div>
+          </div>
+
+          <div style={{ marginTop:8, padding:"8px 10px", background:isDark ? "#2a1e05" : "#fefce8", border:"1px solid #eab30855", borderRadius:6, fontSize:10.5, color:isDark ? "#fde047" : "#854d0e", lineHeight:1.5 }}>
+            ⚠️ <strong>Strict Friday / Weekend Risk Rule:</strong> Friday overnight positions face 48 hours of theta decay and 2 days of weekend global event risk. Therefore, Friday requires a higher score threshold (≥ +4 or ≤ -4) and position sizing is capped at <strong>50% max</strong>. If flow is mixed, the model strictly advises <strong>EXIT TO CASH</strong>.
+          </div>
+
+          <div style={{ fontSize:10.5, color:t.textMuted, marginTop:8 }}>
+            ⏱️ <strong>Execution Window:</strong> Check the EOD card between <strong>15:10 and 15:25 IST</strong> when closing auction flows solidify. If conditions are met, enter ATM/slight ITM option with overnight risk strictly defined by the institutional Floor/Roof stop.
+          </div>
+        </div>
       </div>
 
       <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:10,

@@ -67,6 +67,11 @@ function getISTMinutes() {
   return istDate.getHours() * 60 + istDate.getMinutes();
 }
 
+function getISTDayOfWeek() {
+  const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  return istDate.getDay();
+}
+
 function getISTDateStr() {
   return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
 }
@@ -425,6 +430,178 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
   };
 }
 
+function calculateEODDecision({
+  spot = 22696.65,
+  floorStrike = 22600,
+  roofStrike = 22800,
+  totPutWriting = 0,
+  totCallWriting = 0,
+  pcr = 1.0,
+  deltaPcr = 1.0,
+  timeline = [],
+  dayOfWeek = 5,
+  nowMins = 905,
+}) {
+  let score = 0;
+  const audit = [];
+
+  // 1. Full Day Writing Ratio
+  let fullDayStatus = "NEUTRAL";
+  let fullDayDetail = "Balanced / non-directional writing";
+  if (totPutWriting > 1.35 * totCallWriting) {
+    score += 2;
+    fullDayStatus = "BULLISH";
+    fullDayDetail = `Put writing dominates full day (${formatLots(totPutWriting)} P vs ${formatLots(totCallWriting)} C)`;
+  } else if (totCallWriting > 1.35 * totPutWriting) {
+    score -= 2;
+    fullDayStatus = "BEARISH";
+    fullDayDetail = `Call writing dominates full day (${formatLots(totCallWriting)} C vs ${formatLots(totPutWriting)} P)`;
+  }
+  audit.push({
+    label: "Full Day Writing",
+    status: fullDayStatus,
+    detail: fullDayDetail,
+    impact: fullDayStatus === "BULLISH" ? "+2 pts" : fullDayStatus === "BEARISH" ? "-2 pts" : "0 pts",
+  });
+
+  // 2. Final Hour Flow (14:15 to current)
+  let lastHourNetDelta = 0;
+  let closingFlowStatus = "NEUTRAL";
+  let closingFlowDetail = "Neutral closing hour flow";
+  if (timeline && timeline.length >= 3) {
+    let p1415 = timeline[0];
+    let minDiff = Infinity;
+    for (const pt of timeline) {
+      const d = Math.abs((pt.minutes || 0) - 855); // 855 = 14:15 IST
+      if (d < minDiff) {
+        minDiff = d;
+        p1415 = pt;
+      }
+    }
+    const pNow = timeline[timeline.length - 1];
+    lastHourNetDelta = (pNow.netDiff || 0) - (p1415.netDiff || 0);
+
+    if (lastHourNetDelta > 20000) {
+      score += 2;
+      closingFlowStatus = "BULLISH";
+      closingFlowDetail = `Strong Put accumulation (${formatLots(lastHourNetDelta)} lots since 14:15)`;
+    } else if (lastHourNetDelta < -20000) {
+      score -= 2;
+      closingFlowStatus = "BEARISH";
+      closingFlowDetail = `Heavy Call distribution (${formatLots(lastHourNetDelta)} lots since 14:15)`;
+    } else {
+      closingFlowDetail = `Closing flow steady (${formatLots(lastHourNetDelta)} lots since 14:15)`;
+    }
+  } else {
+    closingFlowDetail = "Awaiting more intraday ticks";
+  }
+  audit.push({
+    label: "Closing Hour Flow (14:15+)",
+    status: closingFlowStatus,
+    detail: closingFlowDetail,
+    impact: closingFlowStatus === "BULLISH" ? "+2 pts" : closingFlowStatus === "BEARISH" ? "-2 pts" : "0 pts",
+  });
+
+  // 3. PCR & Delta PCR
+  let pcrStatus = "NEUTRAL";
+  let pcrDetail = `PCR ${Number(pcr).toFixed(2)} · ΔPCR ${Number(deltaPcr).toFixed(2)}`;
+  if (pcr >= 1.20 && deltaPcr >= 1.30) {
+    score += 1;
+    pcrStatus = "BULLISH";
+    pcrDetail = `Bullish PCR expansion (PCR ${Number(pcr).toFixed(2)}, ΔPCR ${Number(deltaPcr).toFixed(2)})`;
+  } else if (pcr <= 0.85 && deltaPcr <= 0.75) {
+    score -= 1;
+    pcrStatus = "BEARISH";
+    pcrDetail = `Bearish PCR compression (PCR ${Number(pcr).toFixed(2)}, ΔPCR ${Number(deltaPcr).toFixed(2)})`;
+  }
+  audit.push({
+    label: "PCR Structure",
+    status: pcrStatus,
+    detail: pcrDetail,
+    impact: pcrStatus === "BULLISH" ? "+1 pt" : pcrStatus === "BEARISH" ? "-1 pt" : "0 pts",
+  });
+
+  // 4. Spot Price vs Floor / Roof
+  let levelStatus = "NEUTRAL";
+  let levelDetail = `Spot ${Number(spot).toFixed(0)} between ${floorStrike} and ${roofStrike}`;
+  if (spot >= floorStrike + 30 && spot <= roofStrike - 15) {
+    score += 1;
+    levelStatus = "BULLISH";
+    levelDetail = `Spot holding firmly above Floor support (${floorStrike})`;
+  } else if (spot <= floorStrike + 15) {
+    score -= 1;
+    levelStatus = "BEARISH";
+    levelDetail = `Spot breaking down near Floor support (${floorStrike})`;
+  } else if (spot >= roofStrike - 10) {
+    score -= 1;
+    levelStatus = "BEARISH";
+    levelDetail = `Spot pinned at Roof resistance (${roofStrike})`;
+  }
+  audit.push({
+    label: "Spot vs Levels",
+    status: levelStatus,
+    detail: levelDetail,
+    impact: levelStatus === "BULLISH" ? "+1 pt" : levelStatus === "BEARISH" ? "-1 pt" : "0 pts",
+  });
+
+  const isFriday = (dayOfWeek === 5);
+  const isDecisionWindow = (nowMins >= 885 && nowMins <= 930); // 14:45 to 15:30 IST
+
+  let statusLabel = "EARLY MONITORING";
+  if (isDecisionWindow) {
+    statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
+  } else if (nowMins > 930) {
+    statusLabel = "MARKET CLOSED · EOD POST-MORTEM";
+  } else {
+    statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
+  }
+
+  let verdict = "EXIT TO CASH / DO NOT CARRY";
+  let bias = "NEUTRAL";
+  let conviction = 75;
+  let sizing = "0% (Zero Leverage)";
+  let action = "No overnight edge. Balanced flow or chop. Carry zero leverage into next session.";
+
+  // Thresholds: on Friday, require score >= 4 or <= -4 due to weekend decay
+  const thresh = isFriday ? 4 : 3;
+
+  if (score >= thresh) {
+    verdict = "CARRY NIFTY CE (BTST)";
+    bias = "BULLISH";
+    conviction = Math.min(95, 72 + score * 4);
+    sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
+    action = `Favorable for holding overnight Nifty CE. Smart money has underwritten downside risk. Target: Morning gap-up continuation toward ${roofStrike}.`;
+  } else if (score <= -thresh) {
+    verdict = "CARRY NIFTY PE (STBT)";
+    bias = "BEARISH";
+    conviction = Math.min(95, 72 + Math.abs(score) * 4);
+    sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
+    action = `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}.`;
+  } else {
+    verdict = "EXIT TO CASH / DO NOT CARRY";
+    bias = "NEUTRAL";
+    conviction = 80;
+    sizing = "0% (Cash Only)";
+    const riskReason = isFriday
+      ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
+      : "Balanced intraday flow without clear overnight edge";
+    action = `${riskReason}. Carry 0 overnight leverage and preserve capital for next market open.`;
+  }
+
+  return {
+    verdict,
+    bias,
+    conviction,
+    sizing,
+    action,
+    score,
+    isFriday,
+    isDecisionWindow,
+    statusLabel,
+    audit,
+  };
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -616,6 +793,21 @@ export default async function handler(req, res) {
       intradayHistory: timeline,
     });
 
+    const eodDecision = calculateEODDecision({
+      spot,
+      floorStrike,
+      roofStrike,
+      totPutWriting,
+      totCallWriting,
+      pcr,
+      deltaPcr,
+      timeline,
+      dayOfWeek: getISTDayOfWeek(),
+      nowMins: getISTMinutes(),
+    });
+
+    smartMoney.eodDecision = eodDecision;
+
     const payload = {
       success: true,
       isLive: true,
@@ -637,6 +829,7 @@ export default async function handler(req, res) {
       deltaPcr,
       strikes,
       smartMoney,
+      eodDecision,
       intradayTimeline: timeline,
       hasRedis: Boolean(REDIS_URL),
     };
@@ -701,6 +894,21 @@ function getFallbackData() {
     intradayHistory: timeline,
   });
 
+  const eodDecision = calculateEODDecision({
+    spot,
+    floorStrike: 22600,
+    roofStrike: 22800,
+    totPutWriting: 279500,
+    totCallWriting: 157500,
+    pcr: 1.28,
+    deltaPcr: 1.77,
+    timeline,
+    dayOfWeek: getISTDayOfWeek(),
+    nowMins: getISTMinutes(),
+  });
+
+  smartMoney.eodDecision = eodDecision;
+
   return {
     success: true,
     isLive: false,
@@ -723,6 +931,7 @@ function getFallbackData() {
     deltaPcr: 1.77,
     strikes,
     smartMoney,
+    eodDecision,
     intradayTimeline: timeline,
     hasRedis: Boolean(REDIS_URL),
   };

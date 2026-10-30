@@ -1385,6 +1385,174 @@ export function NiftyFlowView({ t, isDark }) {
         </div>
       )}
 
+      {/* ── 🌙 EOD OVERNIGHT CARRY DECISION (BTST / STBT) ── */}
+      {(oiData?.eodDecision || oiData?.smartMoney?.eodDecision) && (() => {
+        const eod = oiData.eodDecision || oiData.smartMoney.eodDecision;
+        const isBull = eod.bias === "BULLISH";
+        const isBear = eod.bias === "BEARISH";
+        const color = isBull ? "#16a34a" : isBear ? "#ef4444" : "#d97706";
+        const bgTint = isBull
+          ? (isDark ? "#052e16" : "#f0fdf4")
+          : isBear
+          ? (isDark ? "#2d0a0a" : "#fef2f2")
+          : (isDark ? "#291804" : "#fffbeb");
+        const borderTint = isBull ? "#16a34a55" : isBear ? "#ef444455" : "#d9770655";
+
+        return (
+          <div style={{
+            background: t.surface,
+            border: `1.5px solid ${t.border}`,
+            borderRadius: 12,
+            padding: isMobile ? "12px 14px" : "16px 20px",
+            marginBottom: 16,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
+          }}>
+            {/* Header Row */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontSize: isMobile ? 14 : 16, fontWeight: 900, color: t.text }}>
+                  🌙 EOD OVERNIGHT CARRY DECISION (BTST / STBT)
+                </span>
+                <span style={{
+                  fontSize: isMobile ? 10 : 11,
+                  fontWeight: 800,
+                  padding: "3px 8px",
+                  borderRadius: 6,
+                  background: isDark ? "#1e293b" : "#f1f5f9",
+                  color: t.textSub,
+                  border: `1px solid ${t.border}`,
+                }}>
+                  {eod.statusLabel}
+                </span>
+              </div>
+              <span style={{
+                fontSize: isMobile ? 11 : 12,
+                fontWeight: 800,
+                padding: "3px 9px",
+                borderRadius: 6,
+                background: bgTint,
+                color: color,
+                border: `1px solid ${borderTint}`,
+              }}>
+                {eod.conviction}% Conviction · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
+              </span>
+            </div>
+
+            {/* Verdict Banner */}
+            <div style={{
+              background: bgTint,
+              border: `1.5px solid ${borderTint}`,
+              borderRadius: 8,
+              padding: isMobile ? "12px" : "14px 16px",
+              marginBottom: 10,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                <span style={{
+                  fontSize: isMobile ? 14 : 16,
+                  fontWeight: 900,
+                  color: color,
+                  letterSpacing: "0.2px",
+                }}>
+                  {eod.verdict}
+                </span>
+                <span style={{
+                  fontSize: isMobile ? 11 : 12,
+                  fontWeight: 800,
+                  color: color,
+                  padding: "2px 8px",
+                  borderRadius: 4,
+                  background: isDark ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.7)",
+                  border: `1px solid ${borderTint}`,
+                }}>
+                  Recommended Sizing: {eod.sizing}
+                </span>
+              </div>
+              <div style={{ fontSize: isMobile ? 11.5 : 12.5, color: t.text, fontWeight: 600, lineHeight: 1.55 }}>
+                {eod.action}
+              </div>
+            </div>
+
+            {/* Friday Weekend Risk Banner */}
+            {eod.isFriday && (
+              <div style={{
+                background: isDark ? "#2a1e05" : "#fefce8",
+                border: "1px solid #eab30866",
+                borderRadius: 8,
+                padding: "8px 12px",
+                fontSize: isMobile ? 10.5 : 11.5,
+                color: isDark ? "#fde047" : "#854d0e",
+                lineHeight: 1.5,
+                marginBottom: 10,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}>
+                <span style={{ fontSize: 15 }}>⚠️</span>
+                <div>
+                  <strong>Friday Weekend Decay Rule:</strong> Weekend carry incurs 48 hours of theta decay + global weekend event risk. Sizing is strictly capped at 50% max, requiring score ≥ 4. If signals are mixed, capital is preserved in 100% Cash.
+                </div>
+              </div>
+            )}
+
+            {/* 4-Pill Confluence Audit Grid */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
+              gap: 8,
+              marginBottom: 8,
+            }}>
+              {(eod.audit || []).map((item, idx) => {
+                const itemBull = item.status === "BULLISH";
+                const itemBear = item.status === "BEARISH";
+                const itemColor = itemBull ? "#16a34a" : itemBear ? "#ef4444" : t.textMuted;
+                const itemBg = itemBull
+                  ? (isDark ? "#052e1633" : "#f0fdf4")
+                  : itemBear
+                  ? (isDark ? "#2d0a0a33" : "#fef2f2")
+                  : (isDark ? "#18181b33" : "#f9fafb");
+                return (
+                  <div key={idx} style={{
+                    background: itemBg,
+                    border: `1px solid ${itemBull ? "#16a34a33" : itemBear ? "#ef444433" : t.border}`,
+                    borderRadius: 6,
+                    padding: "8px 10px",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                      <span style={{ fontSize: isMobile ? 10.5 : 11, fontWeight: 800, color: t.textSub }}>
+                        {item.label}
+                      </span>
+                      <span style={{ fontSize: 10, fontWeight: 900, color: itemColor }}>
+                        {item.impact}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: isMobile ? 11 : 11.5, fontWeight: 700, color: itemColor, lineHeight: 1.4 }}>
+                      {item.detail}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Timing / Invalidation Footer */}
+            <div style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: 6,
+              fontSize: isMobile ? 10 : 11,
+              color: t.textMuted,
+              borderTop: `1px solid ${t.border}`,
+              paddingTop: 8,
+              marginTop: 4,
+            }}>
+              <span>⏱️ <strong>Execution:</strong> Enter between 15:10 – 15:25 IST as post-market auction settles.</span>
+              <span>⛔ <strong>Stop / Invalidation:</strong> Exit at morning open if Nifty breaks Floor ({oiData?.floor}) or Roof ({oiData?.roof}).</span>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* ── INTRADAY NET OI LINE GRAPH (WITH ZOOM & PAN) ── */}
       <NiftyIntradayLineChart
         timeline={oiData?.intradayTimeline}
