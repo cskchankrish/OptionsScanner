@@ -1306,13 +1306,18 @@ export function NiftyFlowView({ t, isDark }) {
           {/* Divergence / Trap Alert Strip */}
           <div style={{
             fontSize: isMobile ? 10.5 : 11.5,
-            padding: "6px 10px",
+            padding: "8px 12px",
             borderRadius: 6,
             background: oiData.smartMoney.trapAlert.includes("WARNING")
-              ? (isDark ? "rgba(239, 68, 68, 0.15)" : "#fee2e2")
+              ? (isDark ? "rgba(239, 68, 68, 0.16)" : "#fee2e2")
               : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
-              ? (isDark ? "rgba(34, 197, 94, 0.15)" : "#dcfce7")
+              ? (isDark ? "rgba(34, 197, 94, 0.16)" : "#dcfce7")
               : (isDark ? "#0a1322" : "#f1f5f9"),
+            border: oiData.smartMoney.trapAlert.includes("WARNING")
+              ? "1px solid rgba(239, 68, 68, 0.4)"
+              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
+              ? "1px solid rgba(34, 197, 94, 0.4)"
+              : `1px solid ${t.border}`,
             color: oiData.smartMoney.trapAlert.includes("WARNING")
               ? "#ef4444"
               : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
@@ -1321,7 +1326,8 @@ export function NiftyFlowView({ t, isDark }) {
             fontWeight: 700,
             display: "flex",
             alignItems: "center",
-            gap: 6
+            gap: 6,
+            lineHeight: 1.5
           }}>
             {oiData.smartMoney.trapAlert}
           </div>

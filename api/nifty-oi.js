@@ -276,18 +276,29 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
     }
   }
 
-  // Divergence / Trap detection from intraday timeline history
+  // Divergence / Trap detection from intraday timeline history (with 8-minute persistence window)
   let trapAlert = "● Flow In-Sync: Price action is aligned with institutional writing flow.";
   if (intradayHistory && intradayHistory.length >= 3) {
-    const last = intradayHistory[intradayHistory.length - 1];
-    const prev = intradayHistory[Math.max(0, intradayHistory.length - 3)];
-    if (last && prev) {
-      const deltaSpot = last.spot - prev.spot;
-      const deltaDiff = last.netDiff - prev.netDiff;
-      if (deltaSpot > 12 && deltaDiff < -12000) {
-        trapAlert = `⚠️ BULL TRAP WARNING: Spot pushed higher (+${deltaSpot.toFixed(1)} pts), but Net Writing Delta dropped. Smart money is fading the rally with Call writing.`;
-      } else if (deltaSpot < -12 && deltaDiff > 12000) {
-        trapAlert = `🟢 BEAR TRAP / ABSORPTION: Spot dipped (${deltaSpot.toFixed(1)} pts), but Put writing expanded. Smart money is quietly absorbing selling pressure.`;
+    const endIdx = intradayHistory.length - 1;
+    const startIdx = Math.max(2, intradayHistory.length - 9); // Look back up to 8 minutes
+
+    for (let idx = endIdx; idx >= startIdx; idx--) {
+      const cur = intradayHistory[idx];
+      const prev = intradayHistory[Math.max(0, idx - 3)];
+      if (cur && prev && cur !== prev) {
+        const deltaSpot = cur.spot - prev.spot;
+        const deltaDiff = cur.netDiff - prev.netDiff;
+        if (deltaSpot > 11 && deltaDiff < -12000) {
+          const ageMins = (intradayHistory[endIdx].minutes || 0) - (cur.minutes || 0);
+          const remainingMins = Math.max(1, 8 - ageMins);
+          trapAlert = `⚠️ BULL TRAP WARNING (Detected at ${cur.time} IST · Active for ${remainingMins}m): Spot pushed higher (+${deltaSpot.toFixed(1)} pts), but Net Writing Delta dropped. Smart money is fading the rally with Call writing. Caution on fresh long breakout entries.`;
+          break;
+        } else if (deltaSpot < -11 && deltaDiff > 12000) {
+          const ageMins = (intradayHistory[endIdx].minutes || 0) - (cur.minutes || 0);
+          const remainingMins = Math.max(1, 8 - ageMins);
+          trapAlert = `🟢 BEAR TRAP / ABSORPTION (Detected at ${cur.time} IST · Active for ${remainingMins}m): Spot dipped (${deltaSpot.toFixed(1)} pts), but Put writing expanded. Smart money is quietly absorbing selling pressure. Favorable for dip reversal.`;
+          break;
+        }
       }
     }
   }

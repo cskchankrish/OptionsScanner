@@ -648,9 +648,9 @@ function StockListView({ stocks, t, isDark }) {
 }
 
 // ─── SCORING GUIDE ────────────────────────────────────────────────────────────
-function ScoringGuide({ t }) {
+function ScoringGuide({ t, isDark }) {
   return (
-    <div style={{ padding:"16px 14px", maxWidth:680, margin:"0 auto", display:"flex", flexDirection:"column", gap:12 }}>
+    <div style={{ padding:"16px 14px", maxWidth:680, margin:"0 auto", display:"flex", flexDirection:"column", gap:14 }}>
       <div style={{ background:t.surface, border:`1px solid ${t.border}`, borderRadius:12, padding:18 }}>
         <div style={{ fontWeight:800, fontSize:14, color:t.text, marginBottom:4 }}>📐 Base Signals — Max 100 pts</div>
         <div style={{ fontSize:11, color:t.textMuted, marginBottom:12 }}>200 EMA is reference only — not scored.</div>
@@ -705,6 +705,104 @@ function ScoringGuide({ t }) {
             <span style={{ fontSize:11, color:t.textMuted }}>{desc}</span>
           </div>
         ))}
+      </div>
+
+      {/* ── 🧠 SMART MONEY & INSTITUTIONAL RADAR GUIDE ── */}
+      <div style={{ background:t.surface, border:`1.5px solid ${t.border}`, borderRadius:12, padding:18 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+          <span style={{ fontWeight:900, fontSize:15, color:t.text }}>🧠 Smart Money &amp; Institutional Radar Guide</span>
+          <span style={{ fontSize:10.5, fontWeight:800, padding:"2px 7px", borderRadius:4, background:t.accentBg, color:t.accentSub }}>
+            OI Flow
+          </span>
+        </div>
+        <div style={{ fontSize:11.5, color:t.textMuted, lineHeight:1.6, marginBottom:14 }}>
+          How institutional positioning, conviction percentages, strike migrations, and trap divergences are derived in the Nifty Flow dashboard.
+        </div>
+
+        {/* 1. Institutional Corridor */}
+        <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12, marginBottom:10 }}>
+          <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
+            🎯 1. The Institutional Corridor (ATM ± 200 pts)
+          </div>
+          <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6 }}>
+            Unlike retail traders who buy far Out-of-the-Money (OTM) options, smart money (Proprietary Desks &amp; FIIs) deploys over <strong>80% of their risk capital</strong> strictly within ATM ± 200 points. The radar isolates this near-the-money zone to eliminate retail noise and measure true institutional underwriting.
+          </div>
+        </div>
+
+        {/* 2. Conviction Percentage */}
+        <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12, marginBottom:10 }}>
+          <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
+            📊 2. Conviction % Derivation &amp; High-Conviction (80–90%)
+          </div>
+          <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6, marginBottom:8 }}>
+            Conviction is derived mathematically from the writing dominance ratio inside the Institutional Corridor:
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:6, fontSize:11 }}>
+            <div style={{ padding:"6px 10px", background:isDark ? "#052e1622" : "#f0fdf4", border:"1px solid #16a34a33", borderRadius:6 }}>
+              <strong style={{ color:"#16a34a" }}>🟢 Accumulation (Bullish):</strong> Put writing &gt; 1.35x Call writing. Conviction = Put Dominance % (e.g. 85% Put writing = <strong>85% Conviction</strong>).
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#2d0a0a22" : "#fef2f2", border:"1px solid #ef444433", borderRadius:6 }}>
+              <strong style={{ color:"#ef4444" }}>🔴 Capping / Distribution (Bearish):</strong> Call writing &gt; 1.35x Put writing. Conviction = Call Dominance % (e.g. 88% Call writing = <strong>88% Conviction</strong>).
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#1e1b4b22" : "#eef2ff", border:"1px solid #6366f133", borderRadius:6 }}>
+              <strong style={{ color:"#6366f1" }}>🚀 Short Covering Squeeze:</strong> Trapped Call writers closing &gt;25k lots under pressure. Conviction scales from <strong>75% to 95%</strong>.
+            </div>
+            <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
+              <strong style={{ color:"#d97706" }}>⚪ Range-Bound (Delta Neutral):</strong> Writing is balanced on both wings. Conviction stays at <strong>60%–65%</strong> because institutions are writing straddles to harvest theta decay rather than taking a directional bet.
+            </div>
+          </div>
+          <div style={{ fontSize:10.5, color:t.textMuted, marginTop:8, fontStyle:"italic" }}>
+            💡 <strong>When will conviction reach 80%–90%?</strong> Typically between 10:15 AM and 1:30 PM once morning cross-currents settle and institutions establish a one-sided trend (e.g. a 4:1 writing ratio or active defense of a key Floor/Roof).
+          </div>
+        </div>
+
+        {/* 3. Trap Warnings & Trading Playbook */}
+        <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12, marginBottom:10 }}>
+          <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
+            ⚠️ 3. Trap Divergence Alerts &amp; Trading Playbook
+          </div>
+          <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6, marginBottom:8 }}>
+            Monitors rolling 3-minute divergence between <strong>Spot Price Action</strong> vs. <strong>Net Writing Delta</strong>:
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:8, fontSize:11 }}>
+            <div style={{ padding:"8px 10px", background:isDark ? "#2d0a0a33" : "#fee2e2", border:"1px solid #ef444444", borderRadius:6 }}>
+              <div style={{ fontWeight:800, color:"#ef4444", marginBottom:3 }}>
+                ⚠️ Bull Trap Warning (Spot Surges +11 pts &amp; Net Delta Drops &gt; 12k lots)
+              </div>
+              <div style={{ color:t.textSub, lineHeight:1.5 }}>
+                • <strong>What is happening:</strong> Retail traders buy green breakout candles, but smart money refuses to support it and dumps heavy Call writing directly into the spike.<br />
+                • <strong>Playbook:</strong> <strong>DO NOT BUY THE BREAKOUT.</strong> Cancel buy market orders. If holding existing long calls from support, trail stops to breakeven or lock partial profits.<br />
+                • <strong>Confluence:</strong> If flashing near Resistance Roof or Camarilla R3, reversal probability is &gt;85%.
+              </div>
+            </div>
+
+            <div style={{ padding:"8px 10px", background:isDark ? "#052e1633" : "#dcfce7", border:"1px solid #16a34a44", borderRadius:6 }}>
+              <div style={{ fontWeight:800, color:"#16a34a", marginBottom:3 }}>
+                🟢 Bear Trap / Absorption (Spot Dips -11 pts &amp; Net Put Writing Expands &gt; 12k lots)
+              </div>
+              <div style={{ color:t.textSub, lineHeight:1.5 }}>
+                • <strong>What is happening:</strong> Price breaks lower, but Put writers aggressively step in and absorb the selling pressure.<br />
+                • <strong>Playbook:</strong> <strong>DO NOT SHORT THE BREAKDOWN.</strong> Wait for bullish confirmation or dip bounce from Floor support.
+              </div>
+            </div>
+          </div>
+
+          <div style={{ fontSize:10.5, color:t.textMuted, marginTop:8 }}>
+            ⏱️ <strong>8-Minute Persistence Window:</strong> To prevent signals from vanishing on a 1-minute flicker, alerts remain visible with an active countdown timer (e.g. <em>Active for 7m</em>) so you have adequate time to evaluate trades.
+          </div>
+        </div>
+
+        {/* 4. Strike Migration & Max Pain */}
+        <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12 }}>
+          <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
+            📌 4. Strike Migration &amp; Max Pain Pinning
+          </div>
+          <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6 }}>
+            • <strong>Floor / Ceiling Migration:</strong> When heavy Put writing moves up (e.g. 22,500 → 22,600), big players are raising support (bullish). When Call writing steps down (e.g. 22,900 → 22,800), big players are actively compressing the ceiling (bearish).<br />
+            • <strong>Max Pain:</strong> The mathematically calculated strike price where option buyers experience maximum cumulative financial loss (and option writers keep the maximum premium). It acts as a gravitational anchor near expiry.
+          </div>
+        </div>
       </div>
 
       <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:10,
@@ -883,7 +981,7 @@ export default function App() {
         <NiftyFlowView t={t} isDark={isDark} />
       </div>
       <div style={{ display: activeTab==="guide" ? "block" : "none" }}>
-        <ScoringGuide t={t} />
+        <ScoringGuide t={t} isDark={isDark} />
       </div>
 
       {/* MOBILE BOTTOM NAVIGATION BAR (Thumb-friendly native app navigation) */}
