@@ -896,7 +896,7 @@ export function NiftyFlowView({ t, isDark }) {
   useEffect(() => {
     try {
       const todayKey = getTodayDateKey();
-      const stored = localStorage.getItem(`nifty_timeline_${todayKey}`);
+      const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
       if (stored) {
         const localArr = JSON.parse(stored);
         if (Array.isArray(localArr) && localArr.length > 0) {
@@ -941,7 +941,7 @@ export function NiftyFlowView({ t, isDark }) {
 
         // Check local storage to merge past points collected during the day
         try {
-          const stored = localStorage.getItem(`nifty_timeline_${todayKey}`);
+          const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
           if (stored) {
             const localArr = JSON.parse(stored);
             if (Array.isArray(localArr) && localArr.length > 0) {
@@ -959,7 +959,7 @@ export function NiftyFlowView({ t, isDark }) {
             }
           }
           if (finalTimeline.length > 0) {
-            localStorage.setItem(`nifty_timeline_${todayKey}`, JSON.stringify(finalTimeline));
+            localStorage.setItem(`nifty_timeline_v2_${todayKey}`, JSON.stringify(finalTimeline));
           }
         } catch (e) {
           // ignore localStorage errors (e.g. incognito)

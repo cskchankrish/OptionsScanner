@@ -19,7 +19,7 @@ async function getRedisTimeline(dateKey) {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   try {
     const cleanKey = dateKey.replace(/\//g, "-");
-    const res = await fetch(`${REDIS_URL}/get/nifty_timeline_${encodeURIComponent(cleanKey)}`, {
+    const res = await fetch(`${REDIS_URL}/get/nifty_timeline_v2_${encodeURIComponent(cleanKey)}`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
       signal: AbortSignal.timeout(2000),
     });
@@ -37,7 +37,7 @@ async function setRedisTimeline(dateKey, timelineArray) {
   if (!REDIS_URL || !REDIS_TOKEN || !Array.isArray(timelineArray) || timelineArray.length === 0) return false;
   try {
     const cleanKey = dateKey.replace(/\//g, "-");
-    const res = await fetch(`${REDIS_URL}/set/nifty_timeline_${encodeURIComponent(cleanKey)}?ex=86400`, {
+    const res = await fetch(`${REDIS_URL}/set/nifty_timeline_v2_${encodeURIComponent(cleanKey)}?ex=86400`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -94,31 +94,10 @@ function buildTimeline(totPut, totCall, spot) {
 
   const capMins = Math.min(930, nowMins);
 
-  // Initialize smooth timeline curve if history is empty
-  if (intradayHistory.length === 0) {
-    for (let m = 555; m <= capMins; m += 15) {
-      const h = Math.floor(m / 60);
-      const mn = m % 60;
-      const progress = (m - 555) / Math.max(1, capMins - 555);
-      const factor = Math.pow(progress, 1.15);
-      const pVal = Math.round(totPut * factor);
-      const cVal = Math.round(totCall * factor);
-      const sVal = Number((spot - (1 - progress) * 24.5).toFixed(2));
-      intradayHistory.push({
-        time: `${String(h).padStart(2, "0")}:${String(mn).padStart(2, "0")}`,
-        minutes: m,
-        putWriting: pVal,
-        callWriting: cVal,
-        netDiff: pVal - cVal,
-        spot: sVal,
-      });
-    }
-  }
-
-  // Append or update latest live tick (1-min granularity)
+  // Append or update latest live tick (1-min granularity) strictly with REAL exchange data
   const last = intradayHistory[intradayHistory.length - 1];
   let didUpdate = false;
-  if (!last || last.minutes < capMins || (last.time !== nowStr && Math.abs(totPut - last.putWriting) > 200)) {
+  if (!last || last.minutes < capMins || last.time !== nowStr) {
     intradayHistory.push({
       time: nowStr,
       minutes: capMins,
@@ -126,6 +105,7 @@ function buildTimeline(totPut, totCall, spot) {
       callWriting: totCall,
       netDiff: totPut - totCall,
       spot: spot,
+      isLiveTick: true,
     });
     didUpdate = true;
   } else if (last) {
@@ -134,6 +114,7 @@ function buildTimeline(totPut, totCall, spot) {
     last.netDiff = totPut - totCall;
     last.spot = spot;
     last.time = nowStr;
+    last.isLiveTick = true;
     didUpdate = true;
   }
 
@@ -276,9 +257,9 @@ function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPain
       action: "High-Probability 50–100 pt Reversal Up. Smart money heavily absorbed the 30m dip with Put writing.",
       targetMove: `50–80 pts (Target: ~${targetPrice})`,
       invalidation: `Below ${invPrice} (30m low - 15 pts)`,
-      candle1: `${c1Label}: Spot ${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
-      candle2: `${c2Label}: Spot ${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
-      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
+      candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
+      candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
+      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
       message: `🟢 30-MIN MACRO BEAR TRAP (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot dipped ${totalSpotDelta.toFixed(1)} pts, but Put writers absorbed ${formatLots(totalNetDelta)}. High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.`,
     };
   }
