@@ -1303,34 +1303,85 @@ export function NiftyFlowView({ t, isDark }) {
             </div>
           </div>
 
-          {/* Divergence / Trap Alert Strip */}
-          <div style={{
-            fontSize: isMobile ? 10.5 : 11.5,
-            padding: "8px 12px",
-            borderRadius: 6,
-            background: oiData.smartMoney.trapAlert.includes("WARNING")
-              ? (isDark ? "rgba(239, 68, 68, 0.16)" : "#fee2e2")
-              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
-              ? (isDark ? "rgba(34, 197, 94, 0.16)" : "#dcfce7")
-              : (isDark ? "#0a1322" : "#f1f5f9"),
-            border: oiData.smartMoney.trapAlert.includes("WARNING")
-              ? "1px solid rgba(239, 68, 68, 0.4)"
-              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
-              ? "1px solid rgba(34, 197, 94, 0.4)"
-              : `1px solid ${t.border}`,
-            color: oiData.smartMoney.trapAlert.includes("WARNING")
-              ? "#ef4444"
-              : oiData.smartMoney.trapAlert.includes("BEAR TRAP")
-              ? "#16a34a"
-              : t.textMuted,
-            fontWeight: 700,
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            lineHeight: 1.5
-          }}>
-            {oiData.smartMoney.trapAlert}
-          </div>
+          {/* 30-MIN MACRO (2x 15m CANDLE) ACTIONABLE REVERSAL CARD */}
+          {oiData.smartMoney.macroTurn?.isTriggered ? (
+            <div style={{
+              background: oiData.smartMoney.macroTurn.direction === "BEARISH_TURN"
+                ? (isDark ? "#2d0a0a" : "#fef2f2")
+                : (isDark ? "#052e16" : "#f0fdf4"),
+              border: `1.5px solid ${oiData.smartMoney.macroTurn.direction === "BEARISH_TURN" ? "#ef4444" : "#16a34a"}`,
+              borderRadius: 8,
+              padding: isMobile ? "12px 12px" : "14px 16px",
+              marginTop: 6
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                <span style={{
+                  fontSize: isMobile ? 12.5 : 14,
+                  fontWeight: 900,
+                  color: oiData.smartMoney.macroTurn.direction === "BEARISH_TURN" ? "#ef4444" : "#16a34a",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6
+                }}>
+                  {oiData.smartMoney.macroTurn.title}
+                </span>
+                <span style={{
+                  fontSize: isMobile ? 11 : 12,
+                  fontWeight: 800,
+                  background: oiData.smartMoney.macroTurn.direction === "BEARISH_TURN" ? "#ef444422" : "#16a34a22",
+                  color: oiData.smartMoney.macroTurn.direction === "BEARISH_TURN" ? "#ef4444" : "#16a34a",
+                  padding: "3px 9px",
+                  borderRadius: 6,
+                  border: `1px solid ${oiData.smartMoney.macroTurn.direction === "BEARISH_TURN" ? "#ef444455" : "#16a34a55"}`
+                }}>
+                  Target Move: {oiData.smartMoney.macroTurn.targetMove}
+                </span>
+              </div>
+
+              <div style={{ fontSize: isMobile ? 11.5 : 13, color: t.text, fontWeight: 700, marginBottom: 8, lineHeight: 1.55 }}>
+                🎯 <strong>Actionable Setup:</strong> {oiData.smartMoney.macroTurn.action}
+              </div>
+
+              {/* 2x 15m Candle Evidence Grid */}
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
+                gap: 6,
+                background: isDark ? "rgba(0,0,0,0.35)" : "rgba(255,255,255,0.7)",
+                padding: "8px 12px",
+                borderRadius: 6,
+                fontSize: isMobile ? 10.5 : 11.5,
+                fontFamily: "monospace",
+                color: t.textSub,
+                marginBottom: 8
+              }}>
+                <div>• {oiData.smartMoney.macroTurn.candle1}</div>
+                <div>• {oiData.smartMoney.macroTurn.candle2}</div>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, fontSize: isMobile ? 10.5 : 11.5, color: t.textMuted }}>
+                <span>{oiData.smartMoney.macroTurn.summary}</span>
+                <span style={{ color: "#ef4444", fontWeight: 800 }}>⛔ Invalidation: {oiData.smartMoney.macroTurn.invalidation}</span>
+              </div>
+            </div>
+          ) : (
+            /* Normal 30-Min In-Sync Strip */
+            <div style={{
+              fontSize: isMobile ? 10.5 : 11.5,
+              padding: "8px 12px",
+              borderRadius: 6,
+              background: isDark ? "#0a1322" : "#f1f5f9",
+              border: `1px solid ${t.border}`,
+              color: t.textMuted,
+              fontWeight: 700,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              lineHeight: 1.5
+            }}>
+              {oiData.smartMoney.trapAlert || "● 30-Min Flow In-Sync: Price action aligned with institutional writing flow."}
+            </div>
+          )}
         </div>
       )}
 

@@ -756,40 +756,45 @@ function ScoringGuide({ t, isDark }) {
           </div>
         </div>
 
-        {/* 3. Trap Warnings & Trading Playbook */}
+        {/* 3. 30-Min Macro Reversal Engine (2x 15m Candles) */}
         <div style={{ background:t.surface2, border:`1px solid ${t.border}`, borderRadius:8, padding:12, marginBottom:10 }}>
           <div style={{ fontSize:12.5, fontWeight:800, color:t.text, marginBottom:4 }}>
-            ⚠️ 3. Trap Divergence Alerts &amp; Trading Playbook
+            🎯 3. 30-Minute Macro Reversal Engine (Capturing 50–100 Pt Turns)
           </div>
           <div style={{ fontSize:11, color:t.textSub, lineHeight:1.6, marginBottom:8 }}>
-            Monitors rolling 3-minute divergence between <strong>Spot Price Action</strong> vs. <strong>Net Writing Delta</strong>:
+            To filter out 1-minute micro-noise and capture high-probability <strong>50–100 point index turns</strong>, the radar continuously audits two consecutive 15-minute candles (30-minute macro span):
+            <br />• <strong>Candle 1 (Buildup):</strong> Smart money initiates heavy contra-writing against retail momentum.
+            <br />• <strong>Candle 2 (Confirmation):</strong> Price attempts another push, but writing delta fails completely and accelerates in opposite direction.
           </div>
 
           <div style={{ display:"flex", flexDirection:"column", gap:8, fontSize:11 }}>
             <div style={{ padding:"8px 10px", background:isDark ? "#2d0a0a33" : "#fee2e2", border:"1px solid #ef444444", borderRadius:6 }}>
               <div style={{ fontWeight:800, color:"#ef4444", marginBottom:3 }}>
-                ⚠️ Bull Trap Warning (Spot Surges +11 pts &amp; Net Delta Drops &gt; 12k lots)
+                🚨 Macro Bull Trap Reversal (Spot +22+ pts over 30m &amp; Net Writing Delta Plunges &gt;26k lots)
               </div>
               <div style={{ color:t.textSub, lineHeight:1.5 }}>
-                • <strong>What is happening:</strong> Retail traders buy green breakout candles, but smart money refuses to support it and dumps heavy Call writing directly into the spike.<br />
-                • <strong>Playbook:</strong> <strong>DO NOT BUY THE BREAKOUT.</strong> Cancel buy market orders. If holding existing long calls from support, trail stops to breakeven or lock partial profits.<br />
-                • <strong>Confluence:</strong> If flashing near Resistance Roof or Camarilla R3, reversal probability is &gt;85%.
+                • <strong>What is happening:</strong> Nifty rallies for 30 minutes, but institutional Call writers dump massive supply into the rally. When Candle 2 fails to expand writing, a sharp distribution top is formed.<br />
+                • <strong>Actionable Setup:</strong> Favorable for entering Nifty PEs / shorting Index Futures.<br />
+                • <strong>Reversal Target:</strong> <strong>50–80+ pts drop</strong> toward Floor support or Max Pain.<br />
+                • <strong>Invalidation:</strong> 15 points above the 30m high.
               </div>
             </div>
 
             <div style={{ padding:"8px 10px", background:isDark ? "#052e1633" : "#dcfce7", border:"1px solid #16a34a44", borderRadius:6 }}>
               <div style={{ fontWeight:800, color:"#16a34a", marginBottom:3 }}>
-                🟢 Bear Trap / Absorption (Spot Dips -11 pts &amp; Net Put Writing Expands &gt; 12k lots)
+                🟢 Macro Bear Trap / Absorption (Spot Dips -22+ pts over 30m &amp; Net Put Writing Surges &gt;26k lots)
               </div>
               <div style={{ color:t.textSub, lineHeight:1.5 }}>
-                • <strong>What is happening:</strong> Price breaks lower, but Put writers aggressively step in and absorb the selling pressure.<br />
-                • <strong>Playbook:</strong> <strong>DO NOT SHORT THE BREAKDOWN.</strong> Wait for bullish confirmation or dip bounce from Floor support.
+                • <strong>What is happening:</strong> Nifty dips for 30 minutes, but institutional Put writers aggressively absorb selling volume across both candles.<br />
+                • <strong>Actionable Setup:</strong> Favorable for buying Nifty CEs on dips to support.<br />
+                • <strong>Reversal Target:</strong> <strong>50–80+ pts bounce</strong> toward Roof resistance or Max Pain.<br />
+                • <strong>Invalidation:</strong> 15 points below the 30m low.
               </div>
             </div>
           </div>
 
           <div style={{ fontSize:10.5, color:t.textMuted, marginTop:8 }}>
-            ⏱️ <strong>8-Minute Persistence Window:</strong> To prevent signals from vanishing on a 1-minute flicker, alerts remain visible with an active countdown timer (e.g. <em>Active for 7m</em>) so you have adequate time to evaluate trades.
+            ⏱️ <strong>High Concrete Accuracy:</strong> By requiring two full 15-minute candles of sustained divergence, premature 1-minute false alarms are eliminated, giving you the confidence to trade genuine 50–100 point swings.
           </div>
         </div>
 

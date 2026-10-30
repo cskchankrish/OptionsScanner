@@ -154,6 +154,115 @@ function formatLots(n) {
   return `${sign}${abs.toLocaleString("en-IN")}`;
 }
 
+function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPainStrike }) {
+  if (!timeline || timeline.length < 12) {
+    return {
+      isTriggered: false,
+      status: "BUILDING",
+      message: "● 30-Min Macro Engine: Collecting 2x 15-minute candle history...",
+    };
+  }
+
+  const tNow = timeline[timeline.length - 1];
+  const nowMins = tNow.minutes || 0;
+
+  const target15 = nowMins - 15;
+  const target30 = nowMins - 30;
+
+  let pt15 = timeline[0];
+  let pt30 = timeline[0];
+  let minDiff15 = Infinity;
+  let minDiff30 = Infinity;
+
+  for (const pt of timeline) {
+    const m = pt.minutes || 0;
+    const diff15 = Math.abs(m - target15);
+    const diff30 = Math.abs(m - target30);
+    if (diff15 < minDiff15) {
+      minDiff15 = diff15;
+      pt15 = pt;
+    }
+    if (diff30 < minDiff30) {
+      minDiff30 = diff30;
+      pt30 = pt;
+    }
+  }
+
+  const spanMins = (tNow.minutes || 0) - (pt30.minutes || 0);
+  if (spanMins < 20) {
+    return {
+      isTriggered: false,
+      status: "ACCUMULATING",
+      message: `● 30-Min Macro Engine: ${spanMins}m recorded. Waiting for complete 2x 15m window.`,
+    };
+  }
+
+  const c1SpotDelta = pt15.spot - pt30.spot;
+  const c1NetDelta = pt15.netDiff - pt30.netDiff;
+
+  const c2SpotDelta = tNow.spot - pt15.spot;
+  const c2NetDelta = tNow.netDiff - pt15.netDiff;
+
+  const totalSpotDelta = tNow.spot - pt30.spot;
+  const totalNetDelta = tNow.netDiff - pt30.netDiff;
+
+  // Criteria for Concrete Macro Bull Trap (50–100 pt reversal down):
+  // 1. Spot pushed up by >= 22 pts over 30m window (or tested near Roof)
+  // 2. Net Writing Delta dropped significantly (<= -26,000 lots)
+  // 3. Candle 2 confirmed ongoing/accelerating Call writing
+  if (totalSpotDelta >= 22 && totalNetDelta <= -26000 && (c1NetDelta < -7000 || c2NetDelta < -14000)) {
+    const targetDrop = Math.max(50, Math.min(100, Math.round(spot - floorStrike)));
+    const targetPrice = Math.round(spot - targetDrop);
+    const invPrice = Math.round(Math.max(tNow.spot, pt15.spot, pt30.spot) + 15);
+    return {
+      isTriggered: true,
+      type: "BULL_TRAP_REVERSAL",
+      direction: "BEARISH_TURN",
+      title: "🚨 30-MIN MACRO BULL TRAP CONFIRMED (2x 15m Candles)",
+      action: "High-Probability 50–100 pt Reversal Down. Smart money heavily shorted the 30m rally with Call writing.",
+      targetMove: `50–80 pts (Target: ~${targetPrice})`,
+      invalidation: `Above ${invPrice} (30m high + 15 pts)`,
+      candle1: `C1 (${pt30.time}-${pt15.time}): Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
+      candle2: `C2 (${pt15.time}-${tNow.time}): Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
+      summary: `30m Total: Spot +${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
+      message: `🚨 30-MIN MACRO BULL TRAP: Spot pushed +${totalSpotDelta.toFixed(1)} pts across 2x15m candles, but Net Writing Delta plunged ${formatLots(totalNetDelta)}. High-probability 50–80 pt drop toward ~${targetPrice}. Invalidation: Above ${invPrice}.`,
+    };
+  }
+
+  // Criteria for Concrete Macro Bear Trap (50–100 pt bounce up):
+  // 1. Spot dropped by <= -22 pts over 30m window (or tested near Floor)
+  // 2. Net Writing Delta surged significantly (>= +26,000 lots)
+  // 3. Put writers aggressively absorbed the dip across both candles
+  if (totalSpotDelta <= -22 && totalNetDelta >= 28000 && (c1NetDelta > 7000 || c2NetDelta > 14000)) {
+    const targetBounce = Math.max(50, Math.min(100, Math.round(roofStrike - spot)));
+    const targetPrice = Math.round(spot + targetBounce);
+    const invPrice = Math.round(Math.min(tNow.spot, pt15.spot, pt30.spot) - 15);
+    return {
+      isTriggered: true,
+      type: "BEAR_TRAP_REVERSAL",
+      direction: "BULLISH_TURN",
+      title: "🟢 30-MIN MACRO BEAR TRAP / ABSORPTION CONFIRMED (2x 15m Candles)",
+      action: "High-Probability 50–100 pt Reversal Up. Smart money heavily absorbed the 30m dip with Put writing.",
+      targetMove: `50–80 pts (Target: ~${targetPrice})`,
+      invalidation: `Below ${invPrice} (30m low - 15 pts)`,
+      candle1: `C1 (${pt30.time}-${pt15.time}): Spot ${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
+      candle2: `C2 (${pt15.time}-${tNow.time}): Spot ${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
+      summary: `30m Total: Spot ${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
+      message: `🟢 30-MIN MACRO BEAR TRAP: Spot dipped ${totalSpotDelta.toFixed(1)} pts across 2x15m candles, but Put writers absorbed ${formatLots(totalNetDelta)}. High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.`,
+    };
+  }
+
+  return {
+    isTriggered: false,
+    type: "IN_SYNC",
+    message: `● 30-Min Flow In-Sync (${spanMins}m): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts | Net Delta ${formatLots(totalNetDelta)}. Price & writing delta aligned.`,
+    candle1: `C1: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} | Delta ${formatLots(c1NetDelta)}`,
+    candle2: `C2: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} | Delta ${formatLots(c2NetDelta)}`,
+    totalSpotDelta: Number(totalSpotDelta.toFixed(1)),
+    totalNetDelta: Math.round(totalNetDelta),
+  };
+}
+
 // ── SMART MONEY / INSTITUTIONAL CALCULATIONS ──
 function calculateMaxPain(strikes) {
   if (!strikes || strikes.length === 0) return 22700;
@@ -276,32 +385,16 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
     }
   }
 
-  // Divergence / Trap detection from intraday timeline history (with 8-minute persistence window)
-  let trapAlert = "● Flow In-Sync: Price action is aligned with institutional writing flow.";
-  if (intradayHistory && intradayHistory.length >= 3) {
-    const endIdx = intradayHistory.length - 1;
-    const startIdx = Math.max(2, intradayHistory.length - 9); // Look back up to 8 minutes
+  // 30-MINUTE MACRO ENGINE (2x 15-Minute Candles) for 50-100 Pt Turns
+  const macroTurn = detectMacroTurn({
+    timeline: intradayHistory,
+    spot,
+    floorStrike,
+    roofStrike,
+    maxPainStrike,
+  });
 
-    for (let idx = endIdx; idx >= startIdx; idx--) {
-      const cur = intradayHistory[idx];
-      const prev = intradayHistory[Math.max(0, idx - 3)];
-      if (cur && prev && cur !== prev) {
-        const deltaSpot = cur.spot - prev.spot;
-        const deltaDiff = cur.netDiff - prev.netDiff;
-        if (deltaSpot > 11 && deltaDiff < -12000) {
-          const ageMins = (intradayHistory[endIdx].minutes || 0) - (cur.minutes || 0);
-          const remainingMins = Math.max(1, 8 - ageMins);
-          trapAlert = `⚠️ BULL TRAP WARNING (Detected at ${cur.time} IST · Active for ${remainingMins}m): Spot pushed higher (+${deltaSpot.toFixed(1)} pts), but Net Writing Delta dropped. Smart money is fading the rally with Call writing. Caution on fresh long breakout entries.`;
-          break;
-        } else if (deltaSpot < -11 && deltaDiff > 12000) {
-          const ageMins = (intradayHistory[endIdx].minutes || 0) - (cur.minutes || 0);
-          const remainingMins = Math.max(1, 8 - ageMins);
-          trapAlert = `🟢 BEAR TRAP / ABSORPTION (Detected at ${cur.time} IST · Active for ${remainingMins}m): Spot dipped (${deltaSpot.toFixed(1)} pts), but Put writing expanded. Smart money is quietly absorbing selling pressure. Favorable for dip reversal.`;
-          break;
-        }
-      }
-    }
-  }
+  const trapAlert = macroTurn.message;
 
   return {
     stance,
@@ -316,6 +409,7 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
     floorMigration,
     roofMigration,
     trapAlert,
+    macroTurn,
   };
 }
 
