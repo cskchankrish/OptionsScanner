@@ -78,88 +78,151 @@ async function fetchGoogleDocWithRetry(url, maxRetries = 2) {
 export function parseArgonDoc(text) {
   if (!text || typeof text !== "string") return [];
 
-  // 1. Isolate Tab 1 (the live current week plan) before any Archive/Tab 2 sections
-  let targetText = text;
-  const tab2Idx = text.search(/Tab\s*2\s*:/i);
-  if (tab2Idx !== -1) {
-    targetText = text.slice(0, tab2Idx);
-  } else {
-    const archiveIdx = text.search(/(?:4|5)\.\s*Completed\s*Week\s*Correlation/i);
-    if (archiveIdx !== -1) {
-      targetText = text.slice(0, archiveIdx);
+  try {
+    // 1. Isolate Tab 1 (the live current week plan) before any Archive/Tab 2 sections
+    let targetText = text;
+    const tab2Idx = text.search(/Tab\s*2\s*:/i);
+    if (tab2Idx !== -1) {
+      targetText = text.slice(0, tab2Idx);
+    } else {
+      const archiveIdx = text.search(/(?:4|5)\.\s*Completed\s*Week\s*Correlation/i);
+      if (archiveIdx !== -1) {
+        targetText = text.slice(0, archiveIdx);
+      }
     }
-  }
 
-  // 2. Extract Document-level Date Range if available (e.g. "Nov 2 – Nov 6, 2026")
-  const docRangeRegex = new RegExp(`\\b(${MONTH_REGEX_STR})[a-z]*\\.?\\s+(\\d{1,2})\\s*[–—-–]\\s*(?:(${MONTH_REGEX_STR})[a-z]*\\.?\\s+)?(\\d{1,2})\\b`, "i");
-  const docRangeMatch = targetText.match(docRangeRegex);
+    // 2. Extract Document-level Date Range if available (e.g. "Nov 2 – Nov 6, 2026")
+    const docRangeRegex = new RegExp(`\\b(${MONTH_REGEX_STR})[a-z]*\\.?\\s+(\\d{1,2})\\s*[-–—]\\s*(?:(${MONTH_REGEX_STR})[a-z]*\\.?\\s+)?(\\d{1,2})\\b`, "i");
+    const docRangeMatch = targetText.match(docRangeRegex);
 
-  let defaultMonth = "";
-  let startDayNum = 0;
-  if (docRangeMatch) {
-    const mRaw = docRangeMatch[1].slice(0, 3);
-    defaultMonth = mRaw.charAt(0).toUpperCase() + mRaw.slice(1).toLowerCase();
-    startDayNum = parseInt(docRangeMatch[2], 10);
-  }
+    let defaultMonth = "";
+    let startDayNum = 0;
+    if (docRangeMatch) {
+      const mRaw = docRangeMatch[1].slice(0, 3);
+      defaultMonth = mRaw.charAt(0).toUpperCase() + mRaw.slice(1).toLowerCase();
+      startDayNum = parseInt(docRangeMatch[2], 10);
+    }
 
-  const dayRegex = /^(Monday|Tuesday|Wednesday|Thursday|Friday)/i;
-  const monthRegex = new RegExp(`\\b(${MONTH_REGEX_STR})[a-z]*\\.?\\s+(\\d{1,2})\\b`, "i");
-  const dayNumMonthRegex = new RegExp(`\\b(\\d{1,2})\\s+(${MONTH_REGEX_STR})[a-z]*\\b`, "i");
-  const dayOrder = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+    const dayRegex = /^(Monday|Tuesday|Wednesday|Thursday|Friday)/i;
+    const monthRegex = new RegExp(`\\b(${MONTH_REGEX_STR})[a-z]*\\.?\\s+(\\d{1,2})\\b`, "i");
+    const dayNumMonthRegex = new RegExp(`\\b(\\d{1,2})\\s+(${MONTH_REGEX_STR})[a-z]*\\b`, "i");
+    const dayOrder = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 
-  // STRATEGY 1: Tab-separated cells (Google Docs default table text export)
-  const cells = targetText.split("\t").map(s => s.trim()).filter(Boolean);
-  const rows = [];
-  let i = 0;
-  let weekdayCounter = 0;
+    // STRATEGY 1: Tab-separated cells (Google Docs default table text export)
+    const cells = targetText.split("\t").map(s => s.trim()).filter(Boolean);
+    const rows = [];
+    let i = 0;
+    let weekdayCounter = 0;
 
-  while (i < cells.length) {
-    const rawCell = cells[i];
-    const cleanCell = rawCell.replace(/\r?\n/g, " ").trim();
-    const dayMatch = cleanCell.match(dayRegex);
+    while (i < cells.length) {
+      const rawCell = cells[i];
+      const cleanCell = rawCell.replace(/\r?\n/g, " ").trim();
+      const dayMatch = cleanCell.match(dayRegex);
 
-    if (dayMatch && i + 4 < cells.length) {
-      const nextCellClean = cells[i + 1].replace(/\r?\n/g, " ").trim();
-      if (!dayRegex.test(nextCellClean)) {
-        const fullSession = cleanCell;
-        const matchedDay = dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1).toLowerCase();
+      if (dayMatch && i + 4 < cells.length) {
+        const nextCellClean = cells[i + 1].replace(/\r?\n/g, " ").trim();
+        if (!dayRegex.test(nextCellClean)) {
+          const fullSession = cleanCell;
+          const matchedDay = dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1).toLowerCase();
 
-        // Extract Date and Month
+          // Extract Date and Month
+          let dateStr = "";
+          const m1 = cleanCell.match(monthRegex);
+          if (m1) {
+            const mName = m1[1].slice(0, 3);
+            dateStr = `${m1[2]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+          } else {
+            const m2 = cleanCell.match(dayNumMonthRegex);
+            if (m2) {
+              const mName = m2[2].slice(0, 3);
+              dateStr = `${m2[1]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+            } else if (defaultMonth && startDayNum > 0) {
+              try {
+                const dIdx = dayOrder.indexOf(matchedDay);
+                const offset = dIdx !== -1 ? dIdx : weekdayCounter;
+                const curYear = new Date().getFullYear();
+                const baseDate = new Date(`${defaultMonth} ${startDayNum}, ${curYear}`);
+                baseDate.setDate(baseDate.getDate() + offset);
+                dateStr = `${baseDate.getDate()} ${MONTHS[baseDate.getMonth()]}`;
+              } catch (e) {
+                dateStr = "";
+              }
+            }
+          }
+
+          const stance = cells[i + 1].replace(/\r?\n/g, " ").trim();
+          const forecast = cells[i + 2].replace(/\r?\n/g, " ").trim();
+          const action = cells[i + 3].replace(/\r?\n/g, " ").trim();
+          let sectors = cells[i + 4].replace(/\r?\n/g, " ").trim();
+
+          // Clean any trailing section notes
+          sectors = sectors.split(/(?:\d+\.\s*(?:Weekly|Completed)|Tab\s*2:)/i)[0].trim();
+
+          const label = dateStr ? `${matchedDay} · ${dateStr}` : matchedDay;
+
+          rows.push({
+            session: fullSession,
+            day: matchedDay,
+            date: dateStr,
+            label: label,
+            stance: stance,
+            forecast: forecast,
+            action: action,
+            sectors: sectors,
+          });
+
+          weekdayCounter++;
+          i += 5;
+          continue;
+        }
+      }
+      i += 1;
+    }
+
+    if (rows.length >= 4) {
+      return rows;
+    }
+
+    // STRATEGY 2: Line/Block-based Regex Fallback (immune to missing or stripped tabs)
+    const lineRows = [];
+    const lineDayRegex = /^\s*(Monday|Tuesday|Wednesday|Thursday|Friday)\b[^\n]*/gim;
+    const matches = [];
+    let m;
+    while ((m = lineDayRegex.exec(targetText)) !== null) {
+      matches.push({ day: m[1], index: m.index });
+    }
+
+    for (let idx = 0; idx < matches.length; idx++) {
+      const cur = matches[idx];
+      const nextIdx = idx + 1 < matches.length ? matches[idx + 1].index : targetText.length;
+      const block = targetText.slice(cur.index, nextIdx).trim();
+      const blockLines = block.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+      if (blockLines.length >= 2) {
+        const fullSession = blockLines[0];
+        const matchedDay = cur.day.charAt(0).toUpperCase() + cur.day.slice(1).toLowerCase();
+
         let dateStr = "";
-        const m1 = cleanCell.match(monthRegex);
+        const m1 = fullSession.match(monthRegex);
         if (m1) {
           const mName = m1[1].slice(0, 3);
           dateStr = `${m1[2]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
         } else {
-          const m2 = cleanCell.match(dayNumMonthRegex);
+          const m2 = fullSession.match(dayNumMonthRegex);
           if (m2) {
             const mName = m2[2].slice(0, 3);
             dateStr = `${m2[1]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
-          } else if (defaultMonth && startDayNum > 0) {
-            try {
-              const dIdx = dayOrder.indexOf(matchedDay);
-              const offset = dIdx !== -1 ? dIdx : weekdayCounter;
-              const curYear = new Date().getFullYear();
-              const baseDate = new Date(`${defaultMonth} ${startDayNum}, ${curYear}`);
-              baseDate.setDate(baseDate.getDate() + offset);
-              dateStr = `${baseDate.getDate()} ${MONTHS[baseDate.getMonth()]}`;
-            } catch (e) {
-              dateStr = "";
-            }
           }
         }
 
-        const stance = cells[i + 1].replace(/\r?\n/g, " ").trim();
-        const forecast = cells[i + 2].replace(/\r?\n/g, " ").trim();
-        const action = cells[i + 3].replace(/\r?\n/g, " ").trim();
-        let sectors = cells[i + 4].replace(/\r?\n/g, " ").trim();
-
-        // Clean any trailing section notes
+        const stance = blockLines[1] || "";
+        const forecast = blockLines[2] || "";
+        const action = blockLines[3] || "";
+        let sectors = blockLines.slice(4).join(" ") || "";
         sectors = sectors.split(/(?:\d+\.\s*(?:Weekly|Completed)|Tab\s*2:)/i)[0].trim();
 
         const label = dateStr ? `${matchedDay} · ${dateStr}` : matchedDay;
-
-        rows.push({
+        lineRows.push({
           session: fullSession,
           day: matchedDay,
           date: dateStr,
@@ -169,72 +232,14 @@ export function parseArgonDoc(text) {
           action: action,
           sectors: sectors,
         });
-
-        weekdayCounter++;
-        i += 5;
-        continue;
       }
     }
-    i += 1;
+
+    return lineRows.length > 0 ? lineRows : rows;
+  } catch (err) {
+    console.error("parseArgonDoc internal error:", err);
+    return [];
   }
-
-  if (rows.length >= 4) {
-    return rows;
-  }
-
-  // STRATEGY 2: Line/Block-based Regex Fallback (immune to missing or stripped tabs)
-  const lineRows = [];
-  const lineDayRegex = /^\s*(Monday|Tuesday|Wednesday|Thursday|Friday)\b[^\n]*/gim;
-  const matches = [];
-  let m;
-  while ((m = lineDayRegex.exec(targetText)) !== null) {
-    matches.push({ day: m[1], index: m.index, matchText: m[0] });
-  }
-
-  for (let idx = 0; idx < matches.length; idx++) {
-    const cur = matches[idx];
-    const nextIdx = idx + 1 < matches.length ? matches[idx + 1].index : targetText.length;
-    const block = targetText.slice(cur.index, nextIdx).trim();
-    const blockLines = block.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-
-    if (blockLines.length >= 2) {
-      const fullSession = blockLines[0];
-      const matchedDay = cur.day.charAt(0).toUpperCase() + cur.day.slice(1).toLowerCase();
-
-      let dateStr = "";
-      const m1 = fullSession.match(monthRegex);
-      if (m1) {
-        const mName = m1[1].slice(0, 3);
-        dateStr = `${m1[2]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
-      } else {
-        const m2 = fullSession.match(dayNumMonthRegex);
-        if (m2) {
-          const mName = m2[2].slice(0, 3);
-          dateStr = `${m2[1]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
-        }
-      }
-
-      const stance = blockLines[1] || "";
-      const forecast = blockLines[2] || "";
-      const action = blockLines[3] || "";
-      let sectors = blockLines.slice(4).join(" ") || "";
-      sectors = sectors.split(/(?:\d+\.\s*(?:Weekly|Completed)|Tab\s*2:)/i)[0].trim();
-
-      const label = dateStr ? `${matchedDay} · ${dateStr}` : matchedDay;
-      lineRows.push({
-        session: fullSession,
-        day: matchedDay,
-        date: dateStr,
-        label: label,
-        stance: stance,
-        forecast: forecast,
-        action: action,
-        sectors: sectors,
-      });
-    }
-  }
-
-  return lineRows.length > 0 ? lineRows : rows;
 }
 
 function generateCurrentWeekFallback() {
@@ -306,7 +311,41 @@ function findBestSession(sessions, dayName, dayNum) {
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  const { dayName: currentDayName, dayNum } = getIstDayInfo();
+
+  // Handle client-to-server sync via POST (e.g. client browser fetched Google Doc directly)
+  if (req.method === "POST") {
+    try {
+      const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const incomingSessions = body?.sessions;
+      if (Array.isArray(incomingSessions) && incomingSessions.length >= 4) {
+        const todaySession = findBestSession(incomingSessions, currentDayName, dayNum);
+        const payload = {
+          success: true,
+          isLive: true,
+          source: "client_sync_to_redis",
+          updatedAt: new Date().toISOString(),
+          docUrl: "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing",
+          sessions: incomingSessions,
+          todaySession,
+          currentDay: currentDayName,
+        };
+        cache = { data: payload, timestamp: Date.now() };
+        await setRedisArgonData(payload);
+        return res.status(200).json({ success: true, count: incomingSessions.length });
+      }
+      return res.status(400).json({ error: "Invalid sessions payload" });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
 
   const isForce = req.query?.force === "true" || req.query?.refresh === "1";
   res.setHeader("Cache-Control", isForce ? "no-store, max-age=0" : "s-maxage=30, stale-while-revalidate=60");
@@ -315,8 +354,6 @@ export default async function handler(req, res) {
   if (!isForce && cache.data && now - cache.timestamp < 30000) {
     return res.status(200).json(cache.data);
   }
-
-  const { dayName: currentDayName, dayNum } = getIstDayInfo();
 
   try {
     const rawText = await fetchGoogleDocWithRetry(DOC_URL, 2);

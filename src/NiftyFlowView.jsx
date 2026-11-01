@@ -1126,7 +1126,8 @@ export function NiftyFlowView({ t, isDark }) {
       const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        if (data?.sessions && data.sessions.length > 0) {
+        const isPlaceholder = !data.isLive && (data.source?.includes("dynamic") || data.source?.includes("fallback") || data.sessions?.[0]?.stance?.includes("AWAITING"));
+        if (!isPlaceholder && data?.sessions && data.sessions.length > 0) {
           globalArgonCache = data;
           setArgonData(data);
           try {
@@ -1176,12 +1177,22 @@ export function NiftyFlowView({ t, isDark }) {
           try {
             localStorage.setItem("argon_cached_sessions_v2", JSON.stringify(clientData));
           } catch (e) {}
+
+          // Silent sync back to server Redis so all other devices and future requests have it
+          fetch("/api/argon", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessions }),
+          }).catch(() => {});
+
           const todayIdx = findBestSessionIndex(sessions, dayName, todaySession);
           setSelectedDayIdx(todayIdx);
           if (force) {
             setDocSyncMsg("Direct Doc Synced!");
             setTimeout(() => setDocSyncMsg(""), 3500);
           }
+          if (force) setSyncingDoc(false);
+          return;
         }
       }
     } catch (e) {
