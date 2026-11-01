@@ -98,6 +98,134 @@ function getSessionDayAndDate(sess) {
   return { day, date, label: date ? `${day} · ${date}` : day };
 }
 
+const MONTHS_LIST = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_REGEX_STR = MONTHS_LIST.join("|");
+
+function parseArgonDocClient(text) {
+  if (!text || typeof text !== "string") return [];
+  let targetText = text;
+  const tab2Idx = text.search(/Tab\s*2\s*:/i);
+  if (tab2Idx !== -1) {
+    targetText = text.slice(0, tab2Idx);
+  } else {
+    const archiveIdx = text.search(/(?:4|5)\.\s*Completed\s*Week\s*Correlation/i);
+    if (archiveIdx !== -1) targetText = text.slice(0, archiveIdx);
+  }
+
+  const dayRegex = /^(Monday|Tuesday|Wednesday|Thursday|Friday)/i;
+  const monthRegex = new RegExp(`\\b(${MONTH_REGEX_STR})[a-z]*\\.?\\s+(\\d{1,2})\\b`, "i");
+  const dayNumMonthRegex = new RegExp(`\\b(\\d{1,2})\\s+(${MONTH_REGEX_STR})[a-z]*\\b`, "i");
+
+  // Strategy 1: Tab-separated cells
+  const cells = targetText.split("\t").map(s => s.trim()).filter(Boolean);
+  const rows = [];
+  let i = 0;
+
+  while (i < cells.length) {
+    const cleanCell = cells[i].replace(/\r?\n/g, " ").trim();
+    const dayMatch = cleanCell.match(dayRegex);
+
+    if (dayMatch && i + 4 < cells.length) {
+      const nextCellClean = cells[i + 1].replace(/\r?\n/g, " ").trim();
+      if (!dayRegex.test(nextCellClean)) {
+        const fullSession = cleanCell;
+        const matchedDay = dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1).toLowerCase();
+
+        let dateStr = "";
+        const m1 = cleanCell.match(monthRegex);
+        if (m1) {
+          const mName = m1[1].slice(0, 3);
+          dateStr = `${m1[2]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+        } else {
+          const m2 = cleanCell.match(dayNumMonthRegex);
+          if (m2) {
+            const mName = m2[2].slice(0, 3);
+            dateStr = `${m2[1]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+          }
+        }
+
+        const stance = cells[i + 1].replace(/\r?\n/g, " ").trim();
+        const forecast = cells[i + 2].replace(/\r?\n/g, " ").trim();
+        const action = cells[i + 3].replace(/\r?\n/g, " ").trim();
+        let sectors = cells[i + 4].replace(/\r?\n/g, " ").trim();
+        sectors = sectors.split(/(?:\d+\.\s*(?:Weekly|Completed)|Tab\s*2:)/i)[0].trim();
+
+        const label = dateStr ? `${matchedDay} · ${dateStr}` : matchedDay;
+        rows.push({
+          session: fullSession,
+          day: matchedDay,
+          date: dateStr,
+          label: label,
+          stance: stance,
+          forecast: forecast,
+          action: action,
+          sectors: sectors,
+        });
+
+        i += 5;
+        continue;
+      }
+    }
+    i += 1;
+  }
+
+  if (rows.length >= 4) return rows;
+
+  // Strategy 2: Line regex fallback
+  const lineRows = [];
+  const lineDayRegex = /^\s*(Monday|Tuesday|Wednesday|Thursday|Friday)\b[^\n]*/gim;
+  const matches = [];
+  let m;
+  while ((m = lineDayRegex.exec(targetText)) !== null) {
+    matches.push({ day: m[1], index: m.index });
+  }
+
+  for (let idx = 0; idx < matches.length; idx++) {
+    const cur = matches[idx];
+    const nextIdx = idx + 1 < matches.length ? matches[idx + 1].index : targetText.length;
+    const block = targetText.slice(cur.index, nextIdx).trim();
+    const blockLines = block.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    if (blockLines.length >= 2) {
+      const fullSession = blockLines[0];
+      const matchedDay = cur.day.charAt(0).toUpperCase() + cur.day.slice(1).toLowerCase();
+
+      let dateStr = "";
+      const m1 = fullSession.match(monthRegex);
+      if (m1) {
+        const mName = m1[1].slice(0, 3);
+        dateStr = `${m1[2]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+      } else {
+        const m2 = fullSession.match(dayNumMonthRegex);
+        if (m2) {
+          const mName = m2[2].slice(0, 3);
+          dateStr = `${m2[1]} ${mName.charAt(0).toUpperCase() + mName.slice(1).toLowerCase()}`;
+        }
+      }
+
+      const stance = blockLines[1] || "";
+      const forecast = blockLines[2] || "";
+      const action = blockLines[3] || "";
+      let sectors = blockLines.slice(4).join(" ") || "";
+      sectors = sectors.split(/(?:\d+\.\s*(?:Weekly|Completed)|Tab\s*2:)/i)[0].trim();
+
+      const label = dateStr ? `${matchedDay} · ${dateStr}` : matchedDay;
+      lineRows.push({
+        session: fullSession,
+        day: matchedDay,
+        date: dateStr,
+        label: label,
+        stance: stance,
+        forecast: forecast,
+        action: action,
+        sectors: sectors,
+      });
+    }
+  }
+
+  return lineRows.length > 0 ? lineRows : rows;
+}
+
 function findBestSessionIndex(sessions, serverDayName, todaySession) {
   if (!sessions || sessions.length === 0) return 0;
 
@@ -888,11 +1016,13 @@ export function NiftyFlowView({ t, isDark }) {
   const [loading, setLoading] = useState(() => !globalOiCache);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedDayIdx, setSelectedDayIdx] = useState(() => findBestSessionIndex(globalArgonCache?.sessions, globalArgonCache?.currentDay, globalArgonCache?.todaySession));
+  const [syncingDoc, setSyncingDoc] = useState(false);
+  const [docSyncMsg, setDocSyncMsg] = useState("");
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
-  // Restore timeline from localStorage on mount (preserves full day points across browser close/refresh)
+  // Restore timeline & argon data from localStorage on mount (preserves state across browser close/refresh)
   useEffect(() => {
     try {
       const todayKey = getTodayDateKey();
@@ -909,6 +1039,21 @@ export function NiftyFlowView({ t, isDark }) {
       }
     } catch (e) {
       console.warn("Could not load local timeline:", e);
+    }
+
+    try {
+      const storedArgon = localStorage.getItem("argon_cached_sessions_v2");
+      if (storedArgon) {
+        const cached = JSON.parse(storedArgon);
+        if (cached?.sessions?.length) {
+          globalArgonCache = cached;
+          setArgonData(cached);
+          const todayIdx = findBestSessionIndex(cached.sessions, cached.currentDay, cached.todaySession);
+          setSelectedDayIdx(todayIdx);
+        }
+      }
+    } catch (e) {
+      console.warn("Could not load local argon cache:", e);
     }
   }, []);
 
@@ -974,20 +1119,79 @@ export function NiftyFlowView({ t, isDark }) {
     }
   };
 
-  const fetchArgon = async () => {
+  const fetchArgon = async (force = false) => {
+    if (force) setSyncingDoc(true);
     try {
-      const res = await fetch("/api/argon");
+      const url = force ? `/api/argon?force=true&_t=${Date.now()}` : "/api/argon";
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        globalArgonCache = data;
-        setArgonData(data);
-        if (data.sessions?.length) {
-          const todayIdx = findBestSessionIndex(data.sessions, data.currentDay, data.todaySession);
-          setSelectedDayIdx(todayIdx);
+        if (data?.sessions && data.sessions.length > 0) {
+          globalArgonCache = data;
+          setArgonData(data);
+          try {
+            localStorage.setItem("argon_cached_sessions_v2", JSON.stringify(data));
+          } catch (e) {}
+          if (data.sessions?.length) {
+            const todayIdx = findBestSessionIndex(data.sessions, data.currentDay, data.todaySession);
+            setSelectedDayIdx(todayIdx);
+          }
+          if (force) {
+            setDocSyncMsg("Synced live!");
+            setTimeout(() => setDocSyncMsg(""), 3500);
+          }
+          if (force) setSyncingDoc(false);
+          return;
         }
       }
     } catch (e) {
-      console.error("Failed to load /api/argon:", e);
+      console.warn("Failed to load /api/argon, trying direct Google Doc client fetch:", e);
+    }
+
+    // Direct client fallback to Google Docs export (Access-Control-Allow-Origin: * allows client fetch)
+    try {
+      const directRes = await fetch("https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/export?format=txt", {
+        headers: { "Cache-Control": "no-cache" },
+        signal: AbortSignal.timeout(9000),
+      });
+      if (directRes.ok) {
+        const text = await directRes.text();
+        const sessions = parseArgonDocClient(text);
+        if (sessions && sessions.length >= 4) {
+          const { dayName, dayNum } = getIstDayInfo();
+          const targetDay = dayNum === 0 ? "Monday" : dayNum === 6 ? "Friday" : dayName;
+          const todaySession = sessions.find(s => s.day?.toLowerCase() === targetDay.toLowerCase()) || sessions[0];
+          const clientData = {
+            success: true,
+            isLive: true,
+            source: "client_direct_gdoc",
+            updatedAt: new Date().toISOString(),
+            docUrl: "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing",
+            sessions,
+            todaySession,
+            currentDay: dayName,
+          };
+          globalArgonCache = clientData;
+          setArgonData(clientData);
+          try {
+            localStorage.setItem("argon_cached_sessions_v2", JSON.stringify(clientData));
+          } catch (e) {}
+          const todayIdx = findBestSessionIndex(sessions, dayName, todaySession);
+          setSelectedDayIdx(todayIdx);
+          if (force) {
+            setDocSyncMsg("Direct Doc Synced!");
+            setTimeout(() => setDocSyncMsg(""), 3500);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Direct Google Doc client fetch also failed:", e);
+      if (force) {
+        setDocSyncMsg("Sync failed, check connection");
+        setTimeout(() => setDocSyncMsg(""), 4000);
+      }
+    } finally {
+      if (force) setSyncingDoc(false);
     }
   };
 
@@ -1858,16 +2062,51 @@ export function NiftyFlowView({ t, isDark }) {
               padding: isMobile ? "14px 12px" : "18px 20px",
               boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
             }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
                 <div>
                   <div style={{ fontSize: isMobile ? 14 : isTablet ? 16 : 17, fontWeight: 900, color: t.text }}>🎯 WEEKLY &amp; DAILY PREDICTION</div>
                   <div style={{ fontSize: isMobile ? 10 : 12, color: t.textMuted }}>Price Action Model &amp; Key Pivots</div>
                 </div>
-                <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
-                  target="_blank" rel="noreferrer"
-                  style={{ fontSize: isMobile ? 11 : 12.5, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
-                  Doc ↗
-                </a>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  {docSyncMsg && (
+                    <span style={{
+                      fontSize: 10.5,
+                      fontWeight: 800,
+                      color: docSyncMsg.includes("failed") ? "#ef4444" : "#16a34a",
+                      background: docSyncMsg.includes("failed") ? (isDark ? "#2d0a0a" : "#fee2e2") : (isDark ? "#052e16" : "#dcfce7"),
+                      padding: "2px 7px",
+                      borderRadius: 4,
+                      border: `1px solid ${docSyncMsg.includes("failed") ? "#ef444444" : "#16a34a44"}`,
+                    }}>
+                      {docSyncMsg}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => fetchArgon(true)}
+                    disabled={syncingDoc}
+                    title="Force immediate live sync from Google Doc"
+                    style={{
+                      padding: isMobile ? "4px 8px" : "5px 12px",
+                      borderRadius: 6,
+                      fontSize: isMobile ? 10.5 : 11.5,
+                      fontWeight: 800,
+                      background: isDark ? "#1e293b" : "#f1f5f9",
+                      color: t.accent,
+                      border: `1px solid ${t.border}`,
+                      cursor: syncingDoc ? "wait" : "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      transition: "all 0.15s ease",
+                    }}>
+                    <span>{syncingDoc ? "⏳ Syncing..." : "🔄 Sync Live Doc"}</span>
+                  </button>
+                  <a href={argonData?.docUrl || "https://docs.google.com/document/d/1P21Ba9Jlf9Ebn2rTKW0rTyQtzR_oJCPCyqFq_5LRB_c/edit?usp=sharing"}
+                    target="_blank" rel="noreferrer"
+                    style={{ fontSize: isMobile ? 11 : 12.5, color: t.accentSub, textDecoration: "none", fontWeight: 700 }}>
+                    Doc ↗
+                  </a>
+                </div>
               </div>
 
               {/* DAY SELECTOR BUTTONS */}
@@ -1878,6 +2117,9 @@ export function NiftyFlowView({ t, isDark }) {
                   const isToday = argonData?.todaySession
                     ? (argonData.todaySession.session === sess.session || (argonData.todaySession.day && argonData.todaySession.day === sess.day))
                     : sess.session.toLowerCase().includes((argonData?.currentDay || getIstDayInfo().dayName).toLowerCase());
+                  const dayNum = getIstDayInfo().dayNum;
+                  const badgeText = (dayNum === 0 || dayNum === 6) ? "NEXT" : "TODAY";
+
                   return (
                     <button key={sess.session || idx} onClick={() => setSelectedDayIdx(idx)} style={{
                       padding: isMobile ? "7px 12px" : "8px 15px",
@@ -1919,7 +2161,7 @@ export function NiftyFlowView({ t, isDark }) {
                           fontWeight: 800,
                           letterSpacing: 0.3
                         }}>
-                          TODAY
+                          {badgeText}
                         </span>
                       )}
                     </button>
