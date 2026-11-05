@@ -1336,9 +1336,6 @@ export function NiftyFlowView({ t, isDark }) {
   const [expandedHistoryId, setExpandedHistoryId] = useState(null);
   const [editingOpenId, setEditingOpenId] = useState(null);
   const [customOpenSpot, setCustomOpenSpot] = useState("");
-  const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
-  const [countdown, setCountdown] = useState(60);
-  const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
   // Restore timeline & argon data from localStorage on mount (preserves state across browser close/refresh)
   useEffect(() => {
