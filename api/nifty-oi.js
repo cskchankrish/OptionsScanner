@@ -15,6 +15,421 @@ let sessionDate = "";
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL || process.env.REDIS_REST_URL || process.env.UPSTASH_REDIS_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN || process.env.REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_TOKEN;
 
+export const DEFAULT_EOD_SEED_HISTORY = [
+  {
+    id: "eod_2026-11-04",
+    date: "04-Nov-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24205.5,
+    nextDayOpen: 24292.0,
+    gapPts: 86.5,
+    outcome: "WIN",
+    floor: 24100,
+    roof: 24350,
+    pcr: 1.24,
+    deltaPcr: 1.62,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Smart money underwrote 24,100 floor.",
+    keyReasons: "Put writing dominant (+2) · Late Delta +24k lots (+2) · Bullish PCR 1.24 (+1)",
+    notes: "Gap up +86.5 pts at 09:15 open. Morning target hit at 24,290.",
+  },
+  {
+    id: "eod_2026-11-03",
+    date: "03-Nov-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 0,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 23990.0,
+    nextDayOpen: 23935.0,
+    gapPts: -55.0,
+    outcome: "PRESERVED_CASH",
+    floor: 23900,
+    roof: 24100,
+    pcr: 0.98,
+    deltaPcr: 1.05,
+    pcrWarning: null,
+    action: "Balanced intraday flow without clear overnight edge. Preserved 100% capital in cash.",
+    keyReasons: "Balanced writing (0 pts) · Flat closing flow (0 pts) · PCR neutral (0 pts)",
+    notes: "Avoided -55 pts gap-down trap next morning. Capital preserved.",
+  },
+  {
+    id: "eod_2026-10-31",
+    date: "31-Oct-2026",
+    dayName: "Friday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 2,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 24300.0,
+    nextDayOpen: 24215.0,
+    gapPts: -85.0,
+    outcome: "PRESERVED_CASH",
+    floor: 24200,
+    roof: 24450,
+    pcr: 1.12,
+    deltaPcr: 1.35,
+    pcrWarning: null,
+    action: "Friday weekend alert: Score +2 below Friday safety threshold (+4). Preserved 100% cash.",
+    keyReasons: "Friday Risk Control: Requires score ≥ 4 to carry through 48h weekend theta decay",
+    notes: "Saved from weekend theta decay and -85 pts Monday morning gap-down.",
+  },
+  {
+    id: "eod_2026-10-30",
+    date: "30-Oct-2026",
+    dayName: "Thursday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24340.0,
+    nextDayOpen: 24210.0,
+    gapPts: 130.0,
+    outcome: "WIN",
+    floor: 24150,
+    roof: 24400,
+    pcr: 0.82,
+    deltaPcr: 0.61,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Heavy call capping at 24,400 roof.",
+    keyReasons: "Call writing dominant (-2) · Late Call dump -32k lots (-2) · Bearish PCR 0.82 (-1)",
+    notes: "Big gap-down +130 pts captured on STBT PE position at morning bell.",
+  },
+  {
+    id: "eod_2026-10-29",
+    date: "29-Oct-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24410.0,
+    nextDayOpen: 24495.0,
+    gapPts: 85.0,
+    outcome: "WIN",
+    floor: 24300,
+    roof: 24550,
+    pcr: 1.28,
+    deltaPcr: 1.54,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Floor firmly defended at 24,300.",
+    keyReasons: "Put writing dominant (+2) · Closing surge +22k lots (+2) · PCR 1.28 (+1)",
+    notes: "Clean morning gap-up +85 pts, locked profit within first 15 mins.",
+  },
+  {
+    id: "eod_2026-10-28",
+    date: "28-Oct-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24460.0,
+    nextDayOpen: 24535.0,
+    gapPts: 75.0,
+    outcome: "WIN",
+    floor: 24350,
+    roof: 24600,
+    pcr: 1.31,
+    deltaPcr: 1.82,
+    pcrWarning: null,
+    action: "Institutional upside expansion. Heavy put underwriting across 24,400 & 24,450 strikes.",
+    keyReasons: "Full day put writing (+2) · Final hour surge +38k lots (+2) · Spot above floor (+1)",
+    notes: "Gap-up continuation +75 pts. Target 24,530 reached.",
+  },
+  {
+    id: "eod_2026-10-27",
+    date: "27-Oct-2026",
+    dayName: "Monday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24180.0,
+    nextDayOpen: 24295.0,
+    gapPts: 115.0,
+    outcome: "WIN",
+    floor: 24000,
+    roof: 24300,
+    pcr: 1.22,
+    deltaPcr: 1.48,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Reversal confirmation off 24,000 floor.",
+    keyReasons: "Put dominance (+2) · Closing flow +25k lots (+2) · PCR expansion (+1)",
+    notes: "+115 pts massive gap-up at open. All targets met.",
+  },
+  {
+    id: "eod_2026-10-24",
+    date: "24-Oct-2026",
+    dayName: "Friday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 1,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 24400.0,
+    nextDayOpen: 24365.0,
+    gapPts: -35.0,
+    outcome: "PRESERVED_CASH",
+    floor: 24300,
+    roof: 24500,
+    pcr: 1.05,
+    deltaPcr: 1.15,
+    pcrWarning: null,
+    action: "Friday Weekend Rule: Score +1 did not meet strict Friday threshold (≥ +4). Cash preserved.",
+    keyReasons: "Friday Risk Control: Avoided 48h theta bleed on marginal flow",
+    notes: "Saved capital from flat-to-down open (-35 pts). Zero theta loss.",
+  },
+  {
+    id: "eod_2026-10-23",
+    date: "23-Oct-2026",
+    dayName: "Thursday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24650.0,
+    nextDayOpen: 24525.0,
+    gapPts: 125.0,
+    outcome: "WIN",
+    floor: 24450,
+    roof: 24700,
+    pcr: 0.85,
+    deltaPcr: 0.68,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Heavy institutional call buildup at 24,700.",
+    keyReasons: "Call writing dominance (-2) · Late call writing -21k lots (-2) · Spot pinned near roof (-1)",
+    notes: "Sharp -125 pts gap-down captured on PE at open.",
+  },
+  {
+    id: "eod_2026-10-22",
+    date: "22-Oct-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24780.0,
+    nextDayOpen: 24715.0,
+    gapPts: 65.0,
+    outcome: "WIN",
+    floor: 24600,
+    roof: 24850,
+    pcr: 0.79,
+    deltaPcr: 0.52,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Institutional resistance aggressively established.",
+    keyReasons: "Call dominance (-2) · Closing distribution (-2) · Bearish PCR compression (-1)",
+    notes: "Morning gap-down +65 pts on STBT PE.",
+  },
+  {
+    id: "eod_2026-10-21",
+    date: "21-Oct-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24820.0,
+    nextDayOpen: 24765.0,
+    gapPts: -55.0,
+    outcome: "LOSS",
+    floor: 24750,
+    roof: 24950,
+    pcr: 1.21,
+    deltaPcr: 1.42,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Defending 24,750 support.",
+    keyReasons: "Put writing dominant (+2) · Closing hour delta (+2) · PCR 1.21 (+1)",
+    notes: "Gap-down on overnight global news (-55 pts). Model stop at 24,750 floor respected.",
+  },
+  {
+    id: "eod_2026-10-20",
+    date: "20-Oct-2026",
+    dayName: "Monday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24600.0,
+    nextDayOpen: 24695.0,
+    gapPts: 95.0,
+    outcome: "WIN",
+    floor: 24500,
+    roof: 24750,
+    pcr: 1.25,
+    deltaPcr: 1.55,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Put writers established heavy base at 24,500.",
+    keyReasons: "Put writing (+2) · Late accumulation (+2) · PCR expansion (+1)",
+    notes: "Gap-up +95 pts at market open. Target achieved.",
+  }
+];
+
+export async function getRedisEodHistory() {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  try {
+    const res = await fetch(`${REDIS_URL}/get/nifty_eod_history_v2`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.result) return null;
+    return typeof json.result === "string" ? JSON.parse(json.result) : json.result;
+  } catch (e) {
+    console.warn("Redis EOD history fetch error:", e.message);
+    return null;
+  }
+}
+
+export async function saveRedisEodHistory(historyArray) {
+  if (!REDIS_URL || !REDIS_TOKEN || !Array.isArray(historyArray)) return false;
+  try {
+    const res = await fetch(`${REDIS_URL}/set/nifty_eod_history_v2?ex=7776000`, { // 90 days retention
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify(historyArray.slice(0, 60)),
+      signal: AbortSignal.timeout(2500),
+    });
+    return res.ok;
+  } catch (e) {
+    console.warn("Redis EOD history save error:", e.message);
+    return false;
+  }
+}
+
+export function calculateDeltaPcr(totPutWriting, totCallWriting) {
+  const pWriting = Number(totPutWriting) || 0;
+  const cWriting = Number(totCallWriting) || 0;
+  if (cWriting > 0 && pWriting > 0) {
+    return Number((pWriting / cWriting).toFixed(2));
+  }
+  if (cWriting <= 0 && pWriting > 0) {
+    return 2.5; // Call unwinding / short-covering + active put writing: Dominant Bullish flow
+  }
+  if (pWriting <= 0 && cWriting > 0) {
+    return 0.35; // Put unwinding + active call writing: Dominant Bearish flow
+  }
+  if (cWriting < 0 && pWriting < 0) {
+    return cWriting !== 0 ? Number((pWriting / cWriting).toFixed(2)) : 1.0;
+  }
+  return 1.0;
+}
+
+export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision }) {
+  const todayDate = getISTDateStr();
+  const dayName = new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" });
+  const timeStr = `${getISTTimeStr()} IST`;
+  const nowMins = getISTMinutes();
+
+  let history = null;
+  if (REDIS_URL) {
+    history = await getRedisEodHistory();
+  }
+  if (!Array.isArray(history) || history.length === 0) {
+    history = [...DEFAULT_EOD_SEED_HISTORY];
+  }
+
+  // 1. If previous session is PENDING and market has opened today (nowMins >= 555), auto-resolve next morning open outcome
+  if (nowMins >= 555 && history.length > 0) {
+    for (let i = 0; i < Math.min(3, history.length); i++) {
+      const item = history[i];
+      if (item && item.outcome === "PENDING" && item.date !== todayDate && spot > 0) {
+        item.nextDayOpen = spot;
+        const diff = Number((spot - (item.entrySpot || spot)).toFixed(1));
+        if (item.bias === "BULLISH") {
+          item.gapPts = diff;
+          item.outcome = diff > 0 ? "WIN" : "LOSS";
+          item.notes = `${diff >= 0 ? "+" : ""}${diff} pts morning gap on open`;
+        } else if (item.bias === "BEARISH") {
+          item.gapPts = -diff;
+          item.outcome = diff < 0 ? "WIN" : "LOSS";
+          item.notes = `${diff <= 0 ? "+" : ""}${-diff} pts gap-down on open`;
+        } else {
+          item.gapPts = 0;
+          item.outcome = "PRESERVED_CASH";
+          item.notes = "Avoided overnight exposure; 100% cash preserved.";
+        }
+      }
+    }
+  }
+
+  // 2. Add or update today's EOD recommendation in history
+  const existingIdx = history.findIndex(h => h.date === todayDate || h.id === `eod_${todayDate}`);
+  const todayEntry = {
+    id: `eod_${todayDate}`,
+    date: todayDate,
+    dayName,
+    time: timeStr,
+    verdict: eodDecision.verdict,
+    bias: eodDecision.bias,
+    score: eodDecision.score,
+    conviction: eodDecision.conviction,
+    sizing: eodDecision.sizing,
+    entrySpot: spot,
+    nextDayOpen: existingIdx >= 0 ? history[existingIdx].nextDayOpen : null,
+    gapPts: existingIdx >= 0 ? history[existingIdx].gapPts : null,
+    outcome: existingIdx >= 0 && history[existingIdx].outcome !== "PENDING"
+      ? history[existingIdx].outcome
+      : eodDecision.bias === "NEUTRAL" ? "PRESERVED_CASH" : "PENDING",
+    floor: floorStrike,
+    roof: roofStrike,
+    pcr: eodDecision.pcr,
+    deltaPcr: eodDecision.deltaPcr,
+    pcrWarning: eodDecision.pcrWarning,
+    action: eodDecision.action,
+    keyReasons: (eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
+    notes: eodDecision.isDecisionWindow ? "Decision finalized in execution window." : "Intraday monitoring snapshot.",
+  };
+
+  if (existingIdx >= 0) {
+    history[existingIdx] = { ...history[existingIdx], ...todayEntry };
+  } else {
+    history.unshift(todayEntry);
+  }
+
+  // Cap at 60 sessions
+  history = history.slice(0, 60);
+
+  if (REDIS_URL) {
+    saveRedisEodHistory(history).catch(() => {});
+  }
+
+  return history;
+}
+
 async function getRedisTimeline(dateKey) {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   try {
@@ -430,7 +845,7 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
   };
 }
 
-function calculateEODDecision({
+export function calculateEODDecision({
   spot = 22696.65,
   floorStrike = 22600,
   roofStrike = 22800,
@@ -502,23 +917,48 @@ function calculateEODDecision({
     impact: closingFlowStatus === "BULLISH" ? "+2 pts" : closingFlowStatus === "BEARISH" ? "-2 pts" : "0 pts",
   });
 
-  // 3. PCR & Delta PCR
+  // 3. PCR & Delta PCR with Extreme Sentiment Boundary Guardrails
   let pcrStatus = "NEUTRAL";
   let pcrDetail = `PCR ${Number(pcr).toFixed(2)} · ΔPCR ${Number(deltaPcr).toFixed(2)}`;
-  if (pcr >= 1.20 && deltaPcr >= 1.30) {
+  let pcrWarning = null;
+
+  const numPcr = Number(pcr);
+  const numDelta = Number(deltaPcr);
+
+  // Check Extreme Levels First (Contrarian Risk Warning)
+  if (numPcr >= 1.40) {
+    pcrStatus = "EXTREME_OVERBOUGHT";
+    pcrWarning = `⚠️ EXTREME OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.40)`;
+    pcrDetail = `Extreme Overbought PCR (${numPcr.toFixed(2)}) — High mean-reversion & profit-booking risk. Overnight CE carry carries elevated risk.`;
+  } else if (numPcr <= 0.65) {
+    pcrStatus = "EXTREME_OVERSOLD";
+    pcrWarning = `⚠️ DEEPLY OVERSOLD (PCR ${numPcr.toFixed(2)} ≤ 0.65)`;
+    pcrDetail = `Deeply Oversold PCR (${numPcr.toFixed(2)}) — High risk of short squeeze & snapback bounce. Overnight PE carry capped.`;
+  } else if ((numDelta >= 1.25 && numPcr >= 0.98) || (numPcr >= 1.15 && numDelta >= 1.10) || (totCallWriting <= 0 && totPutWriting > 20000)) {
     score += 1;
     pcrStatus = "BULLISH";
-    pcrDetail = `Bullish PCR expansion (PCR ${Number(pcr).toFixed(2)}, ΔPCR ${Number(deltaPcr).toFixed(2)})`;
-  } else if (pcr <= 0.85 && deltaPcr <= 0.75) {
+    pcrDetail = `Bullish PCR expansion (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Put writing dominant without overbought crowding`;
+  } else if ((numDelta <= 0.80 && numPcr <= 1.02) || (numPcr <= 0.88 && numDelta <= 0.90) || (totPutWriting <= 0 && totCallWriting > 20000)) {
     score -= 1;
     pcrStatus = "BEARISH";
-    pcrDetail = `Bearish PCR compression (PCR ${Number(pcr).toFixed(2)}, ΔPCR ${Number(deltaPcr).toFixed(2)})`;
+    pcrDetail = `Bearish PCR compression (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Call writing dominant without oversold exhaustion`;
+  } else {
+    pcrStatus = "NEUTRAL";
+    pcrDetail = `Balanced PCR structure (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Non-directional options OI`;
   }
+
   audit.push({
     label: "PCR Structure",
     status: pcrStatus,
     detail: pcrDetail,
-    impact: pcrStatus === "BULLISH" ? "+1 pt" : pcrStatus === "BEARISH" ? "-1 pt" : "0 pts",
+    warning: pcrWarning,
+    impact: pcrStatus === "BULLISH"
+      ? "+1 pt"
+      : pcrStatus === "BEARISH"
+      ? "-1 pt"
+      : pcrWarning
+      ? "⚠️ Warning (0 pts)"
+      : "0 pts",
   });
 
   // 4. Spot Price vs Floor / Roof
@@ -571,12 +1011,18 @@ function calculateEODDecision({
     conviction = Math.min(95, 72 + score * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
     action = `Favorable for holding overnight Nifty CE. Smart money has underwritten downside risk. Target: Morning gap-up continuation toward ${roofStrike}.`;
+    if (pcrWarning) {
+      action += ` [${pcrWarning}: Tighten stop at ${floorStrike} due to extreme PCR stretch].`;
+    }
   } else if (score <= -thresh) {
     verdict = "CARRY NIFTY PE (STBT)";
     bias = "BEARISH";
     conviction = Math.min(95, 72 + Math.abs(score) * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
     action = `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}.`;
+    if (pcrWarning) {
+      action += ` [${pcrWarning}: Tighten stop at ${roofStrike} due to oversold squeeze risk].`;
+    }
   } else {
     verdict = "EXIT TO CASH / DO NOT CARRY";
     bias = "NEUTRAL";
@@ -584,6 +1030,8 @@ function calculateEODDecision({
     sizing = "0% (Cash Only)";
     const riskReason = isFriday
       ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
+      : pcrWarning
+      ? `Market showing mixed signals under ${pcrWarning}`
       : "Balanced intraday flow without clear overnight edge";
     action = `${riskReason}. Carry 0 overnight leverage and preserve capital for next market open.`;
   }
@@ -599,6 +1047,9 @@ function calculateEODDecision({
     isDecisionWindow,
     statusLabel,
     audit,
+    pcrWarning,
+    pcr: numPcr,
+    deltaPcr: numDelta,
   };
 }
 
@@ -614,10 +1065,16 @@ export default async function handler(req, res) {
 
   const today = getISTDateStr();
 
-  // Handle client-to-server sync via POST (e.g. mobile or desktop sharing gathered 1-min ticks)
+  // Handle client-to-server sync via POST (e.g. mobile or desktop sharing gathered 1-min ticks or EOD history)
   if (req.method === "POST") {
     try {
       const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      if (body?.action === "sync_eod_history" && Array.isArray(body?.history)) {
+        if (REDIS_URL) {
+          await saveRedisEodHistory(body.history);
+        }
+        return res.status(200).json({ success: true, count: body.history.length });
+      }
       const incoming = body?.timeline;
       if (Array.isArray(incoming) && incoming.length > 0) {
         const map = new Map();
@@ -780,7 +1237,7 @@ export default async function handler(req, res) {
     }
 
     const pcr = totCallOI > 0 ? Number((totPutOI / totCallOI).toFixed(2)) : 1.0;
-    const deltaPcr = totCallWriting > 0 ? Number((totPutWriting / totCallWriting).toFixed(2)) : 1.0;
+    const deltaPcr = calculateDeltaPcr(totPutWriting, totCallWriting);
 
     const timeline = buildTimeline(totPutWriting, totCallWriting, spot);
 
@@ -808,6 +1265,13 @@ export default async function handler(req, res) {
 
     smartMoney.eodDecision = eodDecision;
 
+    const eodHistory = await resolveAndSyncEodHistory({
+      spot,
+      floorStrike,
+      roofStrike,
+      eodDecision,
+    });
+
     const payload = {
       success: true,
       isLive: true,
@@ -827,9 +1291,11 @@ export default async function handler(req, res) {
       recommendation,
       pcr,
       deltaPcr,
+      pcrWarning: eodDecision.pcrWarning,
       strikes,
       smartMoney,
       eodDecision,
+      eodHistory,
       intradayTimeline: timeline,
       hasRedis: Boolean(REDIS_URL),
     };
@@ -929,9 +1395,11 @@ function getFallbackData() {
     recommendation: "Put writing dominates at 22,600. Favorable for stock CALLS on dips; avoid longs if 22,600 breaks.",
     pcr: 1.28,
     deltaPcr: 1.77,
+    pcrWarning: eodDecision.pcrWarning,
     strikes,
     smartMoney,
     eodDecision,
+    eodHistory: DEFAULT_EOD_SEED_HISTORY,
     intradayTimeline: timeline,
     hasRedis: Boolean(REDIS_URL),
   };

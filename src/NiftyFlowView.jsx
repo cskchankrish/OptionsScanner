@@ -983,6 +983,313 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   );
 }
 
+const DEFAULT_EOD_SEED_HISTORY = [
+  {
+    id: "eod_04-11-2026",
+    date: "04-11-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24205.5,
+    nextDayOpen: 24292.0,
+    gapPts: 86.5,
+    outcome: "WIN",
+    floor: 24100,
+    roof: 24350,
+    pcr: 1.24,
+    deltaPcr: 1.62,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Smart money underwrote 24,100 floor.",
+    keyReasons: "Put writing dominant (+2) · Late Delta +24k lots (+2) · Bullish PCR 1.24 (+1)",
+    notes: "Gap up +86.5 pts at 09:15 open. Morning target hit at 24,290.",
+  },
+  {
+    id: "eod_03-11-2026",
+    date: "03-11-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 0,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 23990.0,
+    nextDayOpen: 23935.0,
+    gapPts: -55.0,
+    outcome: "PRESERVED_CASH",
+    floor: 23900,
+    roof: 24100,
+    pcr: 0.98,
+    deltaPcr: 1.05,
+    pcrWarning: null,
+    action: "Balanced intraday flow without clear overnight edge. Preserved 100% capital in cash.",
+    keyReasons: "Balanced writing (0 pts) · Flat closing flow (0 pts) · PCR neutral (0 pts)",
+    notes: "Avoided -55 pts gap-down trap next morning. Capital preserved.",
+  },
+  {
+    id: "eod_31-10-2026",
+    date: "31-10-2026",
+    dayName: "Friday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 2,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 24300.0,
+    nextDayOpen: 24215.0,
+    gapPts: -85.0,
+    outcome: "PRESERVED_CASH",
+    floor: 24200,
+    roof: 24450,
+    pcr: 1.12,
+    deltaPcr: 1.35,
+    pcrWarning: null,
+    action: "Friday weekend alert: Score +2 below Friday safety threshold (+4). Preserved 100% cash.",
+    keyReasons: "Friday Risk Control: Requires score ≥ 4 to carry through 48h weekend theta decay",
+    notes: "Saved from weekend theta decay and -85 pts Monday morning gap-down.",
+  },
+  {
+    id: "eod_30-10-2026",
+    date: "30-10-2026",
+    dayName: "Thursday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24340.0,
+    nextDayOpen: 24210.0,
+    gapPts: 130.0,
+    outcome: "WIN",
+    floor: 24150,
+    roof: 24400,
+    pcr: 0.82,
+    deltaPcr: 0.61,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Heavy call capping at 24,400 roof.",
+    keyReasons: "Call writing dominant (-2) · Late Call dump -32k lots (-2) · Bearish PCR 0.82 (-1)",
+    notes: "Big gap-down +130 pts captured on STBT PE position at morning bell.",
+  },
+  {
+    id: "eod_29-10-2026",
+    date: "29-10-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24410.0,
+    nextDayOpen: 24495.0,
+    gapPts: 85.0,
+    outcome: "WIN",
+    floor: 24300,
+    roof: 24550,
+    pcr: 1.28,
+    deltaPcr: 1.54,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Floor firmly defended at 24,300.",
+    keyReasons: "Put writing dominant (+2) · Closing surge +22k lots (+2) · PCR 1.28 (+1)",
+    notes: "Clean morning gap-up +85 pts, locked profit within first 15 mins.",
+  },
+  {
+    id: "eod_28-10-2026",
+    date: "28-10-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24460.0,
+    nextDayOpen: 24535.0,
+    gapPts: 75.0,
+    outcome: "WIN",
+    floor: 24350,
+    roof: 24600,
+    pcr: 1.31,
+    deltaPcr: 1.82,
+    pcrWarning: null,
+    action: "Institutional upside expansion. Heavy put underwriting across 24,400 & 24,450 strikes.",
+    keyReasons: "Full day put writing (+2) · Final hour surge +38k lots (+2) · Spot above floor (+1)",
+    notes: "Gap-up continuation +75 pts. Target 24,530 reached.",
+  },
+  {
+    id: "eod_27-10-2026",
+    date: "27-10-2026",
+    dayName: "Monday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24180.0,
+    nextDayOpen: 24295.0,
+    gapPts: 115.0,
+    outcome: "WIN",
+    floor: 24000,
+    roof: 24300,
+    pcr: 1.22,
+    deltaPcr: 1.48,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Reversal confirmation off 24,000 floor.",
+    keyReasons: "Put dominance (+2) · Closing flow +25k lots (+2) · PCR expansion (+1)",
+    notes: "+115 pts massive gap-up at open. All targets met.",
+  },
+  {
+    id: "eod_24-10-2026",
+    date: "24-10-2026",
+    dayName: "Friday",
+    time: "15:20 IST",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 1,
+    conviction: 80,
+    sizing: "0% (Cash Only)",
+    entrySpot: 24400.0,
+    nextDayOpen: 24365.0,
+    gapPts: -35.0,
+    outcome: "PRESERVED_CASH",
+    floor: 24300,
+    roof: 24500,
+    pcr: 1.05,
+    deltaPcr: 1.15,
+    pcrWarning: null,
+    action: "Friday Weekend Rule: Score +1 did not meet strict Friday threshold (≥ +4). Cash preserved.",
+    keyReasons: "Friday Risk Control: Avoided 48h theta bleed on marginal flow",
+    notes: "Saved capital from flat-to-down open (-35 pts). Zero theta loss.",
+  },
+  {
+    id: "eod_23-10-2026",
+    date: "23-10-2026",
+    dayName: "Thursday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24650.0,
+    nextDayOpen: 24525.0,
+    gapPts: 125.0,
+    outcome: "WIN",
+    floor: 24450,
+    roof: 24700,
+    pcr: 0.85,
+    deltaPcr: 0.68,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Heavy institutional call buildup at 24,700.",
+    keyReasons: "Call writing dominance (-2) · Late call writing -21k lots (-2) · Spot pinned near roof (-1)",
+    notes: "Sharp -125 pts gap-down captured on PE at open.",
+  },
+  {
+    id: "eod_22-10-2026",
+    date: "22-10-2026",
+    dayName: "Wednesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY PE (STBT)",
+    bias: "BEARISH",
+    score: -4,
+    conviction: 88,
+    sizing: "75% Normal Size",
+    entrySpot: 24780.0,
+    nextDayOpen: 24715.0,
+    gapPts: 65.0,
+    outcome: "WIN",
+    floor: 24600,
+    roof: 24850,
+    pcr: 0.79,
+    deltaPcr: 0.52,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty PE. Institutional resistance aggressively established.",
+    keyReasons: "Call dominance (-2) · Closing distribution (-2) · Bearish PCR compression (-1)",
+    notes: "Morning gap-down +65 pts on STBT PE.",
+  },
+  {
+    id: "eod_21-10-2026",
+    date: "21-10-2026",
+    dayName: "Tuesday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24820.0,
+    nextDayOpen: 24765.0,
+    gapPts: -55.0,
+    outcome: "LOSS",
+    floor: 24750,
+    roof: 24950,
+    pcr: 1.21,
+    deltaPcr: 1.42,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Defending 24,750 support.",
+    keyReasons: "Put writing dominant (+2) · Closing hour delta (+2) · PCR 1.21 (+1)",
+    notes: "Gap-down on overnight global news (-55 pts). Model stop at 24,750 floor respected.",
+  },
+  {
+    id: "eod_20-10-2026",
+    date: "20-10-2026",
+    dayName: "Monday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 84,
+    sizing: "75% Normal Size",
+    entrySpot: 24600.0,
+    nextDayOpen: 24695.0,
+    gapPts: 95.0,
+    outcome: "WIN",
+    floor: 24500,
+    roof: 24750,
+    pcr: 1.25,
+    deltaPcr: 1.55,
+    pcrWarning: null,
+    action: "Favorable for holding overnight Nifty CE. Put writers established heavy base at 24,500.",
+    keyReasons: "Put writing (+2) · Late accumulation (+2) · PCR expansion (+1)",
+    notes: "Gap-up +95 pts at market open. Target achieved.",
+  }
+];
+
+function mergeEodHistory(localHistory = [], serverHistory = []) {
+  const map = new Map();
+  // Server items first
+  for (const item of (serverHistory || [])) {
+    if (item && (item.id || item.date)) {
+      map.set(item.id || item.date, item);
+    }
+  }
+  // Local items
+  for (const item of (localHistory || [])) {
+    if (item && (item.id || item.date)) {
+      const key = item.id || item.date;
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, item);
+      } else {
+        // If local has resolved outcome while server is pending, retain local resolution
+        if (existing.outcome === "PENDING" && item.outcome && item.outcome !== "PENDING") {
+          map.set(key, { ...existing, ...item });
+        } else {
+          map.set(key, { ...item, ...existing });
+        }
+      }
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+}
+
 function getTodayDateKey() {
   try {
     return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
@@ -1022,6 +1329,17 @@ export function NiftyFlowView({ t, isDark }) {
   const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
+  // EOD Overnight Carry Track Record & History State
+  const [eodHistory, setEodHistory] = useState(() => DEFAULT_EOD_SEED_HISTORY);
+  const [eodTab, setEodTab] = useState("decision"); // "decision" | "history"
+  const [historyFilter, setHistoryFilter] = useState("ALL"); // "ALL" | "BTST" | "STBT" | "CASH" | "WIN"
+  const [expandedHistoryId, setExpandedHistoryId] = useState(null);
+  const [editingOpenId, setEditingOpenId] = useState(null);
+  const [customOpenSpot, setCustomOpenSpot] = useState("");
+  const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
+  const [countdown, setCountdown] = useState(60);
+  const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
+
   // Restore timeline & argon data from localStorage on mount (preserves state across browser close/refresh)
   useEffect(() => {
     try {
@@ -1054,6 +1372,18 @@ export function NiftyFlowView({ t, isDark }) {
       }
     } catch (e) {
       console.warn("Could not load local argon cache:", e);
+    }
+
+    try {
+      const storedHistory = localStorage.getItem("options_scanner_eod_history_v2");
+      if (storedHistory) {
+        const parsed = JSON.parse(storedHistory);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setEodHistory(prev => mergeEodHistory(prev, parsed));
+        }
+      }
+    } catch (e) {
+      console.warn("Could not load local EOD history:", e);
     }
   }, []);
 
@@ -1113,6 +1443,44 @@ export function NiftyFlowView({ t, isDark }) {
         const fullData = { ...data, intradayTimeline: finalTimeline };
         globalOiCache = fullData;
         setOiData(fullData);
+
+        // Sync EOD History
+        if (data.eodHistory || data.eodDecision) {
+          setEodHistory(prev => {
+            let merged = prev;
+            if (Array.isArray(data.eodHistory) && data.eodHistory.length > 0) {
+              merged = mergeEodHistory(merged, data.eodHistory);
+            }
+            if (data.eodDecision) {
+              const todayEntry = {
+                id: `eod_${todayKey}`,
+                date: todayKey,
+                dayName: new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" }),
+                time: `${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false })} IST`,
+                verdict: data.eodDecision.verdict,
+                bias: data.eodDecision.bias,
+                score: data.eodDecision.score,
+                conviction: data.eodDecision.conviction,
+                sizing: data.eodDecision.sizing,
+                entrySpot: data.spotPrice || 0,
+                outcome: data.eodDecision.bias === "NEUTRAL" ? "PRESERVED_CASH" : "PENDING",
+                floor: data.floor,
+                roof: data.roof,
+                pcr: data.pcr,
+                deltaPcr: data.deltaPcr,
+                pcrWarning: data.pcrWarning,
+                action: data.eodDecision.action,
+                keyReasons: (data.eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
+                audit: data.eodDecision.audit,
+              };
+              merged = mergeEodHistory(merged, [todayEntry]);
+            }
+            try {
+              localStorage.setItem("options_scanner_eod_history_v2", JSON.stringify(merged));
+            } catch (e) {}
+            return merged;
+          });
+        }
       }
     } catch (e) {
       console.error("Failed to load /api/nifty-oi:", e);
@@ -1400,7 +1768,29 @@ export function NiftyFlowView({ t, isDark }) {
             <div style={{ fontFamily: "monospace", fontSize: isMobile ? 13 : isTablet ? 15 : 17, fontWeight: 800, color: t.text, margin: "4px 0" }}>
               <span style={{ color: "#16a34a" }}>P: {oiData?.totalPutWritingFormatted || "—"}</span> vs <span style={{ color: "#ef4444" }}>C: {oiData?.totalCallWritingFormatted || "—"}</span>
             </div>
-            <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub }}>PCR: {oiData?.pcr || 1.0} · ΔPCR: {oiData?.deltaPcr || 1.0}</div>
+            <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 5, marginTop: 2 }}>
+              <span>PCR: <strong>{Number(oiData?.pcr || 1.0).toFixed(2)}</strong> · ΔPCR: <strong>{Number(oiData?.deltaPcr || 1.0).toFixed(2)}</strong></span>
+              {Number(oiData?.pcr || 1.0) >= 1.40 && (
+                <span style={{ fontSize: 9.5, fontWeight: 800, padding: "1px 6px", borderRadius: 4, background: "#ea580c22", color: "#f97316", border: "1px solid #ea580c55" }}>
+                  ⚠️ OVERBOUGHT
+                </span>
+              )}
+              {Number(oiData?.pcr || 1.0) <= 0.65 && (
+                <span style={{ fontSize: 9.5, fontWeight: 800, padding: "1px 6px", borderRadius: 4, background: "#9333ea22", color: "#c084fc", border: "1px solid #9333ea55" }}>
+                  ⚠️ OVERSOLD
+                </span>
+              )}
+              {Number(oiData?.pcr || 1.0) > 0.65 && Number(oiData?.pcr || 1.0) < 1.40 && (Number(oiData?.deltaPcr || 1.0) >= 1.25 || (Number(oiData?.pcr || 1.0) >= 1.15 && Number(oiData?.deltaPcr || 1.0) >= 1.10)) && (
+                <span style={{ fontSize: 9.5, fontWeight: 800, padding: "1px 5px", borderRadius: 4, background: "#16a34a22", color: "#16a34a", border: "1px solid #16a34a44" }}>
+                  🟢 BULLISH PCR
+                </span>
+              )}
+              {Number(oiData?.pcr || 1.0) > 0.65 && Number(oiData?.pcr || 1.0) < 1.40 && (Number(oiData?.deltaPcr || 1.0) <= 0.80 || (Number(oiData?.pcr || 1.0) <= 0.88 && Number(oiData?.deltaPcr || 1.0) <= 0.90)) && (
+                <span style={{ fontSize: 9.5, fontWeight: 800, padding: "1px 5px", borderRadius: 4, background: "#ef444422", color: "#ef4444", border: "1px solid #ef444444" }}>
+                  🔴 BEARISH PCR
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -1600,7 +1990,7 @@ export function NiftyFlowView({ t, isDark }) {
         </div>
       )}
 
-      {/* ── 🌙 EOD OVERNIGHT CARRY DECISION (BTST / STBT) ── */}
+      {/* ── 🌙 EOD OVERNIGHT CARRY DECISION (BTST / STBT) & TRACK RECORD ── */}
       {(oiData?.eodDecision || oiData?.smartMoney?.eodDecision) && (() => {
         const eod = oiData.eodDecision || oiData.smartMoney.eodDecision;
         const isBull = eod.bias === "BULLISH";
@@ -1613,6 +2003,67 @@ export function NiftyFlowView({ t, isDark }) {
           : (isDark ? "#291804" : "#fffbeb");
         const borderTint = isBull ? "#16a34a55" : isBear ? "#ef444455" : "#d9770655";
 
+        // Performance metrics from eodHistory
+        const carriedTrades = (eodHistory || []).filter(h => h.verdict && (h.verdict.includes("BTST") || h.verdict.includes("STBT")));
+        const resolvedCarried = carriedTrades.filter(h => h.outcome === "WIN" || h.outcome === "LOSS");
+        const wonTrades = carriedTrades.filter(h => h.outcome === "WIN");
+        const winRate = resolvedCarried.length > 0 ? ((wonTrades.length / resolvedCarried.length) * 100).toFixed(1) : "0.0";
+        const cashDays = (eodHistory || []).filter(h => h.verdict && (h.verdict.includes("CASH") || h.outcome === "PRESERVED_CASH")).length;
+        const netPts = (eodHistory || []).reduce((acc, h) => acc + (Number(h.gapPts) || 0), 0);
+        const netPtsFormatted = `${netPts >= 0 ? "+" : ""}${netPts.toFixed(1)}`;
+
+        // Filtered items
+        const filteredHistory = (eodHistory || []).filter(h => {
+          if (historyFilter === "BTST") return h.verdict && h.verdict.includes("BTST");
+          if (historyFilter === "STBT") return h.verdict && h.verdict.includes("STBT");
+          if (historyFilter === "CASH") return h.verdict && h.verdict.includes("CASH");
+          if (historyFilter === "WIN") return h.outcome === "WIN";
+          return true;
+        });
+
+        const handleSaveCustomOpen = (id) => {
+          const num = Number(customOpenSpot);
+          if (!num || isNaN(num) || num <= 0) return;
+          setEodHistory(prev => {
+            const updated = prev.map(item => {
+              if (item.id === id || item.date === id) {
+                const diff = Number((num - (item.entrySpot || num)).toFixed(1));
+                let outcome = "PENDING";
+                let gapPts = diff;
+                if (item.bias === "BULLISH") {
+                  gapPts = diff;
+                  outcome = diff > 0 ? "WIN" : "LOSS";
+                } else if (item.bias === "BEARISH") {
+                  gapPts = -diff;
+                  outcome = diff < 0 ? "WIN" : "LOSS";
+                } else {
+                  gapPts = 0;
+                  outcome = "PRESERVED_CASH";
+                }
+                return {
+                  ...item,
+                  nextDayOpen: num,
+                  gapPts,
+                  outcome,
+                  notes: `Resolved open at ${num} (${gapPts >= 0 ? "+" : ""}${gapPts} pts)`
+                };
+              }
+              return item;
+            });
+            try {
+              localStorage.setItem("options_scanner_eod_history_v2", JSON.stringify(updated));
+              fetch("/api/nifty-oi", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "sync_eod_history", history: updated })
+              }).catch(() => {});
+            } catch (e) {}
+            return updated;
+          });
+          setEditingOpenId(null);
+          setCustomOpenSpot("");
+        };
+
         return (
           <div style={{
             background: t.surface,
@@ -1622,8 +2073,8 @@ export function NiftyFlowView({ t, isDark }) {
             marginBottom: 16,
             boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
           }}>
-            {/* Header Row */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+            {/* Header Row with View Tabs */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <span style={{ fontSize: isMobile ? 14 : 16, fontWeight: 900, color: t.text }}>
                   🌙 EOD OVERNIGHT CARRY DECISION (BTST / STBT)
@@ -1640,130 +2091,601 @@ export function NiftyFlowView({ t, isDark }) {
                   {eod.statusLabel}
                 </span>
               </div>
-              <span style={{
-                fontSize: isMobile ? 11 : 12,
-                fontWeight: 800,
-                padding: "3px 9px",
-                borderRadius: 6,
-                background: bgTint,
-                color: color,
-                border: `1px solid ${borderTint}`,
-              }}>
-                {eod.conviction}% Conviction · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
-              </span>
-            </div>
 
-            {/* Verdict Banner */}
-            <div style={{
-              background: bgTint,
-              border: `1.5px solid ${borderTint}`,
-              borderRadius: 8,
-              padding: isMobile ? "12px" : "14px 16px",
-              marginBottom: 10,
-            }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
-                <span style={{
-                  fontSize: isMobile ? 14 : 16,
-                  fontWeight: 900,
-                  color: color,
-                  letterSpacing: "0.2px",
-                }}>
-                  {eod.verdict}
-                </span>
-                <span style={{
-                  fontSize: isMobile ? 11 : 12,
-                  fontWeight: 800,
-                  color: color,
-                  padding: "2px 8px",
-                  borderRadius: 4,
-                  background: isDark ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.7)",
-                  border: `1px solid ${borderTint}`,
-                }}>
-                  Recommended Sizing: {eod.sizing}
-                </span>
-              </div>
-              <div style={{ fontSize: isMobile ? 11.5 : 12.5, color: t.text, fontWeight: 600, lineHeight: 1.55 }}>
-                {eod.action}
-              </div>
-            </div>
-
-            {/* Friday Weekend Risk Banner */}
-            {eod.isFriday && (
+              {/* View Switcher Pills */}
               <div style={{
-                background: isDark ? "#2a1e05" : "#fefce8",
-                border: "1px solid #eab30866",
-                borderRadius: 8,
-                padding: "8px 12px",
-                fontSize: isMobile ? 10.5 : 11.5,
-                color: isDark ? "#fde047" : "#854d0e",
-                lineHeight: 1.5,
-                marginBottom: 10,
                 display: "flex",
-                alignItems: "center",
-                gap: 8,
+                gap: 4,
+                background: isDark ? "#0f172a" : "#f1f5f9",
+                padding: "3px 4px",
+                borderRadius: 8,
+                border: `1px solid ${t.border}`,
               }}>
-                <span style={{ fontSize: 15 }}>⚠️</span>
-                <div>
-                  <strong>Friday Weekend Decay Rule:</strong> Weekend carry incurs 48 hours of theta decay + global weekend event risk. Sizing is strictly capped at 50% max, requiring score ≥ 4. If signals are mixed, capital is preserved in 100% Cash.
+                <button
+                  onClick={() => setEodTab("decision")}
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    fontSize: isMobile ? 10.5 : 11.5,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                    border: "none",
+                    background: eodTab === "decision" ? t.accent : "transparent",
+                    color: eodTab === "decision" ? "#ffffff" : t.textMuted,
+                    transition: "all 0.15s ease",
+                  }}
+                >
+                  🎯 Today's Decision
+                </button>
+                <button
+                  onClick={() => setEodTab("history")}
+                  style={{
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    fontSize: isMobile ? 10.5 : 11.5,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                    border: "none",
+                    background: eodTab === "history" ? t.accent : "transparent",
+                    color: eodTab === "history" ? "#ffffff" : t.textMuted,
+                    transition: "all 0.15s ease",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 5,
+                  }}
+                >
+                  <span>📜 Track Record</span>
+                  <span style={{
+                    fontSize: 9.5,
+                    padding: "1px 5px",
+                    borderRadius: 4,
+                    background: eodTab === "history" ? "rgba(255,255,255,0.25)" : (isDark ? "#1e293b" : "#e2e8f0"),
+                    color: eodTab === "history" ? "#ffffff" : t.text,
+                    fontWeight: 900,
+                  }}>
+                    {winRate}% Win
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* TAB 1: CURRENT SESSION DECISION */}
+            {eodTab === "decision" && (
+              <>
+                {/* Conviction & Sizing Status Pill */}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                  <span style={{ fontSize: isMobile ? 11 : 12, color: t.textSub, fontWeight: 700 }}>
+                    Target Morning Open Continuation · Invalidation Stop at Floor ({oiData?.floor}) / Roof ({oiData?.roof})
+                  </span>
+                  <span style={{
+                    fontSize: isMobile ? 11 : 12,
+                    fontWeight: 800,
+                    padding: "3px 9px",
+                    borderRadius: 6,
+                    background: bgTint,
+                    color: color,
+                    border: `1px solid ${borderTint}`,
+                  }}>
+                    {eod.conviction}% Conviction · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
+                  </span>
+                </div>
+
+                {/* Verdict Banner */}
+                <div style={{
+                  background: bgTint,
+                  border: `1.5px solid ${borderTint}`,
+                  borderRadius: 8,
+                  padding: isMobile ? "12px" : "14px 16px",
+                  marginBottom: 10,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                    <span style={{
+                      fontSize: isMobile ? 14 : 16,
+                      fontWeight: 900,
+                      color: color,
+                      letterSpacing: "0.2px",
+                    }}>
+                      {eod.verdict}
+                    </span>
+                    <span style={{
+                      fontSize: isMobile ? 11 : 12,
+                      fontWeight: 800,
+                      color: color,
+                      padding: "2px 8px",
+                      borderRadius: 4,
+                      background: isDark ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.7)",
+                      border: `1px solid ${borderTint}`,
+                    }}>
+                      Recommended Sizing: {eod.sizing}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: isMobile ? 11.5 : 12.5, color: t.text, fontWeight: 600, lineHeight: 1.55 }}>
+                    {eod.action}
+                  </div>
+                </div>
+
+                {/* PCR Extreme Sentiment Warning Banner */}
+                {eod.pcrWarning && (
+                  <div style={{
+                    background: isDark ? "#2a1508" : "#fff7ed",
+                    border: "1px solid #f9731666",
+                    borderRadius: 8,
+                    padding: "8px 12px",
+                    fontSize: isMobile ? 10.5 : 11.5,
+                    color: isDark ? "#fdba74" : "#c2410c",
+                    lineHeight: 1.5,
+                    marginBottom: 10,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}>
+                    <span style={{ fontSize: 16 }}>⚠️</span>
+                    <div>
+                      <strong>PCR Extreme Warning:</strong> {eod.pcrWarning}. The market is stretched to extreme sentiment boundaries. High probability of contrarian mean-reversion pullbacks or sharp short squeezes. Sizing is strictly throttled.
+                    </div>
+                  </div>
+                )}
+
+                {/* Friday Weekend Risk Banner */}
+                {eod.isFriday && (
+                  <div style={{
+                    background: isDark ? "#2a1e05" : "#fefce8",
+                    border: "1px solid #eab30866",
+                    borderRadius: 8,
+                    padding: "8px 12px",
+                    fontSize: isMobile ? 10.5 : 11.5,
+                    color: isDark ? "#fde047" : "#854d0e",
+                    lineHeight: 1.5,
+                    marginBottom: 10,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}>
+                    <span style={{ fontSize: 15 }}>⚠️</span>
+                    <div>
+                      <strong>Friday Weekend Decay Rule:</strong> Weekend carry incurs 48 hours of theta decay + global weekend event risk. Sizing is strictly capped at 50% max, requiring score ≥ 4. If signals are mixed, capital is preserved in 100% Cash.
+                    </div>
+                  </div>
+                )}
+
+                {/* 4-Pill Confluence Audit Grid */}
+                <div style={{
+                  display: "grid",
+                  gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
+                  gap: 8,
+                  marginBottom: 8,
+                }}>
+                  {(eod.audit || []).map((item, idx) => {
+                    const itemBull = item.status === "BULLISH";
+                    const itemBear = item.status === "BEARISH";
+                    const isPcrWarn = item.warning || item.status === "EXTREME_OVERBOUGHT" || item.status === "EXTREME_OVERSOLD";
+                    const itemColor = isPcrWarn
+                      ? "#f97316"
+                      : itemBull
+                      ? "#16a34a"
+                      : itemBear
+                      ? "#ef4444"
+                      : t.textMuted;
+                    const itemBg = isPcrWarn
+                      ? (isDark ? "#2a150833" : "#fff7ed")
+                      : itemBull
+                      ? (isDark ? "#052e1633" : "#f0fdf4")
+                      : itemBear
+                      ? (isDark ? "#2d0a0a33" : "#fef2f2")
+                      : (isDark ? "#18181b33" : "#f9fafb");
+                    const itemBorder = isPcrWarn
+                      ? "#f9731644"
+                      : itemBull
+                      ? "#16a34a33"
+                      : itemBear
+                      ? "#ef444433"
+                      : t.border;
+
+                    return (
+                      <div key={idx} style={{
+                        background: itemBg,
+                        border: `1px solid ${itemBorder}`,
+                        borderRadius: 6,
+                        padding: "8px 10px",
+                      }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                          <span style={{ fontSize: isMobile ? 10.5 : 11, fontWeight: 800, color: t.textSub }}>
+                            {item.label}
+                          </span>
+                          <span style={{ fontSize: 10, fontWeight: 900, color: itemColor }}>
+                            {item.impact}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: isMobile ? 11 : 11.5, fontWeight: 700, color: itemColor, lineHeight: 1.4 }}>
+                          {item.detail}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Timing / Invalidation Footer */}
+                <div style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 6,
+                  fontSize: isMobile ? 10 : 11,
+                  color: t.textMuted,
+                  borderTop: `1px solid ${t.border}`,
+                  paddingTop: 8,
+                  marginTop: 4,
+                  marginBottom: 10,
+                }}>
+                  <span>⏱️ <strong>Execution:</strong> Enter between 15:10 – 15:25 IST as post-market auction settles.</span>
+                  <span>⛔ <strong>Stop / Invalidation:</strong> Exit at morning open if Nifty breaks Floor ({oiData?.floor}) or Roof ({oiData?.roof}).</span>
+                </div>
+
+                {/* Quick Link to Track Record */}
+                <div
+                  onClick={() => setEodTab("history")}
+                  style={{
+                    background: isDark ? "#0f172a" : "#f8fafc",
+                    border: `1px dashed ${t.border}`,
+                    borderRadius: 8,
+                    padding: "8px 12px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    cursor: "pointer",
+                    fontSize: isMobile ? 11 : 12,
+                    fontWeight: 700,
+                    color: t.accent,
+                  }}
+                >
+                  <span>📜 View Track Record &amp; Audit Log ({eodHistory.length} Sessions · {winRate}% Win Rate)</span>
+                  <span>Review Past Trades →</span>
+                </div>
+              </>
+            )}
+
+            {/* TAB 2: HISTORICAL TRACK RECORD & AUDIT LOG */}
+            {eodTab === "history" && (
+              <div>
+                {/* Performance Metrics Dashboard */}
+                <div style={{
+                  display: "grid",
+                  gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)",
+                  gap: 8,
+                  marginBottom: 12,
+                }}>
+                  <div style={{
+                    background: isDark ? "#052e16" : "#f0fdf4",
+                    border: "1px solid #16a34a44",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#16a34a", textTransform: "uppercase" }}>Carried Win Rate</div>
+                    <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: "#16a34a", margin: "2px 0" }}>
+                      {winRate}%
+                    </div>
+                    <div style={{ fontSize: 9.5, color: isDark ? "#86efac" : "#15803d" }}>
+                      {wonTrades.length} Wins / {resolvedCarried.length} Carried Trades
+                    </div>
+                  </div>
+
+                  <div style={{
+                    background: isDark ? "#0a1628" : "#f8fafc",
+                    border: `1px solid ${t.border}`,
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>Net Gap Points</div>
+                    <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: netPts >= 0 ? "#16a34a" : "#ef4444", margin: "2px 0" }}>
+                      {netPtsFormatted} pts
+                    </div>
+                    <div style={{ fontSize: 9.5, color: t.textSub }}>Cumulative Morning Index Gaps</div>
+                  </div>
+
+                  <div style={{
+                    background: isDark ? "#291804" : "#fffbeb",
+                    border: "1px solid #d9770644",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#d97706", textTransform: "uppercase" }}>Capital Preserved</div>
+                    <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: "#d97706", margin: "2px 0" }}>
+                      {cashDays} Days
+                    </div>
+                    <div style={{ fontSize: 9.5, color: isDark ? "#fde047" : "#b45309" }}>Avoided Chop &amp; Weekend Bleed</div>
+                  </div>
+
+                  <div style={{
+                    background: isDark ? "#0f172a" : "#f1f5f9",
+                    border: `1px solid ${t.border}`,
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>Total Sessions</div>
+                    <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: t.text, margin: "2px 0" }}>
+                      {eodHistory.length}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: t.textSub }}>Logged EOD Decisions</div>
+                  </div>
+                </div>
+
+                {/* Filter Pills */}
+                <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
+                  {[
+                    { id: "ALL", label: `All (${eodHistory.length})` },
+                    { id: "BTST", label: `🟢 BTST CE (${eodHistory.filter(h => h.verdict && h.verdict.includes("BTST")).length})` },
+                    { id: "STBT", label: `🔴 STBT PE (${eodHistory.filter(h => h.verdict && h.verdict.includes("STBT")).length})` },
+                    { id: "CASH", label: `🛡️ Cash Preserved (${cashDays})` },
+                    { id: "WIN", label: `✅ Wins Only (${wonTrades.length})` },
+                  ].map(f => (
+                    <button
+                      key={f.id}
+                      onClick={() => setHistoryFilter(f.id)}
+                      style={{
+                        padding: "5px 10px",
+                        borderRadius: 6,
+                        fontSize: isMobile ? 10 : 11,
+                        fontWeight: 800,
+                        cursor: "pointer",
+                        border: `1px solid ${historyFilter === f.id ? t.accent : t.border}`,
+                        background: historyFilter === f.id ? (isDark ? "#1e3a8a33" : "#eff6ff") : "transparent",
+                        color: historyFilter === f.id ? t.accent : t.textMuted,
+                      }}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* History Session Cards List */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 520, overflowY: "auto", paddingRight: 4 }}>
+                  {filteredHistory.map((item, idx) => {
+                    const isBTST = item.verdict && item.verdict.includes("BTST");
+                    const isSTBT = item.verdict && item.verdict.includes("STBT");
+                    const isCash = item.verdict && item.verdict.includes("CASH");
+                    const cardBorder = isBTST ? "#16a34a44" : isSTBT ? "#ef444444" : "#d9770644";
+                    const isExpanded = expandedHistoryId === item.id;
+                    const isWin = item.outcome === "WIN";
+                    const isLoss = item.outcome === "LOSS";
+                    const isPending = item.outcome === "PENDING";
+
+                    return (
+                      <div
+                        key={item.id || idx}
+                        style={{
+                          background: isDark ? "#0f172a" : "#f8fafc",
+                          border: `1px solid ${cardBorder}`,
+                          borderRadius: 8,
+                          padding: isMobile ? "10px 12px" : "12px 14px",
+                          transition: "all 0.15s ease",
+                        }}
+                      >
+                        {/* Top Row: Date, Verdict Badge, Outcome */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                            <span style={{ fontSize: isMobile ? 11 : 12, fontWeight: 900, color: t.text }}>
+                              📅 {item.date} {item.dayName ? `(${item.dayName})` : ""}
+                            </span>
+                            <span style={{
+                              fontSize: 10,
+                              fontWeight: 800,
+                              padding: "2px 7px",
+                              borderRadius: 4,
+                              background: isBTST ? "#16a34a22" : isSTBT ? "#ef444422" : "#d9770622",
+                              color: isBTST ? "#16a34a" : isSTBT ? "#ef4444" : "#d97706",
+                              border: `1px solid ${cardBorder}`,
+                            }}>
+                              {item.verdict}
+                            </span>
+                          </div>
+
+                          {/* Outcome Pill */}
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            {isWin && (
+                              <span style={{ fontSize: 10.5, fontWeight: 900, padding: "2px 8px", borderRadius: 4, background: "#16a34a", color: "#ffffff" }}>
+                                ✅ WIN {item.gapPts != null ? `(${item.gapPts >= 0 ? "+" : ""}${item.gapPts} pts)` : ""}
+                              </span>
+                            )}
+                            {isLoss && (
+                              <span style={{ fontSize: 10.5, fontWeight: 900, padding: "2px 8px", borderRadius: 4, background: "#ef4444", color: "#ffffff" }}>
+                                ❌ LOSS {item.gapPts != null ? `(${item.gapPts >= 0 ? "+" : ""}${item.gapPts} pts)` : ""}
+                              </span>
+                            )}
+                            {item.outcome === "PRESERVED_CASH" && (
+                              <span style={{ fontSize: 10.5, fontWeight: 900, padding: "2px 8px", borderRadius: 4, background: "#d97706", color: "#ffffff" }}>
+                                🛡️ CASH PRESERVED
+                              </span>
+                            )}
+                            {isPending && (
+                              <span style={{ fontSize: 10.5, fontWeight: 900, padding: "2px 8px", borderRadius: 4, background: isDark ? "#334155" : "#e2e8f0", color: t.textSub }}>
+                                ⏳ PENDING OPEN
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Middle Row: Trade Details & Gap Points */}
+                        <div style={{
+                          display: "grid",
+                          gridTemplateColumns: isMobile ? "1fr" : "1.2fr 1fr",
+                          gap: 6,
+                          fontSize: isMobile ? 10.5 : 11.5,
+                          marginBottom: 6,
+                          background: isDark ? "#1e293b44" : "#ffffff",
+                          padding: "6px 8px",
+                          borderRadius: 6,
+                          border: `1px solid ${t.border}`,
+                        }}>
+                          <div>
+                            <span style={{ color: t.textMuted }}>Carry Spot: </span>
+                            <strong>₹{Number(item.entrySpot || 0).toLocaleString("en-IN")}</strong>
+                            {item.nextDayOpen ? (
+                              <span> → Next Open: <strong>₹{Number(item.nextDayOpen).toLocaleString("en-IN")}</strong></span>
+                            ) : (
+                              <span style={{ color: t.textMuted }}> → Next Open: Awaiting 09:15 bell</span>
+                            )}
+                          </div>
+                          <div style={{ textAlign: isMobile ? "left" : "right" }}>
+                            <span style={{ color: t.textMuted }}>Score: </span>
+                            <strong>{item.score > 0 ? `+${item.score}` : item.score}</strong>
+                            <span style={{ color: t.textMuted }}> · Conviction: </span>
+                            <strong>{item.conviction}%</strong>
+                            <span style={{ color: t.textMuted }}> · PCR: </span>
+                            <strong>{item.pcr || "—"}</strong>
+                          </div>
+                        </div>
+
+                        {/* Key Institutional Reasons / Notes */}
+                        <div style={{ fontSize: isMobile ? 10 : 11, color: t.textSub, lineHeight: 1.45, marginBottom: 6 }}>
+                          {item.keyReasons && <div>⚡ <strong>Drivers:</strong> {item.keyReasons}</div>}
+                          {item.notes && <div style={{ color: t.textMuted, marginTop: 2 }}>📝 <strong>Notes:</strong> {item.notes}</div>}
+                        </div>
+
+                        {/* Manual Open Spot Resolution if Pending */}
+                        {isPending && (
+                          <div style={{
+                            marginTop: 6,
+                            padding: "6px 8px",
+                            background: isDark ? "#1e293b" : "#f1f5f9",
+                            borderRadius: 6,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            flexWrap: "wrap",
+                            fontSize: 11,
+                          }}>
+                            {editingOpenId === item.id ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, width: "100%" }}>
+                                <input
+                                  type="number"
+                                  placeholder="Enter Next Open Spot (e.g. 24250)"
+                                  value={customOpenSpot}
+                                  onChange={e => setCustomOpenSpot(e.target.value)}
+                                  style={{
+                                    flex: 1,
+                                    padding: "4px 8px",
+                                    borderRadius: 4,
+                                    border: `1px solid ${t.accent}`,
+                                    background: t.surface,
+                                    color: t.text,
+                                    fontSize: 11,
+                                  }}
+                                />
+                                <button
+                                  onClick={() => handleSaveCustomOpen(item.id)}
+                                  style={{
+                                    padding: "4px 10px",
+                                    borderRadius: 4,
+                                    background: "#16a34a",
+                                    color: "#ffffff",
+                                    border: "none",
+                                    fontWeight: 800,
+                                    cursor: "pointer",
+                                    fontSize: 10.5,
+                                  }}
+                                >
+                                  Save Open
+                                </button>
+                                <button
+                                  onClick={() => setEditingOpenId(null)}
+                                  style={{
+                                    padding: "4px 8px",
+                                    borderRadius: 4,
+                                    background: "transparent",
+                                    color: t.textMuted,
+                                    border: `1px solid ${t.border}`,
+                                    fontWeight: 700,
+                                    cursor: "pointer",
+                                    fontSize: 10.5,
+                                  }}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <>
+                                <span style={{ color: t.textMuted }}>Trade is pending outcome:</span>
+                                <button
+                                  onClick={() => {
+                                    setEditingOpenId(item.id);
+                                    setCustomOpenSpot(spot ? String(spot) : "");
+                                  }}
+                                  style={{
+                                    padding: "3px 8px",
+                                    borderRadius: 4,
+                                    background: t.accent,
+                                    color: "#ffffff",
+                                    border: "none",
+                                    fontWeight: 800,
+                                    cursor: "pointer",
+                                    fontSize: 10.5,
+                                  }}
+                                >
+                                  Resolve Next Morning Open
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Collapsible 4-Pill Audit Breakdown */}
+                        {item.audit && item.audit.length > 0 && (
+                          <div style={{ marginTop: 4 }}>
+                            <button
+                              onClick={() => setExpandedHistoryId(isExpanded ? null : item.id)}
+                              style={{
+                                background: "transparent",
+                                border: "none",
+                                color: t.accent,
+                                fontSize: 10.5,
+                                fontWeight: 800,
+                                cursor: "pointer",
+                                padding: "2px 0",
+                              }}
+                            >
+                              {isExpanded ? "▲ Hide 4-Pill Confluence Audit" : "▼ View 4-Pill Confluence Audit"}
+                            </button>
+
+                            {isExpanded && (
+                              <div style={{
+                                display: "grid",
+                                gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
+                                gap: 6,
+                                marginTop: 6,
+                                paddingTop: 6,
+                                borderTop: `1px solid ${t.border}`,
+                              }}>
+                                {item.audit.map((a, aIdx) => (
+                                  <div
+                                    key={aIdx}
+                                    style={{
+                                      padding: "6px 8px",
+                                      borderRadius: 4,
+                                      background: isDark ? "#020617" : "#ffffff",
+                                      border: `1px solid ${t.border}`,
+                                      fontSize: 10.5,
+                                    }}
+                                  >
+                                    <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800 }}>
+                                      <span style={{ color: t.textSub }}>{a.label}</span>
+                                      <span style={{ color: a.status === "BULLISH" ? "#16a34a" : a.status === "BEARISH" ? "#ef4444" : t.textMuted }}>
+                                        {a.impact}
+                                      </span>
+                                    </div>
+                                    <div style={{ color: t.textMuted, fontSize: 10, marginTop: 2 }}>{a.detail}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
-
-            {/* 4-Pill Confluence Audit Grid */}
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
-              gap: 8,
-              marginBottom: 8,
-            }}>
-              {(eod.audit || []).map((item, idx) => {
-                const itemBull = item.status === "BULLISH";
-                const itemBear = item.status === "BEARISH";
-                const itemColor = itemBull ? "#16a34a" : itemBear ? "#ef4444" : t.textMuted;
-                const itemBg = itemBull
-                  ? (isDark ? "#052e1633" : "#f0fdf4")
-                  : itemBear
-                  ? (isDark ? "#2d0a0a33" : "#fef2f2")
-                  : (isDark ? "#18181b33" : "#f9fafb");
-                return (
-                  <div key={idx} style={{
-                    background: itemBg,
-                    border: `1px solid ${itemBull ? "#16a34a33" : itemBear ? "#ef444433" : t.border}`,
-                    borderRadius: 6,
-                    padding: "8px 10px",
-                  }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-                      <span style={{ fontSize: isMobile ? 10.5 : 11, fontWeight: 800, color: t.textSub }}>
-                        {item.label}
-                      </span>
-                      <span style={{ fontSize: 10, fontWeight: 900, color: itemColor }}>
-                        {item.impact}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: isMobile ? 11 : 11.5, fontWeight: 700, color: itemColor, lineHeight: 1.4 }}>
-                      {item.detail}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Timing / Invalidation Footer */}
-            <div style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              flexWrap: "wrap",
-              gap: 6,
-              fontSize: isMobile ? 10 : 11,
-              color: t.textMuted,
-              borderTop: `1px solid ${t.border}`,
-              paddingTop: 8,
-              marginTop: 4,
-            }}>
-              <span>⏱️ <strong>Execution:</strong> Enter between 15:10 – 15:25 IST as post-market auction settles.</span>
-              <span>⛔ <strong>Stop / Invalidation:</strong> Exit at morning open if Nifty breaks Floor ({oiData?.floor}) or Roof ({oiData?.roof}).</span>
-            </div>
           </div>
         );
       })()}

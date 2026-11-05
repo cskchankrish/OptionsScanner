@@ -826,7 +826,10 @@ function ScoringGuide({ t, isDark }) {
               <strong>2. Closing Hour Flow 14:15–15:25 IST (±2 pts):</strong> Proprietary desks execute overnight positioning in the final 75 minutes. Net Put writing delta surge &gt;+20k lots (+2) indicates BTST accumulation; Call writing surge &gt;+20k lots (-2) indicates STBT distribution.
             </div>
             <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
-              <strong>3. PCR &amp; ΔPCR Confluence (±1 pt):</strong> Closing PCR ≥ 1.20 with ΔPCR ≥ 1.30 confirms bullish positioning (+1). PCR ≤ 0.85 with ΔPCR ≤ 0.75 confirms bearish pressure (-1).
+              <strong>3. PCR &amp; ΔPCR Confluence (±1 pt) + Extreme Guardrails:</strong> Bullish expansion (+1 pt) triggers when intraday ΔPCR ≥ 1.25 with PCR ≥ 0.98 or call unwinding. Bearish compression (-1 pt) triggers when ΔPCR ≤ 0.80 with PCR ≤ 1.02.
+              <div style={{ marginTop:4, color:isDark ? "#fdba74" : "#c2410c", fontWeight:600 }}>
+                ⚠️ <strong>Extreme Boundary Warning (0 pts):</strong> PCR ≥ 1.40 (Extreme Overbought — Contrarian mean reversion / trap risk) or PCR ≤ 0.65 (Deeply Oversold — Short covering bounce risk). Neutralizes points and flags high-risk warning to protect against chasing extreme sentiment tops/bottoms.
+              </div>
             </div>
             <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
               <strong>4. Spot Price vs Floor / Roof (±1 pt):</strong> Spot holding comfortably above the Floor (+1) protects longs. Spot pinned under Roof (-1) or testing breakdown (-1) penalizes longs.
