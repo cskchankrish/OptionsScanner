@@ -1764,12 +1764,17 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
 
           <div style={{ background: isDark ? "#0a1628" : "#f8fafc", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: `1px solid ${t.border}` }}>
-            <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Put vs Call Writing</div>
+            <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, textTransform: "uppercase", fontWeight: 700 }}>Intraday Writing (ΔOI)</div>
             <div style={{ fontFamily: "monospace", fontSize: isMobile ? 13 : isTablet ? 15 : 17, fontWeight: 800, color: t.text, margin: "4px 0" }}>
-              <span style={{ color: "#16a34a" }}>P: {oiData?.totalPutWritingFormatted || "—"}</span> vs <span style={{ color: "#ef4444" }}>C: {oiData?.totalCallWritingFormatted || "—"}</span>
+              <span style={{ color: "#16a34a" }}>Put: {oiData?.totalPutWritingFormatted || "—"}</span> vs <span style={{ color: "#ef4444" }}>Call: {oiData?.totalCallWritingFormatted || "—"}</span>
             </div>
             <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 5, marginTop: 2 }}>
-              <span>PCR: <strong>{Number(oiData?.pcr || 1.0).toFixed(2)}</strong> · ΔPCR: <strong>{Number(oiData?.deltaPcr || 1.0).toFixed(2)}</strong></span>
+              <span>Cum. PCR: <strong>{Number(oiData?.pcr || 1.0).toFixed(2)}</strong> · Day ΔPCR: <strong>{Number(oiData?.deltaPcr || 1.0).toFixed(2)}</strong></span>
+              {oiData?.nearPcr && Number(oiData.nearPcr) !== Number(oiData.pcr) && (
+                <span style={{ fontSize: 9, color: t.textMuted }} title="Near-money strike slice (+/- 550 pts)">
+                  (Near: {Number(oiData.nearPcr).toFixed(2)})
+                </span>
+              )}
               {Number(oiData?.pcr || 1.0) >= 1.40 && (
                 <span style={{ fontSize: 9.5, fontWeight: 800, padding: "1px 6px", borderRadius: 4, background: "#ea580c22", color: "#f97316", border: "1px solid #ea580c55" }}>
                   ⚠️ OVERBOUGHT

@@ -1236,7 +1236,25 @@ export default async function handler(req, res) {
       previousState.roof = roofStrike;
     }
 
-    const pcr = totCallOI > 0 ? Number((totPutOI / totCallOI).toFixed(2)) : 1.0;
+    // Compute True Full Expiry Cumulative Open Interest across ALL strikes in option chain
+    let fullExpiryPutOI = Number(v3Data.filtered?.PE?.totOI) || 0;
+    let fullExpiryCallOI = Number(v3Data.filtered?.CE?.totOI) || 0;
+
+    if (!fullExpiryPutOI || !fullExpiryCallOI) {
+      fullExpiryPutOI = 0;
+      fullExpiryCallOI = 0;
+      for (const r of records) {
+        fullExpiryPutOI += Number(r.PE?.openInterest) || 0;
+        fullExpiryCallOI += Number(r.CE?.openInterest) || 0;
+      }
+    }
+
+    // True Total Cumulative PCR across entire active expiry
+    const pcr = fullExpiryCallOI > 0 ? Number((fullExpiryPutOI / fullExpiryCallOI).toFixed(2)) : 1.0;
+
+    // Near-strike truncated PCR (+/- 550 strikes from spot)
+    const nearPcr = totCallOI > 0 ? Number((totPutOI / totCallOI).toFixed(2)) : 1.0;
+
     const deltaPcr = calculateDeltaPcr(totPutWriting, totCallWriting);
 
     const timeline = buildTimeline(totPutWriting, totCallWriting, spot);
@@ -1290,7 +1308,10 @@ export default async function handler(req, res) {
       balanceStatus,
       recommendation,
       pcr,
+      nearPcr,
       deltaPcr,
+      totalPutOI: fullExpiryPutOI,
+      totalCallOI: fullExpiryCallOI,
       pcrWarning: eodDecision.pcrWarning,
       strikes,
       smartMoney,
