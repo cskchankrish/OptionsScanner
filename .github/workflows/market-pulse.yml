@@ -1,0 +1,16 @@
+name: Market Hours OI Pulse
+
+on:
+  schedule:
+    # Run every 5 minutes between 03:45 and 10:15 UTC (09:15 - 15:45 IST) Monday to Friday
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  ping-nifty-oi:
+    name: Ping Nifty OI API & Record Timeline Tick
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit Nifty OI Endpoint
+        run: |
+          curl -s -m 12 "https://options-scanner-seven.vercel.app/api/nifty-oi" > /dev/null || true

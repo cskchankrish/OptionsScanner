@@ -281,13 +281,17 @@ function buildTimeline(totPut, totCall, spot) {
   }
 
   const capMins = Math.min(940, nowMins); // Extended to 15:40 to capture full Futures & post-closing reconciliation
+  const tickTime = nowMins >= 940 ? "15:40" : nowStr;
+
+  // Filter out any invalid post-market ticks that may have been previously appended
+  intradayHistory = intradayHistory.filter(pt => pt && pt.minutes <= 940 && pt.time <= "15:40");
 
   // Append or update latest live tick (1-min granularity) strictly with REAL exchange data
   const last = intradayHistory[intradayHistory.length - 1];
   let didUpdate = false;
-  if (!last || last.minutes < capMins || last.time !== nowStr) {
+  if (!last || (last.minutes < capMins && last.time !== tickTime)) {
     intradayHistory.push({
-      time: nowStr,
+      time: tickTime,
       minutes: capMins,
       putWriting: totPut,
       callWriting: totCall,
@@ -301,7 +305,7 @@ function buildTimeline(totPut, totCall, spot) {
     last.callWriting = totCall;
     last.netDiff = totPut - totCall;
     last.spot = spot;
-    last.time = nowStr;
+    last.time = tickTime;
     last.isLiveTick = true;
     didUpdate = true;
   }
@@ -932,14 +936,20 @@ export default async function handler(req, res) {
       }
       const incoming = body?.timeline;
       if (Array.isArray(incoming) && incoming.length > 0) {
-        const map = new Map();
-        for (const pt of intradayHistory) {
-          if (pt && pt.time) map.set(pt.time, pt);
+        if (body?.replaceTimeline) {
+          intradayHistory = incoming
+            .filter(pt => pt && pt.minutes <= 940 && pt.time <= "15:40")
+            .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+        } else {
+          const map = new Map();
+          for (const pt of intradayHistory) {
+            if (pt && pt.time && pt.minutes <= 940 && pt.time <= "15:40") map.set(pt.time, pt);
+          }
+          for (const pt of incoming) {
+            if (pt && pt.time && pt.minutes <= 940 && pt.time <= "15:40") map.set(pt.time, pt);
+          }
+          intradayHistory = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         }
-        for (const pt of incoming) {
-          if (pt && pt.time) map.set(pt.time, pt);
-        }
-        intradayHistory = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         if (REDIS_URL) {
           await setRedisTimeline(today, intradayHistory);
         }
@@ -967,10 +977,10 @@ export default async function handler(req, res) {
       "Referer": "https://www.nseindia.com/option-chain",
     };
 
-    // 1. Session warmup with 3.5s timeout
+    // 1. Session warmup with 6.5s timeout (resilient against busy closing NSE traffic)
     const warmup = await fetch("https://www.nseindia.com/option-chain", {
       headers,
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(6500),
     });
     const rawCookies = warmup.headers.get("set-cookie") || "";
     const cookieHeader = rawCookies
@@ -983,20 +993,20 @@ export default async function handler(req, res) {
       Cookie: cookieHeader,
     };
 
-    // 2. Fetch contract info to identify current expiry with 3.5s timeout
+    // 2. Fetch contract info to identify current expiry with 6.5s timeout
     const contractRes = await fetch("https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY", {
       headers: sessionHeaders,
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(6500),
     });
     if (!contractRes.ok) throw new Error(`contract-info status ${contractRes.status}`);
     const contractData = await contractRes.json();
     const expiry = contractData.expiryDates?.[0] || "";
 
-    // 3. Fetch v3 option chain with 3.5s timeout
+    // 3. Fetch v3 option chain with 6.5s timeout
     const v3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(expiry)}`;
     const v3Res = await fetch(v3Url, {
       headers: sessionHeaders,
-      signal: AbortSignal.timeout(3500),
+      signal: AbortSignal.timeout(6500),
     });
     if (!v3Res.ok) throw new Error(`v3 status ${v3Res.status}`);
     const v3Data = await v3Res.json();

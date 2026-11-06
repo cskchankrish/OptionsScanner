@@ -1008,19 +1008,19 @@ function getTodayDateKey() {
 }
 
 function mergeTimelineArrays(localArr = [], serverArr = []) {
-  if (!Array.isArray(localArr) || localArr.length === 0) return serverArr || [];
-  if (!Array.isArray(serverArr) || serverArr.length === 0) return localArr || [];
-
   const map = new Map();
-  for (const item of localArr) {
-    if (item && item.time) map.set(item.time, item);
+  for (const item of (Array.isArray(localArr) ? localArr : [])) {
+    if (item && item.time && (item.minutes || 0) <= 940 && item.time <= "15:40") {
+      map.set(item.time, item);
+    }
   }
-  for (const item of serverArr) {
-    if (item && item.time) map.set(item.time, item);
+  for (const item of (Array.isArray(serverArr) ? serverArr : [])) {
+    if (item && item.time && (item.minutes || 0) <= 940 && item.time <= "15:40") {
+      map.set(item.time, item);
+    }
   }
 
-  const merged = Array.from(map.values());
-  merged.sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+  const merged = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
   return merged;
 }
 
