@@ -220,6 +220,10 @@ async function setRedisTimeline(dateKey, timelineArray) {
 }
 
 async function syncRedisHistory(today) {
+  if (sessionDate !== today) {
+    intradayHistory = [];
+    sessionDate = today;
+  }
   if (REDIS_URL && (!intradayHistory || intradayHistory.length === 0)) {
     const remote = await getRedisTimeline(today);
     if (Array.isArray(remote) && remote.length > 0) {
