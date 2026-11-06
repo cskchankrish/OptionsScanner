@@ -26,7 +26,7 @@ export const DEFAULT_EOD_SEED_HISTORY = CANONICAL_EOD_SEED_HISTORY;
 export async function getRedisEodHistory() {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   try {
-    const res = await fetch(`${REDIS_URL}/get/nifty_eod_history_v2`, {
+    const res = await fetch(`${REDIS_URL}/get/nifty_eod_history_v3`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
       signal: AbortSignal.timeout(2500),
     });
@@ -43,7 +43,7 @@ export async function getRedisEodHistory() {
 export async function saveRedisEodHistory(historyArray) {
   if (!REDIS_URL || !REDIS_TOKEN || !Array.isArray(historyArray)) return false;
   try {
-    const res = await fetch(`${REDIS_URL}/set/nifty_eod_history_v2?ex=7776000`, { // 90 days retention
+    const res = await fetch(`${REDIS_URL}/set/nifty_eod_history_v3?ex=7776000`, { // 90 days retention
       method: "POST",
       headers: {
         Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -1038,6 +1038,7 @@ export default async function handler(req, res) {
         if (REDIS_URL) {
           await saveRedisEodHistory(body.history);
         }
+        cache = { data: null, timestamp: 0 };
         return res.status(200).json({ success: true, count: body.history.length });
       }
       const incoming = body?.timeline;
