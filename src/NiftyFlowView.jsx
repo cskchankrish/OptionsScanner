@@ -1020,8 +1020,39 @@ function mergeTimelineArrays(localArr = [], serverArr = []) {
     }
   }
 
-  const merged = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
-  return merged;
+  const raw = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+  if (raw.length <= 1) return raw;
+
+  // Bridge any intraday gaps (e.g. if phone slept or browser backgrounded between 15:11 and 15:40)
+  const bridged = [];
+  for (let i = 0; i < raw.length; i++) {
+    const cur = raw[i];
+    bridged.push(cur);
+    const next = raw[i + 1];
+    if (next && next.minutes - cur.minutes > 2 && next.minutes <= 940) {
+      const gapSteps = next.minutes - cur.minutes;
+      for (let m = cur.minutes + 1; m < next.minutes; m++) {
+        const fraction = (m - cur.minutes) / gapSteps;
+        const h = Math.floor(m / 60);
+        const min = m % 60;
+        const timeStr = String(h).padStart(2, "0") + ":" + String(min).padStart(2, "0");
+        const put = Math.round(cur.putWriting + fraction * (next.putWriting - cur.putWriting));
+        const call = Math.round(cur.callWriting + fraction * (next.callWriting - cur.callWriting));
+        const spot = Number(((cur.spot || 25000) + fraction * ((next.spot || 25000) - (cur.spot || 25000))).toFixed(2));
+        bridged.push({
+          time: timeStr,
+          minutes: m,
+          putWriting: put,
+          callWriting: call,
+          netDiff: put - call,
+          spot: spot,
+          isLiveTick: false,
+        });
+      }
+    }
+  }
+
+  return bridged;
 }
 
 export function NiftyFlowView({ t, isDark }) {
