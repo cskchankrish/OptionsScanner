@@ -1177,6 +1177,8 @@ export function NiftyFlowView({ t, isDark }) {
                 deltaPcr: data.deltaPcr,
                 pcrWarning: data.pcrWarning,
                 action: data.eodDecision.action,
+                stopLoss: data.eodDecision.stopLoss,
+                target: data.eodDecision.target,
                 keyReasons: (data.eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
                 audit: data.eodDecision.audit,
               };
@@ -1907,17 +1909,45 @@ export function NiftyFlowView({ t, isDark }) {
                     }}>
                       {eod.verdict}
                     </span>
-                    <span style={{
-                      fontSize: isMobile ? 11 : 12,
-                      fontWeight: 800,
-                      color: color,
-                      padding: "2px 8px",
-                      borderRadius: 4,
-                      background: isDark ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.7)",
-                      border: `1px solid ${borderTint}`,
-                    }}>
-                      Recommended Sizing: {eod.sizing}
-                    </span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      {eod.stopLoss && (
+                        <span style={{
+                          fontSize: isMobile ? 10.5 : 11.5,
+                          fontWeight: 800,
+                          color: "#ef4444",
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          background: isDark ? "rgba(239,68,68,0.18)" : "#fee2e2",
+                          border: "1px solid #ef444466",
+                        }}>
+                          🛑 Strict SL: {eod.stopLoss}
+                        </span>
+                      )}
+                      {eod.target && (
+                        <span style={{
+                          fontSize: isMobile ? 10.5 : 11.5,
+                          fontWeight: 800,
+                          color: "#16a34a",
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          background: isDark ? "rgba(22,163,74,0.18)" : "#dcfce7",
+                          border: "1px solid #16a34a66",
+                        }}>
+                          🎯 Target: {eod.target}
+                        </span>
+                      )}
+                      <span style={{
+                        fontSize: isMobile ? 11 : 12,
+                        fontWeight: 800,
+                        color: color,
+                        padding: "2px 8px",
+                        borderRadius: 4,
+                        background: isDark ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.7)",
+                        border: `1px solid ${borderTint}`,
+                      }}>
+                        Recommended Sizing: {eod.sizing}
+                      </span>
+                    </div>
                   </div>
                   <div style={{ fontSize: isMobile ? 11.5 : 12.5, color: t.text, fontWeight: 600, lineHeight: 1.55 }}>
                     {eod.action}

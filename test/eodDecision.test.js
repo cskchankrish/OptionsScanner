@@ -208,6 +208,13 @@ test("calculateEODDecision triggers LATE CALL BLITZ VETO and blocks BTST when sm
   assert.ok(vetoAudit, "Audit must include 14:15+ Veto Guardrail");
   assert.equal(vetoAudit.status, "BEARISH_VETO");
   assert.ok(result.action.includes("LATE CALL BLITZ VETO"));
+  assert.ok(!result.action.includes("-+"), "Formatting must not contain double signs (-+)");
+  assert.ok(!result.action.includes("++"), "Formatting must not contain double signs (++)");
+  assert.ok(!result.action.includes(".."), "Formatting must not contain double periods");
+  assert.equal(result.stopLoss, 24650, "Stop loss must point to roofStrike 24650");
+  assert.equal(result.target, 24400, "Target must point to floorStrike 24400");
+  assert.ok(result.action.includes("Strict SL at 24650"), "Action must include explicit SL level");
+  assert.ok(result.action.includes("Target: Morning gap-down toward Floor (24400)"), "Action must include explicit Target");
 });
 
 

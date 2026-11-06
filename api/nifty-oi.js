@@ -822,25 +822,33 @@ export function calculateEODDecision({
   const isLateCallBlitz = (lastHourNetDelta <= -50000);
   const isLatePutBlitz = (lastHourNetDelta >= 50000);
 
+  const slShort = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 35);
+  const targetShort = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 70);
+
+  const slLong = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 35);
+  const targetLong = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 70);
+
   if (isLateCallBlitz) {
     // Neutralize BTST: Smart money wrote heavy Calls into close (like Nov 5th)
     score = Math.min(1, score);
-    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (-${formatLots(Math.abs(lastHourNetDelta))} lots) entered after 14:15. BTST strictly forbidden.`;
+    const callLots = formatLots(Math.abs(lastHourNetDelta)).replace(/^\+/, "");
+    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots) entered after 14:15. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
     audit.push({
       label: "14:15+ Institutional Veto Guardrail",
       status: "BEARISH_VETO",
       detail: lateVetoWarning,
-      impact: "VETO (BTST Forbidden)",
+      impact: `VETO BTST · Short SL: ${slShort}`,
     });
   } else if (isLatePutBlitz) {
     // Neutralize STBT: Smart money underwrote heavy Puts into close
     score = Math.max(-1, score);
-    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (+${formatLots(lastHourNetDelta)} lots) entered after 14:15. STBT strictly forbidden.`;
+    const putLots = formatLots(Math.abs(lastHourNetDelta)).replace(/^\+/, "");
+    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots) entered after 14:15. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
     audit.push({
       label: "14:15+ Institutional Veto Guardrail",
       status: "BULLISH_VETO",
       detail: lateVetoWarning,
-      impact: "VETO (STBT Forbidden)",
+      impact: `VETO STBT · Long SL: ${slLong}`,
     });
   }
 
@@ -851,32 +859,34 @@ export function calculateEODDecision({
     bias = "BULLISH";
     conviction = Math.min(95, 72 + score * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
-    action = `Favorable for holding overnight Nifty CE. Smart money has underwritten downside risk. Target: Morning gap-up continuation toward ${roofStrike}.`;
+    action = `Favorable for holding overnight Nifty CE. Smart money has underwritten downside risk. Target: Morning gap-up continuation toward ${roofStrike}. Strict SL: Close below Floor Support (${slLong}).`;
     if (pcrWarning) {
-      action += ` [${pcrWarning}: Tighten stop at ${floorStrike} due to extreme PCR stretch].`;
+      action += ` [${pcrWarning}: Tighten stop at ${slLong} due to extreme PCR stretch].`;
     }
   } else if (score <= -thresh) {
     verdict = "CARRY NIFTY PE (STBT)";
     bias = "BEARISH";
     conviction = Math.min(95, 72 + Math.abs(score) * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
-    action = `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}.`;
+    action = `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}. Strict SL: Close above Roof Resistance (${slShort}).`;
     if (pcrWarning) {
-      action += ` [${pcrWarning}: Tighten stop at ${roofStrike} due to oversold squeeze risk].`;
+      action += ` [${pcrWarning}: Tighten stop at ${slShort} due to oversold squeeze risk].`;
     }
   } else {
     verdict = "EXIT TO CASH / DO NOT CARRY";
     bias = "NEUTRAL";
     conviction = 80;
     sizing = "0% (Cash Only)";
-    const riskReason = lateVetoWarning
-      ? lateVetoWarning
-      : isFriday
-      ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
-      : pcrWarning
-      ? `Market showing mixed signals under ${pcrWarning}`
-      : "Balanced intraday flow without clear overnight edge";
-    action = `${riskReason}. Carry 0 overnight leverage and preserve capital for next market open.`;
+    if (lateVetoWarning) {
+      action = `${lateVetoWarning} Conservative / Friday weekend risk: Carry 0 leverage in cash.`;
+    } else {
+      const riskReason = isFriday
+        ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
+        : pcrWarning
+        ? `Market showing mixed signals under ${pcrWarning}`
+        : "Balanced intraday flow without clear overnight edge";
+      action = `${riskReason}. Carry 0 overnight leverage and preserve capital for next market open.`;
+    }
   }
 
   return {
@@ -885,6 +895,8 @@ export function calculateEODDecision({
     conviction,
     sizing,
     action,
+    stopLoss: (bias === "BEARISH" || isLateCallBlitz) ? slShort : (bias === "BULLISH" || isLatePutBlitz) ? slLong : null,
+    target: (bias === "BEARISH" || isLateCallBlitz) ? targetShort : (bias === "BULLISH" || isLatePutBlitz) ? targetLong : null,
     score,
     isFriday,
     isDecisionWindow,
