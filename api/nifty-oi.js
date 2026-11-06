@@ -248,9 +248,9 @@ async function syncRedisHistory(today) {
     sessionDate = today;
   }
 
-  if (REDIS_URL && (!intradayHistory || intradayHistory.length === 0)) {
+  if (REDIS_URL && (!intradayHistory || intradayHistory.length < 5)) {
     const remote = await getRedisTimeline(today);
-    if (Array.isArray(remote) && remote.length > 0) {
+    if (Array.isArray(remote) && remote.length > (intradayHistory ? intradayHistory.length : 0)) {
       intradayHistory = remote
         .filter(pt => pt && (pt.minutes || 0) <= 940 && (pt.time || "") <= "15:40")
         .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
@@ -1059,6 +1059,7 @@ export default async function handler(req, res) {
         if (REDIS_URL) {
           await setRedisTimeline(today, intradayHistory);
         }
+        cache = { data: null, timestamp: 0 }; // invalidate cache on sync
         return res.status(200).json({ success: true, count: intradayHistory.length });
       }
       return res.status(200).json({ success: true, count: intradayHistory.length });
@@ -1068,7 +1069,7 @@ export default async function handler(req, res) {
   }
 
   const now = Date.now();
-  if (cache.data && now - cache.timestamp < 30000) {
+  if (cache.data && now - cache.timestamp < 30000 && cache.data.intradayTimeline?.length > 1) {
     return res.status(200).json(cache.data);
   }
 
