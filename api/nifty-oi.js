@@ -712,7 +712,7 @@ export function calculateEODDecision({
     impact: closingImpact,
   });
 
-  // 3. PCR & Delta PCR with Extreme Sentiment Boundary Guardrails
+  // 3. PCR & Delta PCR with 2-Tier 5-Year Historical Boundary Guardrails
   let pcrStatus = "NEUTRAL";
   let pcrDetail = `PCR ${Number(pcr).toFixed(2)} · ΔPCR ${Number(deltaPcr).toFixed(2)}`;
   let pcrWarning = null;
@@ -720,23 +720,37 @@ export function calculateEODDecision({
   const numPcr = Number(pcr);
   const numDelta = Number(deltaPcr);
 
-  // Check Extreme Levels First (Contrarian Risk Warning)
-  if (numPcr >= 1.40) {
+  // Check 5-Year Calibrated Historical Extremes
+  if (numPcr >= 1.65) {
+    // Tier 2: 5-Year Historical Peak Overbought (98th percentile blow-off ceiling)
+    score -= 1; // Active contrarian penalty
+    pcrStatus = "HISTORICAL_PEAK_OVERBOUGHT";
+    pcrWarning = `🚨 HISTORICAL PEAK OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.65 — 5-Yr Extreme Exhaustion)`;
+    pcrDetail = `5-Year Historical Extreme (98th %ile). Severe put-writing crowding (>165 Puts / 100 Calls). Statistically precedes violent downward mean-reversion within 24-48h. Penalty (-1 pt) applied.`;
+  } else if (numPcr >= 1.40) {
+    // Tier 1: Overbought Extension
     pcrStatus = "EXTREME_OVERBOUGHT";
-    pcrWarning = `⚠️ EXTREME OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.40)`;
-    pcrDetail = `Extreme Overbought PCR (${numPcr.toFixed(2)}) — High mean-reversion & profit-booking risk. Overnight CE carry carries elevated risk.`;
+    pcrWarning = `⚠️ OVERBOUGHT EXTENSION / EXTREME OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.40)`;
+    pcrDetail = `Overbought territory (${numPcr.toFixed(2)}). Put underwriting saturated. Bullish points frozen (0 pts) to prevent chasing extended tops.`;
+  } else if (numPcr <= 0.52) {
+    // Tier 2: 5-Year Historical Capitulation Floor (Sub-2nd percentile panic bottom)
+    score += 1; // Active contrarian bounce bonus
+    pcrStatus = "HISTORICAL_CAPITULATION_FLOOR";
+    pcrWarning = `🚀 HISTORICAL CAPITULATION FLOOR (PCR ${numPcr.toFixed(2)} ≤ 0.52 — 5-Yr Contrarian Bounce Zone)`;
+    pcrDetail = `5-Year Historical Panic Floor (<2nd %ile). Severe call-writing crowding (>190 Calls / 100 Puts). Statistically precedes violent short-covering squeezes (+150-300 pts). Contrarian bonus (+1 pt) applied.`;
   } else if (numPcr <= 0.65) {
+    // Tier 1: Oversold Extension
     pcrStatus = "EXTREME_OVERSOLD";
-    pcrWarning = `⚠️ DEEPLY OVERSOLD (PCR ${numPcr.toFixed(2)} ≤ 0.65)`;
-    pcrDetail = `Deeply Oversold PCR (${numPcr.toFixed(2)}) — High risk of short squeeze & snapback bounce. Overnight PE carry capped.`;
+    pcrWarning = `⚠️ OVERSOLD EXTENSION / DEEPLY OVERSOLD (PCR ${numPcr.toFixed(2)} ≤ 0.65)`;
+    pcrDetail = `Deeply oversold (${numPcr.toFixed(2)}). Call underwriting saturated. Bearish points frozen (0 pts) to prevent shorting into support.`;
   } else if ((numDelta >= 1.25 && numPcr >= 0.98) || (numPcr >= 1.15 && numDelta >= 1.10) || (totCallWriting <= 0 && totPutWriting > 20000)) {
     score += 1;
     pcrStatus = "BULLISH";
-    pcrDetail = `Bullish PCR expansion (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Put writing dominant without overbought crowding`;
+    pcrDetail = `Bullish PCR expansion (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy put writing without overbought crowding`;
   } else if ((numDelta <= 0.80 && numPcr <= 1.02) || (numPcr <= 0.88 && numDelta <= 0.90) || (totPutWriting <= 0 && totCallWriting > 20000)) {
     score -= 1;
     pcrStatus = "BEARISH";
-    pcrDetail = `Bearish PCR compression (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Call writing dominant without oversold exhaustion`;
+    pcrDetail = `Bearish PCR compression (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy call writing without oversold exhaustion`;
   } else {
     pcrStatus = "NEUTRAL";
     pcrDetail = `Balanced PCR structure (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Non-directional options OI`;
@@ -747,12 +761,16 @@ export function calculateEODDecision({
     status: pcrStatus,
     detail: pcrDetail,
     warning: pcrWarning,
-    impact: pcrStatus === "BULLISH"
+    impact: pcrStatus === "HISTORICAL_PEAK_OVERBOUGHT"
+      ? "🚨 Penalty (-1 pt Reversal Risk)"
+      : pcrStatus === "HISTORICAL_CAPITULATION_FLOOR"
+      ? "🚀 Bonus (+1 pt Squeeze Potential)"
+      : pcrWarning
+      ? "⚠️ Warning (0 pts)"
+      : pcrStatus === "BULLISH"
       ? "+1 pt"
       : pcrStatus === "BEARISH"
       ? "-1 pt"
-      : pcrWarning
-      ? "⚠️ Warning (0 pts)"
       : "0 pts",
   });
 

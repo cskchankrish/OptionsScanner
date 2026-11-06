@@ -823,12 +823,15 @@ function ScoringGuide({ t, isDark }) {
               <strong>1. Full-Day Writing Dominance (±2 pts):</strong> Put writing &gt; 1.35× Call writing (+2) signals institutional downside underwriting. Call writing &gt; 1.35× Put writing (-2) signals capping overhead supply.
             </div>
             <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
-              <strong>2. Closing Hour Flow 14:15–15:25 IST (±2 pts):</strong> Proprietary desks execute overnight positioning in the final 75 minutes. Net Put writing delta surge &gt;+20k lots (+2) indicates BTST accumulation; Call writing surge &gt;+20k lots (-2) indicates STBT distribution.
+              <strong>2. Closing Hour Flow 14:15–15:25 IST (±3 pts + Veto Guardrail):</strong> Proprietary desks execute institutional overnight positioning after 14:15. Net Put writing delta surge &gt;+20k lots (+3 pts) indicates BTST accumulation; Call writing surge &gt;+20k lots (-3 pts) indicates STBT distribution. If smart money initiates a sudden late blitz of &gt;50k opposing lots into close, the model fires a strict directional VETO (e.g. Late Call Blitz blocks BTST unconditionally).
             </div>
             <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>
-              <strong>3. PCR &amp; ΔPCR Confluence (±1 pt) + Extreme Guardrails:</strong> Bullish expansion (+1 pt) triggers when intraday ΔPCR ≥ 1.25 with PCR ≥ 0.98 or call unwinding. Bearish compression (-1 pt) triggers when ΔPCR ≤ 0.80 with PCR ≤ 1.02.
+              <strong>3. PCR &amp; ΔPCR Confluence (±1 pt) + 2-Tier 5-Year Historical Guardrails:</strong> Bullish expansion (+1 pt) triggers when intraday ΔPCR ≥ 1.25 with PCR ≥ 0.98. Bearish compression (-1 pt) triggers when ΔPCR ≤ 0.80 with PCR ≤ 1.02.
               <div style={{ marginTop:4, color:isDark ? "#fdba74" : "#c2410c", fontWeight:600 }}>
-                ⚠️ <strong>Extreme Boundary Warning (0 pts):</strong> PCR ≥ 1.40 (Extreme Overbought — Contrarian mean reversion / trap risk) or PCR ≤ 0.65 (Deeply Oversold — Short covering bounce risk). Neutralizes points and flags high-risk warning to protect against chasing extreme sentiment tops/bottoms.
+                ⚠️ <strong>Tier 1 Extension Warning (0 pts):</strong> PCR ≥ 1.40 (Overbought Extension) or PCR ≤ 0.65 (Oversold Extension). Bullish/bearish points frozen to 0 to prevent chasing extended moves.
+              </div>
+              <div style={{ marginTop:4, color:isDark ? "#ef4444" : "#b91c1c", fontWeight:700 }}>
+                🚨 <strong>Tier 2 Historical Extremes (5-Year Calibrated):</strong> PCR ≥ 1.65 (98th percentile blow-off top — applies <strong>-1 pt contrarian penalty</strong> for imminent 24–48h mean-reversion). PCR ≤ 0.52 (&lt;2nd percentile panic capitulation floor — applies <strong>+1 pt contrarian bonus</strong> for violent short-covering squeeze).
               </div>
             </div>
             <div style={{ padding:"6px 10px", background:isDark ? "#18181b22" : "#f4f4f5", border:`1px solid ${t.border}`, borderRadius:6 }}>

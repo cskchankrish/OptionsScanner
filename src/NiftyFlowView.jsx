@@ -1477,6 +1477,14 @@ export function NiftyFlowView({ t, isDark }) {
             </div>
             <div style={{ fontSize: isMobile ? 9.5 : 11, color: t.textSub, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 5, marginTop: 2 }}>
               <span>Cum. PCR: <strong>{Number(oiData?.pcr || 1.0).toFixed(2)}</strong> · Day ΔPCR: <strong>{Number(oiData?.deltaPcr || 1.0).toFixed(2)}</strong></span>
+              {(() => {
+                const p = Number(oiData?.pcr || 1.0);
+                if (p >= 1.65) return <span style={{ background: "#dc262622", color: "#ef4444", border: "1px solid #ef4444", borderRadius: 4, padding: "1px 5px", fontSize: 9, fontWeight: 800 }}>🚨 5Y PEAK OVERBOUGHT (≥1.65)</span>;
+                if (p >= 1.40) return <span style={{ background: "#f9731622", color: "#f97316", border: "1px solid #f97316", borderRadius: 4, padding: "1px 5px", fontSize: 9, fontWeight: 800 }}>⚠️ OVERBOUGHT (≥1.40)</span>;
+                if (p <= 0.52) return <span style={{ background: "#16a34a22", color: "#16a34a", border: "1px solid #16a34a", borderRadius: 4, padding: "1px 5px", fontSize: 9, fontWeight: 800 }}>🚀 5Y CAPITULATION FLOOR (≤0.52)</span>;
+                if (p <= 0.65) return <span style={{ background: "#3b82f622", color: "#3b82f6", border: "1px solid #3b82f6", borderRadius: 4, padding: "1px 5px", fontSize: 9, fontWeight: 800 }}>⚠️ OVERSOLD (≤0.65)</span>;
+                return null;
+              })()}
               {oiData?.nearPcr && Number(oiData.nearPcr) !== Number(oiData.pcr) && (
                 <span style={{ fontSize: 9, color: t.textMuted }} title="Near-money strike slice (+/- 550 pts)">
                   (Near: {Number(oiData.nearPcr).toFixed(2)})

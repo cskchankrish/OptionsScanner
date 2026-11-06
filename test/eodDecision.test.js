@@ -209,3 +209,46 @@ test("calculateEODDecision triggers LATE CALL BLITZ VETO and blocks BTST when sm
   assert.equal(vetoAudit.status, "BEARISH_VETO");
   assert.ok(result.action.includes("LATE CALL BLITZ VETO"));
 });
+
+
+test("calculateEODDecision flags Tier 2 HISTORICAL_PEAK_OVERBOUGHT and penalizes -1 pt at PCR >= 1.65", () => {
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 300000,
+    totCallWriting: 100000,
+    pcr: 1.72, // 5-Year Extreme Peak (> 1.65)
+    deltaPcr: 2.10,
+    timeline: [],
+    dayOfWeek: 2,
+    nowMins: 915,
+  });
+
+  const pcrAudit = result.audit.find(a => a.label.includes("PCR Structure"));
+  assert.equal(pcrAudit.status, "HISTORICAL_PEAK_OVERBOUGHT");
+  assert.equal(pcrAudit.impact, "🚨 Penalty (-1 pt Reversal Risk)");
+  assert.ok(result.pcrWarning.includes("HISTORICAL PEAK OVERBOUGHT"));
+  assert.ok(pcrAudit.detail.includes("5-Year Historical Extreme"));
+});
+
+test("calculateEODDecision flags Tier 2 HISTORICAL_CAPITULATION_FLOOR and awards +1 pt contrarian bonus at PCR <= 0.52", () => {
+  const result = calculateEODDecision({
+    spot: 24000,
+    floorStrike: 23900,
+    roofStrike: 24100,
+    totPutWriting: 50000,
+    totCallWriting: 250000,
+    pcr: 0.48, // 5-Year Deep Capitulation Floor (<= 0.52)
+    deltaPcr: 0.35,
+    timeline: [],
+    dayOfWeek: 1,
+    nowMins: 915,
+  });
+
+  const pcrAudit = result.audit.find(a => a.label.includes("PCR Structure"));
+  assert.equal(pcrAudit.status, "HISTORICAL_CAPITULATION_FLOOR");
+  assert.equal(pcrAudit.impact, "🚀 Bonus (+1 pt Squeeze Potential)");
+  assert.ok(result.pcrWarning.includes("HISTORICAL CAPITULATION FLOOR"));
+  assert.ok(pcrAudit.detail.includes("5-Year Historical Panic Floor"));
+});
