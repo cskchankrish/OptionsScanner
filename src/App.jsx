@@ -6,7 +6,7 @@ import { compareStocks } from "./stockSort.js";
 import { NiftyFlowView } from "./NiftyFlowView.jsx";
 
 // ─── LIVE GOOGLE SHEETS LINK ──────────────────────────────────────────────────
-const CSV_URL    = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
+const CSV_URL    = (typeof import.meta !== "undefined" && import.meta.env?.VITE_GOOGLE_SHEETS_CSV_URL) || "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
 const REFRESH_MS = 15 * 60 * 1000;
 const PAGE_SIZE  = 40;
 
@@ -958,6 +958,18 @@ export default function App() {
       fontFamily:"system-ui,sans-serif", fontSize:13,
       paddingBottom: mobile ? "84px" : "16px",
       transition:"background .25s, color .25s" }}>
+
+      {/* Background fetch warning banner if previous data is retained */}
+      {error && (
+        <div style={{ background:"#ef444415", borderBottom:"1px solid #ef444440", padding:"8px 14px",
+          display:"flex", alignItems:"center", justifyContent:"space-between", fontSize:11, color:"#ef4444" }}>
+          <span>⚠️ Live update failed: {error}. Serving cached snapshot.</span>
+          <button onClick={fetchLive} style={{ background:"transparent", border:"1px solid #ef444460",
+            color:"#ef4444", borderRadius:4, padding:"2px 8px", cursor:"pointer", fontSize:10, fontWeight:700 }}>
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* HEADER */}
       <div style={{ background:t.surface, borderBottom:`1px solid ${t.border}`, padding:"12px 14px" }}>

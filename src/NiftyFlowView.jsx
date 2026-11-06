@@ -1,4 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import {
+  CANONICAL_EOD_SEED_HISTORY,
+  mergeEodHistory,
+  loadAndSanitizeStorageHistory,
+  normalizeDateToIso,
+  formatIsoToDisplayDate,
+} from "./eodTrackRecord.js";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -983,316 +990,18 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   );
 }
 
-const DEFAULT_EOD_SEED_HISTORY = [
-  {
-    id: "eod_04-11-2026",
-    date: "04-11-2026",
-    dayName: "Wednesday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24205.5,
-    nextDayOpen: 24292.0,
-    gapPts: 86.5,
-    outcome: "WIN",
-    floor: 24100,
-    roof: 24350,
-    pcr: 1.24,
-    deltaPcr: 1.62,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty CE. Smart money underwrote 24,100 floor.",
-    keyReasons: "Put writing dominant (+2) · Late Delta +24k lots (+2) · Bullish PCR 1.24 (+1)",
-    notes: "Gap up +86.5 pts at 09:15 open. Morning target hit at 24,290.",
-  },
-  {
-    id: "eod_03-11-2026",
-    date: "03-11-2026",
-    dayName: "Tuesday",
-    time: "15:20 IST",
-    verdict: "EXIT TO CASH / DO NOT CARRY",
-    bias: "NEUTRAL",
-    score: 0,
-    conviction: 80,
-    sizing: "0% (Cash Only)",
-    entrySpot: 23990.0,
-    nextDayOpen: 23935.0,
-    gapPts: -55.0,
-    outcome: "PRESERVED_CASH",
-    floor: 23900,
-    roof: 24100,
-    pcr: 0.98,
-    deltaPcr: 1.05,
-    pcrWarning: null,
-    action: "Balanced intraday flow without clear overnight edge. Preserved 100% capital in cash.",
-    keyReasons: "Balanced writing (0 pts) · Flat closing flow (0 pts) · PCR neutral (0 pts)",
-    notes: "Avoided -55 pts gap-down trap next morning. Capital preserved.",
-  },
-  {
-    id: "eod_31-10-2026",
-    date: "31-10-2026",
-    dayName: "Friday",
-    time: "15:20 IST",
-    verdict: "EXIT TO CASH / DO NOT CARRY",
-    bias: "NEUTRAL",
-    score: 2,
-    conviction: 80,
-    sizing: "0% (Cash Only)",
-    entrySpot: 24300.0,
-    nextDayOpen: 24215.0,
-    gapPts: -85.0,
-    outcome: "PRESERVED_CASH",
-    floor: 24200,
-    roof: 24450,
-    pcr: 1.12,
-    deltaPcr: 1.35,
-    pcrWarning: null,
-    action: "Friday weekend alert: Score +2 below Friday safety threshold (+4). Preserved 100% cash.",
-    keyReasons: "Friday Risk Control: Requires score ≥ 4 to carry through 48h weekend theta decay",
-    notes: "Saved from weekend theta decay and -85 pts Monday morning gap-down.",
-  },
-  {
-    id: "eod_30-10-2026",
-    date: "30-10-2026",
-    dayName: "Thursday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY PE (STBT)",
-    bias: "BEARISH",
-    score: -4,
-    conviction: 88,
-    sizing: "75% Normal Size",
-    entrySpot: 24340.0,
-    nextDayOpen: 24210.0,
-    gapPts: 130.0,
-    outcome: "WIN",
-    floor: 24150,
-    roof: 24400,
-    pcr: 0.82,
-    deltaPcr: 0.61,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty PE. Heavy call capping at 24,400 roof.",
-    keyReasons: "Call writing dominant (-2) · Late Call dump -32k lots (-2) · Bearish PCR 0.82 (-1)",
-    notes: "Big gap-down +130 pts captured on STBT PE position at morning bell.",
-  },
-  {
-    id: "eod_29-10-2026",
-    date: "29-10-2026",
-    dayName: "Wednesday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24410.0,
-    nextDayOpen: 24495.0,
-    gapPts: 85.0,
-    outcome: "WIN",
-    floor: 24300,
-    roof: 24550,
-    pcr: 1.28,
-    deltaPcr: 1.54,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty CE. Floor firmly defended at 24,300.",
-    keyReasons: "Put writing dominant (+2) · Closing surge +22k lots (+2) · PCR 1.28 (+1)",
-    notes: "Clean morning gap-up +85 pts, locked profit within first 15 mins.",
-  },
-  {
-    id: "eod_28-10-2026",
-    date: "28-10-2026",
-    dayName: "Tuesday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 4,
-    conviction: 88,
-    sizing: "75% Normal Size",
-    entrySpot: 24460.0,
-    nextDayOpen: 24535.0,
-    gapPts: 75.0,
-    outcome: "WIN",
-    floor: 24350,
-    roof: 24600,
-    pcr: 1.31,
-    deltaPcr: 1.82,
-    pcrWarning: null,
-    action: "Institutional upside expansion. Heavy put underwriting across 24,400 & 24,450 strikes.",
-    keyReasons: "Full day put writing (+2) · Final hour surge +38k lots (+2) · Spot above floor (+1)",
-    notes: "Gap-up continuation +75 pts. Target 24,530 reached.",
-  },
-  {
-    id: "eod_27-10-2026",
-    date: "27-10-2026",
-    dayName: "Monday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24180.0,
-    nextDayOpen: 24295.0,
-    gapPts: 115.0,
-    outcome: "WIN",
-    floor: 24000,
-    roof: 24300,
-    pcr: 1.22,
-    deltaPcr: 1.48,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty CE. Reversal confirmation off 24,000 floor.",
-    keyReasons: "Put dominance (+2) · Closing flow +25k lots (+2) · PCR expansion (+1)",
-    notes: "+115 pts massive gap-up at open. All targets met.",
-  },
-  {
-    id: "eod_24-10-2026",
-    date: "24-10-2026",
-    dayName: "Friday",
-    time: "15:20 IST",
-    verdict: "EXIT TO CASH / DO NOT CARRY",
-    bias: "NEUTRAL",
-    score: 1,
-    conviction: 80,
-    sizing: "0% (Cash Only)",
-    entrySpot: 24400.0,
-    nextDayOpen: 24365.0,
-    gapPts: -35.0,
-    outcome: "PRESERVED_CASH",
-    floor: 24300,
-    roof: 24500,
-    pcr: 1.05,
-    deltaPcr: 1.15,
-    pcrWarning: null,
-    action: "Friday Weekend Rule: Score +1 did not meet strict Friday threshold (≥ +4). Cash preserved.",
-    keyReasons: "Friday Risk Control: Avoided 48h theta bleed on marginal flow",
-    notes: "Saved capital from flat-to-down open (-35 pts). Zero theta loss.",
-  },
-  {
-    id: "eod_23-10-2026",
-    date: "23-10-2026",
-    dayName: "Thursday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY PE (STBT)",
-    bias: "BEARISH",
-    score: -3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24650.0,
-    nextDayOpen: 24525.0,
-    gapPts: 125.0,
-    outcome: "WIN",
-    floor: 24450,
-    roof: 24700,
-    pcr: 0.85,
-    deltaPcr: 0.68,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty PE. Heavy institutional call buildup at 24,700.",
-    keyReasons: "Call writing dominance (-2) · Late call writing -21k lots (-2) · Spot pinned near roof (-1)",
-    notes: "Sharp -125 pts gap-down captured on PE at open.",
-  },
-  {
-    id: "eod_22-10-2026",
-    date: "22-10-2026",
-    dayName: "Wednesday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY PE (STBT)",
-    bias: "BEARISH",
-    score: -4,
-    conviction: 88,
-    sizing: "75% Normal Size",
-    entrySpot: 24780.0,
-    nextDayOpen: 24715.0,
-    gapPts: 65.0,
-    outcome: "WIN",
-    floor: 24600,
-    roof: 24850,
-    pcr: 0.79,
-    deltaPcr: 0.52,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty PE. Institutional resistance aggressively established.",
-    keyReasons: "Call dominance (-2) · Closing distribution (-2) · Bearish PCR compression (-1)",
-    notes: "Morning gap-down +65 pts on STBT PE.",
-  },
-  {
-    id: "eod_21-10-2026",
-    date: "21-10-2026",
-    dayName: "Tuesday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24820.0,
-    nextDayOpen: 24765.0,
-    gapPts: -55.0,
-    outcome: "LOSS",
-    floor: 24750,
-    roof: 24950,
-    pcr: 1.21,
-    deltaPcr: 1.42,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty CE. Defending 24,750 support.",
-    keyReasons: "Put writing dominant (+2) · Closing hour delta (+2) · PCR 1.21 (+1)",
-    notes: "Gap-down on overnight global news (-55 pts). Model stop at 24,750 floor respected.",
-  },
-  {
-    id: "eod_20-10-2026",
-    date: "20-10-2026",
-    dayName: "Monday",
-    time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 3,
-    conviction: 84,
-    sizing: "75% Normal Size",
-    entrySpot: 24600.0,
-    nextDayOpen: 24695.0,
-    gapPts: 95.0,
-    outcome: "WIN",
-    floor: 24500,
-    roof: 24750,
-    pcr: 1.25,
-    deltaPcr: 1.55,
-    pcrWarning: null,
-    action: "Favorable for holding overnight Nifty CE. Put writers established heavy base at 24,500.",
-    keyReasons: "Put writing (+2) · Late accumulation (+2) · PCR expansion (+1)",
-    notes: "Gap-up +95 pts at market open. Target achieved.",
-  }
-];
-
-function mergeEodHistory(localHistory = [], serverHistory = []) {
-  const map = new Map();
-  // Server items first
-  for (const item of (serverHistory || [])) {
-    if (item && (item.id || item.date)) {
-      map.set(item.id || item.date, item);
-    }
-  }
-  // Local items
-  for (const item of (localHistory || [])) {
-    if (item && (item.id || item.date)) {
-      const key = item.id || item.date;
-      const existing = map.get(key);
-      if (!existing) {
-        map.set(key, item);
-      } else {
-        // If local has resolved outcome while server is pending, retain local resolution
-        if (existing.outcome === "PENDING" && item.outcome && item.outcome !== "PENDING") {
-          map.set(key, { ...existing, ...item });
-        } else {
-          map.set(key, { ...item, ...existing });
-        }
-      }
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
-}
-
 function getTodayDateKey() {
   try {
-    return new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
+    const parts = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const y = parts.find(p => p.type === "year")?.value;
+    const m = parts.find(p => p.type === "month")?.value;
+    const d = parts.find(p => p.type === "day")?.value;
+    return `${y}-${m}-${d}`;
   } catch (e) {
     return new Date().toISOString().slice(0, 10);
   }
@@ -1330,7 +1039,7 @@ export function NiftyFlowView({ t, isDark }) {
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
   // EOD Overnight Carry Track Record & History State
-  const [eodHistory, setEodHistory] = useState(() => DEFAULT_EOD_SEED_HISTORY);
+  const [eodHistory, setEodHistory] = useState(() => loadAndSanitizeStorageHistory());
   const [eodTab, setEodTab] = useState("decision"); // "decision" | "history"
   const [historyFilter, setHistoryFilter] = useState("ALL"); // "ALL" | "BTST" | "STBT" | "CASH" | "WIN"
   const [expandedHistoryId, setExpandedHistoryId] = useState(null);
@@ -1372,7 +1081,7 @@ export function NiftyFlowView({ t, isDark }) {
     }
 
     try {
-      const storedHistory = localStorage.getItem("options_scanner_eod_history_v2");
+      const storedHistory = localStorage.getItem("options_scanner_eod_history_v3") || localStorage.getItem("options_scanner_eod_history_v3");
       if (storedHistory) {
         const parsed = JSON.parse(storedHistory);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -1451,7 +1160,8 @@ export function NiftyFlowView({ t, isDark }) {
             if (data.eodDecision) {
               const todayEntry = {
                 id: `eod_${todayKey}`,
-                date: todayKey,
+                isoDate: todayKey,
+                date: formatIsoToDisplayDate(todayKey),
                 dayName: new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" }),
                 time: `${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false })} IST`,
                 verdict: data.eodDecision.verdict,
@@ -1473,7 +1183,7 @@ export function NiftyFlowView({ t, isDark }) {
               merged = mergeEodHistory(merged, [todayEntry]);
             }
             try {
-              localStorage.setItem("options_scanner_eod_history_v2", JSON.stringify(merged));
+              localStorage.setItem("options_scanner_eod_history_v3", JSON.stringify(merged));
             } catch (e) {}
             return merged;
           });
@@ -2053,7 +1763,7 @@ export function NiftyFlowView({ t, isDark }) {
               return item;
             });
             try {
-              localStorage.setItem("options_scanner_eod_history_v2", JSON.stringify(updated));
+              localStorage.setItem("options_scanner_eod_history_v3", JSON.stringify(updated));
               fetch("/api/nifty-oi", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
