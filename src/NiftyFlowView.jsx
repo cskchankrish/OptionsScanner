@@ -2037,15 +2037,18 @@ export function NiftyFlowView({ t, isDark }) {
                   marginBottom: 8,
                 }}>
                   {(eod.audit || []).map((item, idx) => {
-                    const itemBull = item.status === "BULLISH";
-                    const itemBear = item.status === "BEARISH";
-                    const isPcrWarn = item.warning || item.status === "EXTREME_OVERBOUGHT" || item.status === "EXTREME_OVERSOLD";
+                    const itemBull = item.status === "BULLISH" || (item.status && item.status.includes("PUT_BLITZ")) || item.status === "BULLISH_VETO";
+                    const itemBear = item.status === "BEARISH" || (item.status && item.status.includes("CALL_BLITZ")) || item.status === "BEARISH_VETO";
+                    const isPcrWarn = item.warning || item.status === "EXTREME_OVERBOUGHT" || item.status === "EXTREME_OVERSOLD" || item.status === "HISTORICAL_PEAK_OVERBOUGHT" || item.status === "HISTORICAL_CAPITULATION_FLOOR";
+                    const isPending = item.status === "AWAITING_DATA" || item.status === "MONITORING";
                     const itemColor = isPcrWarn
                       ? "#f97316"
                       : itemBull
                       ? "#16a34a"
                       : itemBear
                       ? "#ef4444"
+                      : isPending
+                      ? (isDark ? "#38bdf8" : "#0284c7")
                       : t.textMuted;
                     const itemBg = isPcrWarn
                       ? (isDark ? "#2a150833" : "#fff7ed")
@@ -2053,6 +2056,8 @@ export function NiftyFlowView({ t, isDark }) {
                       ? (isDark ? "#052e1633" : "#f0fdf4")
                       : itemBear
                       ? (isDark ? "#2d0a0a33" : "#fef2f2")
+                      : isPending
+                      ? (isDark ? "#0c4a6e33" : "#f0f9ff")
                       : (isDark ? "#18181b33" : "#f9fafb");
                     const itemBorder = isPcrWarn
                       ? "#f9731644"
@@ -2060,6 +2065,8 @@ export function NiftyFlowView({ t, isDark }) {
                       ? "#16a34a33"
                       : itemBear
                       ? "#ef444433"
+                      : isPending
+                      ? (isDark ? "#38bdf833" : "#bae6fd")
                       : t.border;
 
                     return (

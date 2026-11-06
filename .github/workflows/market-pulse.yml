@@ -2,8 +2,8 @@ name: Market Hours OI Pulse
 
 on:
   schedule:
-    # Run every 5 minutes between 03:45 and 10:15 UTC (09:15 - 15:45 IST) Monday to Friday
-    - cron: "*/5 3-10 * * 1-5"
+    # Run every 5 minutes during trading days (Monday to Friday)
+    - cron: "*/5 3-11 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -11,6 +11,13 @@ jobs:
     name: Ping Nifty OI API & Record Timeline Tick
     runs-on: ubuntu-latest
     steps:
-      - name: Hit Nifty OI Endpoint
+      - name: Hit Nifty OI Endpoint within Market Window
         run: |
-          curl -s -m 12 "https://options-scanner-seven.vercel.app/api/nifty-oi" > /dev/null || true
+          IST_TIME=$(TZ='Asia/Kolkata' date +%H%M)
+          echo "Current IST Time: $IST_TIME"
+          if [ "$IST_TIME" -ge "0915" ] && [ "$IST_TIME" -le "1540" ]; then
+            echo "Within market window (09:15 - 15:40 IST). Pinging API..."
+            curl -s -m 12 "https://options-scanner-seven.vercel.app/api/nifty-oi" > /dev/null || true
+          else
+            echo "Outside market window (09:15 - 15:40 IST). Skipping ping to protect EOD settlement integrity."
+          fi

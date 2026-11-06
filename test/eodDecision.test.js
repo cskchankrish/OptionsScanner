@@ -259,3 +259,89 @@ test("calculateEODDecision flags Tier 2 HISTORICAL_CAPITULATION_FLOOR and awards
   assert.ok(result.pcrWarning.includes("HISTORICAL CAPITULATION FLOOR"));
   assert.ok(pcrAudit.detail.includes("5-Year Historical Panic Floor"));
 });
+
+test("calculateEODDecision enforces data integrity validation: requires >= 15m closing span and holds scoring neutral when ticks missing", () => {
+  // Scenario: Timeline only has 1 tick at 14:15 and 1 tick at 14:20 (< 15 min span)
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 200000,
+    totCallWriting: 100000,
+    pcr: 1.15,
+    deltaPcr: 1.25,
+    timeline: [
+      { minutes: 855, netDiff: 10000, time: "14:15" },
+      { minutes: 860, netDiff: 90000, time: "14:20" }, // +80k jump in 5 mins but span is only 5 mins!
+      { minutes: 862, netDiff: 90000, time: "14:22" }
+    ],
+    dayOfWeek: 3,
+    nowMins: 915, // 15:15 IST
+  });
+
+  assert.equal(result.isClosingDataValid, false, "isClosingDataValid must be false when span < 15m");
+  const closingAudit = result.audit.find(a => a.label.includes("Closing Hour Flow"));
+  assert.equal(closingAudit.status, "AWAITING_DATA");
+  assert.ok(closingAudit.detail.includes("Data Integrity Notice"));
+  assert.equal(closingAudit.impact, "0 pts (Data Pending)");
+
+  // Crucially: late blitz veto must NOT trigger on unvalidated short span
+  const vetoAudit = result.audit.find(a => a.label.includes("14:15+ Institutional Veto"));
+  assert.equal(vetoAudit, undefined, "Veto must never fire when closing data integrity validation fails");
+});
+
+test("calculateEODDecision enforces data integrity validation: holds neutral when 14:15 anchor is missing", () => {
+  // Scenario: Morning ticks only (555, 600, 660) and then a single post-market tick at 15:40 (no 14:15 baseline)
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 200000,
+    totCallWriting: 100000,
+    pcr: 1.15,
+    deltaPcr: 1.25,
+    timeline: [
+      { minutes: 555, netDiff: 5000, time: "09:15" },
+      { minutes: 600, netDiff: 15000, time: "10:00" },
+      { minutes: 660, netDiff: 20000, time: "11:00" },
+      { minutes: 940, netDiff: -100000, time: "15:40" } // Huge negative jump at 15:40, but no 14:15 tick
+    ],
+    dayOfWeek: 3,
+    nowMins: 998, // 16:38 IST (user refresh after hours)
+  });
+
+  assert.equal(result.isClosingDataValid, false);
+  const closingAudit = result.audit.find(a => a.label.includes("Closing Hour Flow"));
+  assert.equal(closingAudit.status, "AWAITING_DATA");
+  assert.ok(closingAudit.detail.includes("Missing 14:15 IST baseline tick"));
+  assert.equal(closingAudit.impact, "0 pts (Data Pending)");
+
+  // Late call blitz veto must NOT trigger from disconnected morning to 15:40 gap
+  const vetoAudit = result.audit.find(a => a.label.includes("14:15+ Institutional Veto"));
+  assert.equal(vetoAudit, undefined, "Veto must not fire from disconnected timeline missing 14:15 anchor");
+});
+
+test("calculateEODDecision displays exact verified window (14:15 to 15:30) when data integrity validation succeeds", () => {
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 200000,
+    totCallWriting: 100000,
+    pcr: 1.15,
+    deltaPcr: 1.25,
+    timeline: [
+      { minutes: 855, netDiff: 10000, time: "14:15" },
+      { minutes: 885, netDiff: 30000, time: "14:45" },
+      { minutes: 930, netDiff: 55000, time: "15:30" } // Span is 75 mins, delta is +45,000
+    ],
+    dayOfWeek: 3,
+    nowMins: 930,
+  });
+
+  assert.equal(result.isClosingDataValid, true);
+  const closingAudit = result.audit.find(a => a.label.includes("Closing Hour Flow"));
+  assert.equal(closingAudit.status, "BULLISH");
+  assert.equal(closingAudit.impact, "+2 pts");
+  assert.ok(closingAudit.detail.includes("(14:15 to 15:30)"), "Must display verified window timestamps");
+});

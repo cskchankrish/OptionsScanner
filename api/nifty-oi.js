@@ -151,7 +151,21 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   };
 
   if (existingIdx >= 0) {
-    history[existingIdx] = { ...history[existingIdx], ...todayEntry };
+    // If existing entry was already finalized in the execution window with valid closing data,
+    // and current calculation has unvalidated closing data (e.g. from an ad-hoc post-market request),
+    // preserve the finalized verdict and score instead of degrading to neutral/unvalidated!
+    const existing = history[existingIdx];
+    const existingWasFinalized = existing.notes?.includes("finalized") || (existing.outcome && existing.outcome !== "PENDING");
+    if (existingWasFinalized && !eodDecision.isClosingDataValid) {
+      history[existingIdx] = {
+        ...existing,
+        entrySpot: spot || existing.entrySpot,
+        floor: floorStrike || existing.floor,
+        roof: roofStrike || existing.roof,
+      };
+    } else {
+      history[existingIdx] = { ...existing, ...todayEntry };
+    }
   } else {
     history.unshift(todayEntry);
   }
@@ -301,7 +315,7 @@ function buildTimeline(totPut, totCall, spot) {
       callWriting: totCall,
       netDiff: totPut - totCall,
       spot: spot,
-      isLiveTick: true,
+      isLiveTick: nowMins <= 940,
     });
     didUpdate = true;
   } else if (last) {
@@ -310,7 +324,7 @@ function buildTimeline(totPut, totCall, spot) {
     last.netDiff = totPut - totCall;
     last.spot = spot;
     last.time = tickTime;
-    last.isLiveTick = true;
+    last.isLiveTick = nowMins <= 940;
     didUpdate = true;
   }
 
@@ -329,6 +343,14 @@ function formatLots(n) {
   if (abs >= 100000) return `${sign}${(abs / 100000).toFixed(1)}L`;
   if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(1)}k`;
   return `${sign}${abs.toLocaleString("en-IN")}`;
+}
+
+export function formatLotsAbs(n) {
+  if (n == null || isNaN(n)) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 100000) return `${(abs / 100000).toFixed(1)}L`;
+  if (abs >= 1000) return `${(abs / 1000).toFixed(1)}k`;
+  return `${abs.toLocaleString("en-IN")}`;
 }
 
 function toClockTimeStr(m) {
@@ -656,61 +678,91 @@ export function calculateEODDecision({
   });
 
   // 2. Final Hour Flow (14:15 to current) - Tiered Institutional Weighting (Up to ±3 pts)
+  // Data Integrity Validation: verify presence and continuity of closing window ticks
+  const validTimeline = (Array.isArray(timeline) ? timeline : []).filter(
+    pt => pt && Number.isFinite(pt.minutes) && pt.minutes >= 555 && pt.minutes <= 940 && Number.isFinite(pt.netDiff)
+  );
+
+  let isClosingDataValid = false;
+  let p1415 = null;
+  let pClose = null;
   let lastHourNetDelta = 0;
   let closingFlowStatus = "NEUTRAL";
   let closingFlowDetail = "Neutral closing hour flow";
   let closingImpact = "0 pts";
 
-  if (timeline && timeline.length >= 3) {
-    let p1415 = timeline[0];
-    let minDiff = Infinity;
-    for (const pt of timeline) {
-      const d = Math.abs((pt.minutes || 0) - 855); // 855 = 14:15 IST
-      if (d < minDiff) {
-        minDiff = d;
+  if (validTimeline.length >= 3) {
+    let minAnchorDiff = Infinity;
+    for (const pt of validTimeline) {
+      const d = Math.abs(pt.minutes - 855); // 855 = 14:15 IST
+      if (d <= 25 && d < minAnchorDiff) {
+        minAnchorDiff = d;
         p1415 = pt;
       }
     }
-    const pNow = timeline[timeline.length - 1];
-    lastHourNetDelta = (pNow.netDiff || 0) - (p1415.netDiff || 0);
 
-    if (lastHourNetDelta >= 75000) {
-      score += 3;
-      closingFlowStatus = "INSTITUTIONAL_PUT_BLITZ";
-      closingFlowDetail = `Massive late Put accumulation (+${formatLots(lastHourNetDelta)} lots since 14:15). Aggressive institutional floor defense.`;
-      closingImpact = "+3 pts (Institutional Blitz)";
-    } else if (lastHourNetDelta >= 30000) {
-      score += 2;
-      closingFlowStatus = "BULLISH";
-      closingFlowDetail = `Strong late Put writing (+${formatLots(lastHourNetDelta)} lots since 14:15).`;
-      closingImpact = "+2 pts";
-    } else if (lastHourNetDelta >= 10000) {
-      score += 1;
-      closingFlowStatus = "MILD_BULLISH";
-      closingFlowDetail = `Moderate late Put addition (+${formatLots(lastHourNetDelta)} lots since 14:15).`;
-      closingImpact = "+1 pt";
-    } else if (lastHourNetDelta <= -75000) {
-      score -= 3;
-      closingFlowStatus = "INSTITUTIONAL_CALL_BLITZ";
-      closingFlowDetail = `Massive late Call distribution (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15). Aggressive institutional ceiling hedge.`;
-      closingImpact = "-3 pts (Institutional Blitz)";
-    } else if (lastHourNetDelta <= -30000) {
-      score -= 2;
-      closingFlowStatus = "BEARISH";
-      closingFlowDetail = `Heavy late Call writing (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15).`;
-      closingImpact = "-2 pts";
-    } else if (lastHourNetDelta <= -10000) {
-      score -= 1;
-      closingFlowStatus = "MILD_BEARISH";
-      closingFlowDetail = `Moderate late Call addition (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15).`;
-      closingImpact = "-1 pt";
+    if (nowMins < 870) {
+      // Before 14:30 IST: Closing window is still accumulating
+      closingFlowStatus = "MONITORING";
+      closingFlowDetail = "Intraday flow accumulating (14:15+ closing window activates after 14:30 IST)";
+      closingImpact = "0 pts (Pending 14:30+)";
+    } else if (!p1415) {
+      closingFlowStatus = "AWAITING_DATA";
+      closingFlowDetail = "Data Integrity Notice: Missing 14:15 IST baseline tick. Closing flow scoring held neutral.";
+      closingImpact = "0 pts (Data Pending)";
     } else {
-      closingFlowDetail = `Closing flow steady (${formatLots(lastHourNetDelta)} lots since 14:15)`;
-      closingImpact = "0 pts";
+      pClose = validTimeline[validTimeline.length - 1];
+      const spanMinutes = (pClose.minutes || 0) - (p1415.minutes || 0);
+
+      if (spanMinutes < 15) {
+        closingFlowStatus = "AWAITING_DATA";
+        closingFlowDetail = `Data Integrity Notice: Insufficient closing tick span (${spanMinutes}m < 15m required). Scoring held neutral.`;
+        closingImpact = "0 pts (Data Pending)";
+      } else {
+        isClosingDataValid = true;
+        lastHourNetDelta = (pClose.netDiff || 0) - (p1415.netDiff || 0);
+        const windowStr = `(${p1415.time || "14:15"} to ${pClose.time || "15:40"})`;
+
+        if (lastHourNetDelta >= 75000) {
+          score += 3;
+          closingFlowStatus = "INSTITUTIONAL_PUT_BLITZ";
+          closingFlowDetail = `Massive late Put accumulation (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}). Aggressive institutional floor defense.`;
+          closingImpact = "+3 pts (Institutional Blitz)";
+        } else if (lastHourNetDelta >= 30000) {
+          score += 2;
+          closingFlowStatus = "BULLISH";
+          closingFlowDetail = `Strong late Put writing (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
+          closingImpact = "+2 pts";
+        } else if (lastHourNetDelta >= 10000) {
+          score += 1;
+          closingFlowStatus = "MILD_BULLISH";
+          closingFlowDetail = `Moderate late Put addition (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
+          closingImpact = "+1 pt";
+        } else if (lastHourNetDelta <= -75000) {
+          score -= 3;
+          closingFlowStatus = "INSTITUTIONAL_CALL_BLITZ";
+          closingFlowDetail = `Massive late Call distribution (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}). Aggressive institutional ceiling hedge.`;
+          closingImpact = "-3 pts (Institutional Blitz)";
+        } else if (lastHourNetDelta <= -30000) {
+          score -= 2;
+          closingFlowStatus = "BEARISH";
+          closingFlowDetail = `Heavy late Call writing (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
+          closingImpact = "-2 pts";
+        } else if (lastHourNetDelta <= -10000) {
+          score -= 1;
+          closingFlowStatus = "MILD_BEARISH";
+          closingFlowDetail = `Moderate late Call addition (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
+          closingImpact = "-1 pt";
+        } else {
+          closingFlowDetail = `Closing flow steady (${formatLots(lastHourNetDelta)} lots ${windowStr})`;
+          closingImpact = "0 pts";
+        }
+      }
     }
   } else {
-    closingFlowDetail = "Awaiting more intraday ticks";
-    closingImpact = "0 pts";
+    closingFlowStatus = "AWAITING_DATA";
+    closingFlowDetail = "Data Integrity Notice: Insufficient intraday timeline ticks (< 3). Scoring held neutral.";
+    closingImpact = "0 pts (Data Pending)";
   }
 
   audit.push({
@@ -826,9 +878,10 @@ export function calculateEODDecision({
   // Thresholds: on Friday, require score >= 4 or <= -4 due to weekend decay
   // Late Institutional Divergence Guardrails (14:15+ Veto)
   // If late flow aggressively contradicts full-day writing, block carry trade to avoid gap traps
+  // GATED: Only fire if closing window data is verified valid!
   let lateVetoWarning = null;
-  const isLateCallBlitz = (lastHourNetDelta <= -50000);
-  const isLatePutBlitz = (lastHourNetDelta >= 50000);
+  const isLateCallBlitz = isClosingDataValid && (lastHourNetDelta <= -50000);
+  const isLatePutBlitz = isClosingDataValid && (lastHourNetDelta >= 50000);
 
   const slShort = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 35);
   const targetShort = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 70);
@@ -839,7 +892,7 @@ export function calculateEODDecision({
   if (isLateCallBlitz) {
     // Neutralize BTST: Smart money wrote heavy Calls into close (like Nov 5th)
     score = Math.min(1, score);
-    const callLots = formatLots(Math.abs(lastHourNetDelta)).replace(/^\+/, "");
+    const callLots = formatLotsAbs(lastHourNetDelta);
     lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots) entered after 14:15. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
     audit.push({
       label: "14:15+ Institutional Veto Guardrail",
@@ -850,7 +903,7 @@ export function calculateEODDecision({
   } else if (isLatePutBlitz) {
     // Neutralize STBT: Smart money underwrote heavy Puts into close
     score = Math.max(-1, score);
-    const putLots = formatLots(Math.abs(lastHourNetDelta)).replace(/^\+/, "");
+    const putLots = formatLotsAbs(lastHourNetDelta);
     lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots) entered after 14:15. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
     audit.push({
       label: "14:15+ Institutional Veto Guardrail",
@@ -913,6 +966,8 @@ export function calculateEODDecision({
     pcrWarning,
     pcr: numPcr,
     deltaPcr: numDelta,
+    isClosingDataValid,
+    lastHourNetDelta,
   };
 }
 
