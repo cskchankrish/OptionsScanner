@@ -29,18 +29,24 @@ test("CANONICAL_EOD_SEED_HISTORY contains verified 05-Nov-2026 Cash Preservation
   assert.ok(nov5, "05-Nov-2026 must be present in canonical seed history");
   assert.equal(nov5.verdict, "EXIT TO CASH / DO NOT CARRY");
   assert.equal(nov5.outcome, "PRESERVED_CASH");
-  assert.equal(nov5.gapPts, -171.0);
+  assert.equal(nov5.entrySpot, 24536.60);
+  assert.equal(nov5.nextDayOpen, 24538.20);
+  assert.equal(nov5.gapPts, 1.60);
 
   // Verify uniqueness of all sessions
   const isoDates = CANONICAL_EOD_SEED_HISTORY.map(h => h.isoDate);
   const uniqueIsoDates = new Set(isoDates);
   assert.equal(isoDates.length, uniqueIsoDates.size, "Seed history must have no duplicate dates");
 
-  // Verify all sessions are weekday trading days (no Saturday/Sunday)
+  // Verify all historical sessions have verified positive entrySpot and nextDayOpen (except pending latest)
   for (const h of CANONICAL_EOD_SEED_HISTORY) {
     const dt = new Date(h.isoDate + "T12:00:00Z");
     const day = dt.getDay();
     assert.ok(day >= 1 && day <= 5, `${h.isoDate} must be a weekday trading session, got day ${day}`);
+    assert.ok(h.entrySpot > 20000 && h.entrySpot < 30000, `${h.isoDate} entrySpot must be authentic Nifty spot quote`);
+    if (h.outcome !== "PENDING") {
+      assert.ok(h.nextDayOpen > 20000 && h.nextDayOpen < 30000, `${h.isoDate} nextDayOpen must be authentic Nifty spot quote`);
+    }
   }
 });
 

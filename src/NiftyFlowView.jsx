@@ -1122,12 +1122,14 @@ export function NiftyFlowView({ t, isDark }) {
     }
 
     try {
-      const storedHistory = localStorage.getItem("options_scanner_eod_history_v4") || localStorage.getItem("options_scanner_eod_history_v4");
+      const storedHistory = localStorage.getItem("options_scanner_eod_history_v5");
       if (storedHistory) {
         const parsed = JSON.parse(storedHistory);
         if (Array.isArray(parsed) && parsed.length > 0) {
           setEodHistory(prev => mergeEodHistory(prev, parsed));
         }
+      } else {
+        localStorage.removeItem("options_scanner_eod_history_v4");
       }
     } catch (e) {
       console.warn("Could not load local EOD history:", e);
@@ -1226,7 +1228,7 @@ export function NiftyFlowView({ t, isDark }) {
               merged = mergeEodHistory(merged, [todayEntry]);
             }
             try {
-              localStorage.setItem("options_scanner_eod_history_v4", JSON.stringify(merged));
+              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(merged));
             } catch (e) {}
             return merged;
           });
@@ -1814,7 +1816,7 @@ export function NiftyFlowView({ t, isDark }) {
               return item;
             });
             try {
-              localStorage.setItem("options_scanner_eod_history_v4", JSON.stringify(updated));
+              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(updated));
               fetch("/api/nifty-oi", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
