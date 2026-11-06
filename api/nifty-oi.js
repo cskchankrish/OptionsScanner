@@ -273,14 +273,14 @@ function buildTimeline(totPut, totCall, spot) {
   const nowMins = getISTMinutes();
   const nowStr = getISTTimeStr();
 
-  // Market hours: 09:15 = 555 mins, 15:30 = 930 mins
+  // Market & Futures settlement hours: 09:15 = 555 mins, 15:40 = 940 mins
   if (nowMins < 555) {
     return [
       { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: spot }
     ];
   }
 
-  const capMins = Math.min(930, nowMins);
+  const capMins = Math.min(940, nowMins); // Extended to 15:40 to capture full Futures & post-closing reconciliation
 
   // Append or update latest live tick (1-min granularity) strictly with REAL exchange data
   const last = intradayHistory[intradayHistory.length - 1];
@@ -780,13 +780,13 @@ export function calculateEODDecision({
   });
 
   const isFriday = (dayOfWeek === 5);
-  const isDecisionWindow = (nowMins >= 885 && nowMins <= 930); // 14:45 to 15:30 IST
+  const isDecisionWindow = (nowMins >= 885 && nowMins <= 940); // 14:45 to 15:40 IST
 
   let statusLabel = "EARLY MONITORING";
   if (isDecisionWindow) {
     statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
-  } else if (nowMins > 930) {
-    statusLabel = "MARKET CLOSED · EOD POST-MORTEM";
+  } else if (nowMins > 940) {
+    statusLabel = "MARKET CLOSED · EOD POST-MORTEM (Post-15:40 Settlement)";
   } else {
     statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
   }

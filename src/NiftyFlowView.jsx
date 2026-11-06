@@ -307,8 +307,8 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   const plotH = svgHeight - padTop - padBottom;
 
   const startMin = 555; // 09:15
-  const endMin = 930;   // 15:30
-  const spanMin = endMin - startMin; // 375
+  const endMin = 940;   // 15:40 (Extended for Futures & reconciliation ticks)
+  const spanMin = endMin - startMin; // 385
 
   const xPos = (m) => padLeft + ((Math.max(startMin, Math.min(endMin, m)) - startMin) / spanMin) * plotW;
 
@@ -385,7 +385,7 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
     { label: "13:00", min: 780 },
     { label: "14:00", min: 840 },
     { label: "15:00", min: 900 },
-    { label: "15:30", min: 930 },
+    { label: "15:40", min: 940 },
   ];
 
   const latestPoint = points[points.length - 1];
