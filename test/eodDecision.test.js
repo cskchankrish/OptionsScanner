@@ -154,3 +154,58 @@ test("DEFAULT_EOD_SEED_HISTORY provides multi-session track record with verified
   assert.ok(winRate >= 75, `Expected win rate >= 75%, got ${winRate}%`);
   assert.ok(DEFAULT_EOD_SEED_HISTORY.some(h => h.outcome === "PRESERVED_CASH"));
 });
+
+
+test("calculateEODDecision awards ±3 pts for dominant 14:15+ institutional flow", () => {
+  const result = calculateEODDecision({
+    spot: 24200,
+    floorStrike: 24100,
+    roofStrike: 24350,
+    totPutWriting: 100000,
+    totCallWriting: 100000, // 0 pts full day
+    pcr: 1.05,
+    deltaPcr: 1.10, // 0 pts pcr
+    timeline: [
+      { minutes: 855, netDiff: 10000 },
+      { minutes: 900, netDiff: 60000 },
+      { minutes: 915, netDiff: 95000 } // +85,000 lots since 14:15 -> +3 pts!
+    ],
+    dayOfWeek: 3,
+    nowMins: 915,
+  });
+
+  const closingAudit = result.audit.find(a => a.label === "Closing Hour Flow (14:15+)");
+  assert.equal(closingAudit.status, "INSTITUTIONAL_PUT_BLITZ");
+  assert.equal(closingAudit.impact, "+3 pts (Institutional Blitz)");
+  assert.equal(result.verdict, "CARRY NIFTY CE (BTST)");
+});
+
+test("calculateEODDecision triggers LATE CALL BLITZ VETO and blocks BTST when smart money writes calls after 14:15 (Nov 5th scenario)", () => {
+  // Scenario: Morning was bullish (+2 pts full day, +1 level), but after 14:15, > 1.2L CE was written (-85k netDiff)
+  const result = calculateEODDecision({
+    spot: 24536,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 300000,
+    totCallWriting: 180000, // +2 pts on full day
+    pcr: 1.34,
+    deltaPcr: 0.95,
+    timeline: [
+      { minutes: 855, netDiff: 30000 }, // 14:15 IST
+      { minutes: 900, netDiff: -20000 },
+      { minutes: 915, netDiff: -65000 } // -95,000 delta since 14:15 (heavy CE writing)
+    ],
+    dayOfWeek: 4, // Thursday (yesterday)
+    nowMins: 915,
+  });
+
+  // VETO must fire and BTST must be blocked
+  assert.notEqual(result.verdict, "CARRY NIFTY CE (BTST)", "BTST must be blocked when late CE blitz occurs");
+  assert.equal(result.verdict, "EXIT TO CASH / DO NOT CARRY");
+  assert.equal(result.bias, "NEUTRAL");
+
+  const vetoAudit = result.audit.find(a => a.label.includes("14:15+ Institutional Veto"));
+  assert.ok(vetoAudit, "Audit must include 14:15+ Veto Guardrail");
+  assert.equal(vetoAudit.status, "BEARISH_VETO");
+  assert.ok(result.action.includes("LATE CALL BLITZ VETO"));
+});

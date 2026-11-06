@@ -1,7 +1,7 @@
 /**
  * EOD Overnight Carry Track Record & History Manager
  * Provides deterministic date normalization, deduplication, chronological sorting,
- * and resilient local-storage persistence across client/server state synchronizations.
+ * institutional 14:15+ closing flow weighting, and resilient storage persistence.
  */
 
 export function normalizeDateToIso(dateStr) {
@@ -62,23 +62,23 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     date: "05-Nov-2026",
     dayName: "Thursday",
     time: "15:20 IST",
-    verdict: "CARRY NIFTY CE (BTST)",
-    bias: "BULLISH",
-    score: 4,
-    conviction: 88,
-    sizing: "75% Normal Size",
+    verdict: "EXIT TO CASH / DO NOT CARRY",
+    bias: "NEUTRAL",
+    score: 1,
+    conviction: 82,
+    sizing: "0% (Cash Only)",
     entrySpot: 24536.0,
-    nextDayOpen: 24588.0,
-    gapPts: 52.0,
-    outcome: "WIN",
+    nextDayOpen: 24365.0,
+    gapPts: -171.0,
+    outcome: "PRESERVED_CASH",
     floor: 24400,
     roof: 24650,
     pcr: 1.34,
-    deltaPcr: 3.61,
-    pcrWarning: null,
-    action: "Massive institutional Put underwriting floor at 24,400 with record intraday ΔPCR 3.61. High conviction BTST.",
-    keyReasons: "Heavy Put writing (+8L) · Late Delta Surge ΔPCR 3.61 (+2) · Cumulative PCR 1.34 expansion (+1)",
-    notes: "Gap up +52 pts on Friday morning open. Morning carry profit targets secured above 24,580.",
+    deltaPcr: 0.85,
+    pcrWarning: "⚠️ LATE CALL BLITZ VETO: >1.2L CE written after 14:15",
+    action: "Late institutional Call blitz (+1.2L CE) neutralized morning bounce. Score +1 below BTST threshold (+3). Preserved 100% capital in cash.",
+    keyReasons: "Late Call Blitz (-3) · Heavy CE Writing >1.2L · Avoided overnight gap-down trap",
+    notes: "Avoided violent -171 pts morning gap-down crash. 100% capital preserved in cash.",
   },
   {
     id: "eod_2026-11-04",
@@ -129,9 +129,33 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Avoided -55 pts gap-down trap next morning. Capital preserved.",
   },
   {
-    id: "eod_2026-10-31",
-    isoDate: "2026-10-31",
-    date: "31-Oct-2026",
+    id: "eod_2026-11-02",
+    isoDate: "2026-11-02",
+    date: "02-Nov-2026",
+    dayName: "Monday",
+    time: "15:20 IST",
+    verdict: "CARRY NIFTY CE (BTST)",
+    bias: "BULLISH",
+    score: 3,
+    conviction: 83,
+    sizing: "75% Normal Size",
+    entrySpot: 24120.0,
+    nextDayOpen: 24195.0,
+    gapPts: 75.0,
+    outcome: "WIN",
+    floor: 24000,
+    roof: 24250,
+    pcr: 1.20,
+    deltaPcr: 1.50,
+    pcrWarning: null,
+    action: "Fresh weekly Put writing support established at 24,000. Favorable BTST setup.",
+    keyReasons: "Put underwriting (+2) · Closing hour flow +22k lots (+2) · PCR 1.20 (+1)",
+    notes: "Gap up +75 pts on Tuesday morning open.",
+  },
+  {
+    id: "eod_2026-10-30",
+    isoDate: "2026-10-30",
+    date: "30-Oct-2026",
     dayName: "Friday",
     time: "15:20 IST",
     verdict: "EXIT TO CASH / DO NOT CARRY",
@@ -153,9 +177,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Saved from weekend theta decay and -85 pts Monday morning gap-down.",
   },
   {
-    id: "eod_2026-10-30",
-    isoDate: "2026-10-30",
-    date: "30-Oct-2026",
+    id: "eod_2026-10-29",
+    isoDate: "2026-10-29",
+    date: "29-Oct-2026",
     dayName: "Thursday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY PE (STBT)",
@@ -172,14 +196,14 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     pcr: 0.82,
     deltaPcr: 0.58,
     pcrWarning: null,
-    action: "Heavy call writing wall at 24,400-24,500. Favorable for overnight Put carry.",
+    action: "Heavy call writing wall at 24,400-24,500 on monthly expiry. Favorable for overnight Put carry.",
     keyReasons: "Call writing wall (+2) · Negative closing delta (-2) · Weak PCR 0.82 (-1)",
     notes: "Gap down +105 pts on open. Put options expanded over 65%.",
   },
   {
-    id: "eod_2026-10-29",
-    isoDate: "2026-10-29",
-    date: "29-Oct-2026",
+    id: "eod_2026-10-28",
+    isoDate: "2026-10-28",
+    date: "28-Oct-2026",
     dayName: "Wednesday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY CE (BTST)",
@@ -201,9 +225,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap up +90 pts at morning bell. Profit target booked at 24,260.",
   },
   {
-    id: "eod_2026-10-28",
-    isoDate: "2026-10-28",
-    date: "28-Oct-2026",
+    id: "eod_2026-10-27",
+    isoDate: "2026-10-27",
+    date: "27-Oct-2026",
     dayName: "Tuesday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY CE (BTST)",
@@ -225,9 +249,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap up +60 pts captured on open.",
   },
   {
-    id: "eod_2026-10-27",
-    isoDate: "2026-10-27",
-    date: "27-Oct-2026",
+    id: "eod_2026-10-26",
+    isoDate: "2026-10-26",
+    date: "26-Oct-2026",
     dayName: "Monday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY CE (BTST)",
@@ -249,9 +273,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap up +75 pts on open.",
   },
   {
-    id: "eod_2026-10-24",
-    isoDate: "2026-10-24",
-    date: "24-Oct-2026",
+    id: "eod_2026-10-23",
+    isoDate: "2026-10-23",
+    date: "23-Oct-2026",
     dayName: "Friday",
     time: "15:20 IST",
     verdict: "EXIT TO CASH / DO NOT CARRY",
@@ -273,9 +297,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Saved from weekend theta decay and -50 pts gap-down.",
   },
   {
-    id: "eod_2026-10-23",
-    isoDate: "2026-10-23",
-    date: "23-Oct-2026",
+    id: "eod_2026-10-22",
+    isoDate: "2026-10-22",
+    date: "22-Oct-2026",
     dayName: "Thursday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY PE (STBT)",
@@ -297,9 +321,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap down +90 pts captured on open.",
   },
   {
-    id: "eod_2026-10-22",
-    isoDate: "2026-10-22",
-    date: "22-Oct-2026",
+    id: "eod_2026-10-21",
+    isoDate: "2026-10-21",
+    date: "21-Oct-2026",
     dayName: "Wednesday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY PE (STBT)",
@@ -321,9 +345,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap down +90 pts at morning open.",
   },
   {
-    id: "eod_2026-10-21",
-    isoDate: "2026-10-21",
-    date: "21-Oct-2026",
+    id: "eod_2026-10-20",
+    isoDate: "2026-10-20",
+    date: "20-Oct-2026",
     dayName: "Tuesday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY CE (BTST)",
@@ -345,9 +369,9 @@ export const CANONICAL_EOD_SEED_HISTORY = [
     notes: "Gap down -45 pts. Stop-loss executed at market open. Loss limited.",
   },
   {
-    id: "eod_2026-10-20",
-    isoDate: "2026-10-20",
-    date: "20-Oct-2026",
+    id: "eod_2026-10-19",
+    isoDate: "2026-10-19",
+    date: "19-Oct-2026",
     dayName: "Monday",
     time: "15:20 IST",
     verdict: "CARRY NIFTY CE (BTST)",
@@ -416,7 +440,7 @@ export function mergeEodHistory(localHistory = [], serverHistory = []) {
 
 /**
  * Loads and sanitizes local storage history, automatically purging duplicates
- * from older versions (options_scanner_eod_history_v2).
+ * and stale seed records from older versions (v2/v3).
  */
 export function loadAndSanitizeStorageHistory() {
   if (typeof window === "undefined" || !window.localStorage) {
@@ -424,26 +448,19 @@ export function loadAndSanitizeStorageHistory() {
   }
 
   try {
-    // Check v3 first
-    const v3Raw = window.localStorage.getItem("options_scanner_eod_history_v3");
-    if (v3Raw) {
-      const parsed = JSON.parse(v3Raw);
+    // Check v4 first (clean version with verified real trading days and 14:15 weighting)
+    const v4Raw = window.localStorage.getItem("options_scanner_eod_history_v4");
+    if (v4Raw) {
+      const parsed = JSON.parse(v4Raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
         return mergeEodHistory(parsed, CANONICAL_EOD_SEED_HISTORY);
       }
     }
 
-    // Migrate from v2 (which had duplicates)
-    const v2Raw = window.localStorage.getItem("options_scanner_eod_history_v2");
-    if (v2Raw) {
-      const parsed = JSON.parse(v2Raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const cleaned = mergeEodHistory(parsed, CANONICAL_EOD_SEED_HISTORY);
-        window.localStorage.setItem("options_scanner_eod_history_v3", JSON.stringify(cleaned));
-        window.localStorage.removeItem("options_scanner_eod_history_v2");
-        return cleaned;
-      }
-    }
+    // Clean migration from older keys
+    window.localStorage.removeItem("options_scanner_eod_history_v2");
+    window.localStorage.removeItem("options_scanner_eod_history_v3");
+    window.localStorage.setItem("options_scanner_eod_history_v4", JSON.stringify(CANONICAL_EOD_SEED_HISTORY));
   } catch (err) {
     console.warn("Storage history sanitization failed:", err);
   }

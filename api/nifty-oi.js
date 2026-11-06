@@ -647,10 +647,12 @@ export function calculateEODDecision({
     impact: fullDayStatus === "BULLISH" ? "+2 pts" : fullDayStatus === "BEARISH" ? "-2 pts" : "0 pts",
   });
 
-  // 2. Final Hour Flow (14:15 to current)
+  // 2. Final Hour Flow (14:15 to current) - Tiered Institutional Weighting (Up to ±3 pts)
   let lastHourNetDelta = 0;
   let closingFlowStatus = "NEUTRAL";
   let closingFlowDetail = "Neutral closing hour flow";
+  let closingImpact = "0 pts";
+
   if (timeline && timeline.length >= 3) {
     let p1415 = timeline[0];
     let minDiff = Infinity;
@@ -664,25 +666,50 @@ export function calculateEODDecision({
     const pNow = timeline[timeline.length - 1];
     lastHourNetDelta = (pNow.netDiff || 0) - (p1415.netDiff || 0);
 
-    if (lastHourNetDelta > 20000) {
+    if (lastHourNetDelta >= 75000) {
+      score += 3;
+      closingFlowStatus = "INSTITUTIONAL_PUT_BLITZ";
+      closingFlowDetail = `Massive late Put accumulation (+${formatLots(lastHourNetDelta)} lots since 14:15). Aggressive institutional floor defense.`;
+      closingImpact = "+3 pts (Institutional Blitz)";
+    } else if (lastHourNetDelta >= 30000) {
       score += 2;
       closingFlowStatus = "BULLISH";
-      closingFlowDetail = `Strong Put accumulation (${formatLots(lastHourNetDelta)} lots since 14:15)`;
-    } else if (lastHourNetDelta < -20000) {
+      closingFlowDetail = `Strong late Put writing (+${formatLots(lastHourNetDelta)} lots since 14:15).`;
+      closingImpact = "+2 pts";
+    } else if (lastHourNetDelta >= 10000) {
+      score += 1;
+      closingFlowStatus = "MILD_BULLISH";
+      closingFlowDetail = `Moderate late Put addition (+${formatLots(lastHourNetDelta)} lots since 14:15).`;
+      closingImpact = "+1 pt";
+    } else if (lastHourNetDelta <= -75000) {
+      score -= 3;
+      closingFlowStatus = "INSTITUTIONAL_CALL_BLITZ";
+      closingFlowDetail = `Massive late Call distribution (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15). Aggressive institutional ceiling hedge.`;
+      closingImpact = "-3 pts (Institutional Blitz)";
+    } else if (lastHourNetDelta <= -30000) {
       score -= 2;
       closingFlowStatus = "BEARISH";
-      closingFlowDetail = `Heavy Call distribution (${formatLots(lastHourNetDelta)} lots since 14:15)`;
+      closingFlowDetail = `Heavy late Call writing (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15).`;
+      closingImpact = "-2 pts";
+    } else if (lastHourNetDelta <= -10000) {
+      score -= 1;
+      closingFlowStatus = "MILD_BEARISH";
+      closingFlowDetail = `Moderate late Call addition (-${formatLots(Math.abs(lastHourNetDelta))} lots since 14:15).`;
+      closingImpact = "-1 pt";
     } else {
       closingFlowDetail = `Closing flow steady (${formatLots(lastHourNetDelta)} lots since 14:15)`;
+      closingImpact = "0 pts";
     }
   } else {
     closingFlowDetail = "Awaiting more intraday ticks";
+    closingImpact = "0 pts";
   }
+
   audit.push({
     label: "Closing Hour Flow (14:15+)",
     status: closingFlowStatus,
     detail: closingFlowDetail,
-    impact: closingFlowStatus === "BULLISH" ? "+2 pts" : closingFlowStatus === "BEARISH" ? "-2 pts" : "0 pts",
+    impact: closingImpact,
   });
 
   // 3. PCR & Delta PCR with Extreme Sentiment Boundary Guardrails
@@ -771,6 +798,34 @@ export function calculateEODDecision({
   let action = "No overnight edge. Balanced flow or chop. Carry zero leverage into next session.";
 
   // Thresholds: on Friday, require score >= 4 or <= -4 due to weekend decay
+  // Late Institutional Divergence Guardrails (14:15+ Veto)
+  // If late flow aggressively contradicts full-day writing, block carry trade to avoid gap traps
+  let lateVetoWarning = null;
+  const isLateCallBlitz = (lastHourNetDelta <= -50000);
+  const isLatePutBlitz = (lastHourNetDelta >= 50000);
+
+  if (isLateCallBlitz) {
+    // Neutralize BTST: Smart money wrote heavy Calls into close (like Nov 5th)
+    score = Math.min(1, score);
+    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (-${formatLots(Math.abs(lastHourNetDelta))} lots) entered after 14:15. BTST strictly forbidden.`;
+    audit.push({
+      label: "14:15+ Institutional Veto Guardrail",
+      status: "BEARISH_VETO",
+      detail: lateVetoWarning,
+      impact: "VETO (BTST Forbidden)",
+    });
+  } else if (isLatePutBlitz) {
+    // Neutralize STBT: Smart money underwrote heavy Puts into close
+    score = Math.max(-1, score);
+    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (+${formatLots(lastHourNetDelta)} lots) entered after 14:15. STBT strictly forbidden.`;
+    audit.push({
+      label: "14:15+ Institutional Veto Guardrail",
+      status: "BULLISH_VETO",
+      detail: lateVetoWarning,
+      impact: "VETO (STBT Forbidden)",
+    });
+  }
+
   const thresh = isFriday ? 4 : 3;
 
   if (score >= thresh) {
@@ -796,7 +851,9 @@ export function calculateEODDecision({
     bias = "NEUTRAL";
     conviction = 80;
     sizing = "0% (Cash Only)";
-    const riskReason = isFriday
+    const riskReason = lateVetoWarning
+      ? lateVetoWarning
+      : isFriday
       ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
       : pcrWarning
       ? `Market showing mixed signals under ${pcrWarning}`
