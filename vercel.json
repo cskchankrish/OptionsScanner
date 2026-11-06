@@ -1,12 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "vite",
-  "crons": [
-    {
-      "path": "/api/nifty-oi",
-      "schedule": "*/2 3-10 * * 1-5"
-    }
-  ],
   "functions": {
     "api/*.js": {
       "maxDuration": 15
