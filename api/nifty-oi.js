@@ -147,7 +147,7 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     pcrWarning: eodDecision.pcrWarning,
     action: eodDecision.action,
     keyReasons: (eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
-    notes: eodDecision.isDecisionWindow ? "Decision finalized in execution window." : "Intraday monitoring snapshot.",
+    notes: (eodDecision.isDecisionWindow || nowMins >= 940) ? "Decision finalized on closing settlement (15:40 IST)." : "Intraday monitoring snapshot.",
   };
 
   if (existingIdx >= 0) {
@@ -234,14 +234,26 @@ async function setRedisTimeline(dateKey, timelineArray) {
 }
 
 async function syncRedisHistory(today) {
+  const nowMins = getISTMinutes();
+
+  // Reset session after 23:00 IST or before 09:15 IST
+  if (nowMins >= 1380 || nowMins < 555) {
+    intradayHistory = [];
+    sessionDate = today;
+    return;
+  }
+
   if (sessionDate !== today) {
     intradayHistory = [];
     sessionDate = today;
   }
+
   if (REDIS_URL && (!intradayHistory || intradayHistory.length === 0)) {
     const remote = await getRedisTimeline(today);
     if (Array.isArray(remote) && remote.length > 0) {
-      intradayHistory = remote;
+      intradayHistory = remote
+        .filter(pt => pt && (pt.minutes || 0) <= 940 && (pt.time || "") <= "15:40")
+        .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
     }
   }
 }
@@ -283,22 +295,55 @@ function getISTTimeStr() {
 
 function buildTimeline(totPut, totCall, spot) {
   const today = getISTDateStr();
+  const nowMins = getISTMinutes();
+  const nowStr = getISTTimeStr();
+
+  // 1. Overnight / Pre-Market Reset Window (23:00 to 09:15 IST)
+  // At 23:00 IST sharp, the session resets in preparation for the next trading day
+  if (nowMins >= 1380 || nowMins < 555) {
+    intradayHistory = [];
+    sessionDate = today;
+    return [];
+  }
+
   if (sessionDate !== today) {
     intradayHistory = [];
     sessionDate = today;
   }
 
-  const nowMins = getISTMinutes();
-  const nowStr = getISTTimeStr();
+  // 2. Post-Market Evening Review Window (15:40 to 23:00 IST)
+  // Market is closed. Today's minute-by-minute data must be preserved until 23:00 IST.
+  // Never wipe or mutate the timeline with ad-hoc post-market ticks.
+  if (nowMins > 940) {
+    intradayHistory = intradayHistory.filter(pt => pt && (pt.minutes || 0) <= 940 && (pt.time || "") <= "15:40");
 
-  // Market & Futures settlement hours: 09:15 = 555 mins, 15:40 = 940 mins
-  if (nowMins < 555) {
-    return [
-      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: spot }
-    ];
+    const last = intradayHistory[intradayHistory.length - 1];
+    if (last && last.minutes < 940 && intradayHistory.length >= 3) {
+      // Add official 15:40 closing settlement tick if missing
+      intradayHistory.push({
+        time: "15:40",
+        minutes: 940,
+        putWriting: totPut,
+        callWriting: totCall,
+        netDiff: totPut - totCall,
+        spot: spot,
+        isLiveTick: false,
+      });
+      if (REDIS_URL) {
+        setRedisTimeline(today, intradayHistory).catch(() => {});
+      }
+    } else if (last && last.minutes === 940) {
+      last.putWriting = totPut;
+      last.callWriting = totCall;
+      last.netDiff = totPut - totCall;
+      last.spot = spot;
+    }
+
+    return intradayHistory;
   }
 
-  const capMins = Math.min(940, nowMins); // Extended to 15:40 to capture full Futures & post-closing reconciliation
+  // 3. Live Market Hours (09:15 to 15:40 IST)
+  const capMins = Math.min(940, nowMins);
   const tickTime = nowMins >= 940 ? "15:40" : nowStr;
 
   // Filter out any invalid post-market ticks that may have been previously appended
@@ -315,7 +360,7 @@ function buildTimeline(totPut, totCall, spot) {
       callWriting: totCall,
       netDiff: totPut - totCall,
       spot: spot,
-      isLiveTick: nowMins <= 940,
+      isLiveTick: true,
     });
     didUpdate = true;
   } else if (last) {
@@ -324,7 +369,7 @@ function buildTimeline(totPut, totCall, spot) {
     last.netDiff = totPut - totCall;
     last.spot = spot;
     last.time = tickTime;
-    last.isLiveTick = nowMins <= 940;
+    last.isLiveTick = true;
     didUpdate = true;
   }
 
@@ -863,8 +908,10 @@ export function calculateEODDecision({
   let statusLabel = "EARLY MONITORING";
   if (isDecisionWindow) {
     statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
-  } else if (nowMins > 940) {
-    statusLabel = "MARKET CLOSED · EOD POST-MORTEM (Post-15:40 Settlement)";
+  } else if (nowMins > 940 && nowMins < 1380) {
+    statusLabel = "MARKET CLOSED · EOD DECISION SETTLED AT 15:40 IST (Active until 23:00 IST)";
+  } else if (nowMins >= 1380 || nowMins < 555) {
+    statusLabel = "PRE-MARKET · AWAITING 09:15 IST OPEN";
   } else {
     statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
   }
@@ -1243,6 +1290,14 @@ export default async function handler(req, res) {
       eodHistory,
       intradayTimeline: timeline,
       hasRedis: Boolean(REDIS_URL),
+      sessionWindow: {
+        isLiveMarket: getISTMinutes() >= 555 && getISTMinutes() <= 940,
+        isEveningReview: getISTMinutes() > 940 && getISTMinutes() < 1380,
+        isPreMarketOrReset: getISTMinutes() >= 1380 || getISTMinutes() < 555,
+        resetTime: "23:00 IST",
+        openTime: "09:15 IST",
+        settlementTime: "15:40 IST",
+      },
     };
 
     cache = { data: payload, timestamp: now };

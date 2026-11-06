@@ -345,3 +345,45 @@ test("calculateEODDecision displays exact verified window (14:15 to 15:30) when 
   assert.equal(closingAudit.impact, "+2 pts");
   assert.ok(closingAudit.detail.includes("(14:15 to 15:30)"), "Must display verified window timestamps");
 });
+
+test("calculateEODDecision sets evening review status active until 23:00 IST and resets to pre-market at 23:00+", () => {
+  const baseTimeline = [
+    { minutes: 855, netDiff: 10000, time: "14:15" },
+    { minutes: 900, netDiff: 30000, time: "15:00" },
+    { minutes: 940, netDiff: 50000, time: "15:40" }
+  ];
+
+  // 1. Post-market evening review (e.g. 19:30 IST / 1170 mins): Active until 23:00 IST
+  const eveningResult = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 200000,
+    totCallWriting: 100000,
+    pcr: 1.15,
+    deltaPcr: 1.25,
+    timeline: baseTimeline,
+    dayOfWeek: 3,
+    nowMins: 1170, // 19:30 IST
+  });
+
+  assert.ok(eveningResult.statusLabel.includes("MARKET CLOSED · EOD DECISION SETTLED AT 15:40 IST"));
+  assert.ok(eveningResult.statusLabel.includes("Active until 23:00 IST"));
+  assert.equal(eveningResult.isClosingDataValid, true);
+
+  // 2. Overnight reset (e.g. 23:15 IST / 1395 mins): Resets to pre-market
+  const overnightResult = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 200000,
+    totCallWriting: 100000,
+    pcr: 1.15,
+    deltaPcr: 1.25,
+    timeline: baseTimeline,
+    dayOfWeek: 3,
+    nowMins: 1395, // 23:15 IST
+  });
+
+  assert.equal(overnightResult.statusLabel, "PRE-MARKET · AWAITING 09:15 IST OPEN");
+});

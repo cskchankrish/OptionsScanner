@@ -58,17 +58,19 @@ function getMarketSessionStatus() {
   const isWeekend = day === 0 || day === 6;
   const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
 
-  // Active market auto-refresh window: 09:00 AM (540 mins) to 04:00 PM (960 mins) IST
-  const isWithinHours = mins >= 540 && mins < 960;
+  // Active market auto-refresh window: 09:15 AM (555 mins) to 03:40 PM (940 mins) IST
+  const isWithinHours = mins >= 555 && mins <= 940;
   const isAutoActive = !isWeekend && isWithinHours;
 
   let reason = "";
   if (isWeekend) {
-    reason = "Weekend · Resumes Mon 09:00 AM";
-  } else if (mins < 540) {
-    reason = "Pre-market · Resumes 09:00 AM";
-  } else if (mins >= 960) {
-    reason = "Market Closed · Resumes 09:00 AM";
+    reason = "Weekend · Resumes Mon 09:15 AM";
+  } else if (mins < 555) {
+    reason = "Pre-market · Resumes 09:15 AM";
+  } else if (mins >= 1380) {
+    reason = "Session Reset (23:00 IST) · Resumes 09:15 AM";
+  } else if (mins > 940) {
+    reason = "Market Closed · Settled at 15:40 IST (Active until 23:00 IST)";
   }
 
   return { isAutoActive, reason };
@@ -1080,16 +1082,24 @@ export function NiftyFlowView({ t, isDark }) {
   // Restore timeline & argon data from localStorage on mount (preserves state across browser close/refresh)
   useEffect(() => {
     try {
+      const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+      const nowMins = istDate.getHours() * 60 + istDate.getMinutes();
       const todayKey = getTodayDateKey();
-      const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
-      if (stored) {
-        const localArr = JSON.parse(stored);
-        if (Array.isArray(localArr) && localArr.length > 0) {
-          setOiData(prev => {
-            if (!prev) return { intradayTimeline: localArr, strikes: [] };
-            const merged = mergeTimelineArrays(localArr, prev.intradayTimeline || []);
-            return { ...prev, intradayTimeline: merged };
-          });
+
+      // If past 23:00 IST or before 09:15 IST, clear previous day timeline from localStorage
+      if (nowMins >= 1380 || nowMins < 555) {
+        localStorage.removeItem(`nifty_timeline_v2_${todayKey}`);
+      } else {
+        const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
+        if (stored) {
+          const localArr = JSON.parse(stored);
+          if (Array.isArray(localArr) && localArr.length > 0) {
+            setOiData(prev => {
+              if (!prev) return { intradayTimeline: localArr, strikes: [] };
+              const merged = mergeTimelineArrays(localArr, prev.intradayTimeline || []);
+              return { ...prev, intradayTimeline: merged };
+            });
+          }
         }
       }
     } catch (e) {
