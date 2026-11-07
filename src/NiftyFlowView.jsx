@@ -75,29 +75,25 @@ function getMarketSessionStatus() {
     const isMuhuratActive = mins >= 840 && mins <= 960;
     let reason = "";
     if (mins < 840) {
-      reason = "🪔 Diwali Muhurat Pre-market · Opens 14:00 IST (Trading 14:20 - 15:20)";
-    } else if (mins >= 1380) {
-      reason = "Session Reset (23:00 IST) · Resumes Mon 09:15 AM";
+      reason = "🪔 Diwali Muhurat Pre-market · Opens 14:00 IST (Trading 14:20 - 15:20) · Friday Settled Preserved";
     } else if (mins > 960) {
-      reason = "🪔 Diwali Muhurat Closed · Settled at 16:00 IST (Active until 23:00 IST)";
+      reason = "🪔 Diwali Muhurat Closed · Settled at 16:00 IST (Preserved until Mon 09:15 AM)";
     }
     return { isAutoActive: isMuhuratActive, reason, isSundayDiwali: true };
   }
 
   // Saturday
   if (isSaturday) {
-    return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST" };
+    return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST (Friday Settled Preserved)" };
   }
 
   // Weekday (Mon-Fri)
   const isWithinHours = mins >= 555 && mins <= 940;
   let reason = "";
   if (mins < 555) {
-    reason = "Pre-market · Resumes 09:15 AM";
-  } else if (mins >= 1380) {
-    reason = "Session Reset (23:00 IST) · Resumes 09:15 AM";
+    reason = "Pre-market · Resumes 09:15 AM (Previous Session Preserved)";
   } else if (mins > 940) {
-    reason = "Market Closed · Settled at 15:40 IST (Active until 23:00 IST)";
+    reason = "Market Closed · Settled at 15:40 IST (Preserved until Next Market Open 09:15 AM)";
   }
 
   return { isAutoActive: isWithinHours, reason };
@@ -1119,30 +1115,32 @@ export function NiftyFlowView({ t, isDark }) {
   const [editingOpenId, setEditingOpenId] = useState(null);
   const [customOpenSpot, setCustomOpenSpot] = useState("");
 
-  // Restore timeline & argon data from localStorage on mount (preserves state across browser close/refresh)
+  // Restore settled session & timeline from localStorage on mount (instant display, zero delay across reloads)
   useEffect(() => {
     try {
-      const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-      const nowMins = istDate.getHours() * 60 + istDate.getMinutes();
-      const day = istDate.getDay();
-      const isSunday = day === 0;
-      const openMins = isSunday ? 840 : 555;
-      const todayKey = getTodayDateKey();
+      const storedSession = localStorage.getItem("nifty_saved_session_v3");
+      if (storedSession) {
+        const parsed = JSON.parse(storedSession);
+        if (parsed && (parsed.spotPrice || parsed.strikes?.length)) {
+          globalOiCache = parsed;
+          setOiData(parsed);
+        }
+      }
+    } catch (e) {
+      console.warn("Could not load local session cache:", e);
+    }
 
-      // If past 23:00 IST or before session open (09:15 weekdays / 14:00 Sunday), clear previous day timeline
-      if (nowMins >= 1380 || nowMins < openMins) {
-        localStorage.removeItem(`nifty_timeline_v2_${todayKey}`);
-      } else {
-        const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
-        if (stored) {
-          const localArr = JSON.parse(stored);
-          if (Array.isArray(localArr) && localArr.length > 0) {
-            setOiData(prev => {
-              if (!prev) return { intradayTimeline: localArr, strikes: [] };
-              const merged = mergeTimelineArrays(localArr, prev.intradayTimeline || []);
-              return { ...prev, intradayTimeline: merged };
-            });
-          }
+    try {
+      const todayKey = getTodayDateKey();
+      const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
+      if (stored) {
+        const localArr = JSON.parse(stored);
+        if (Array.isArray(localArr) && localArr.length > 0) {
+          setOiData(prev => {
+            if (!prev) return { intradayTimeline: localArr, strikes: [] };
+            const merged = mergeTimelineArrays(localArr, prev.intradayTimeline || []);
+            return { ...prev, intradayTimeline: merged };
+          });
         }
       }
     } catch (e) {
@@ -1235,6 +1233,9 @@ export function NiftyFlowView({ t, isDark }) {
         const fullData = { ...data, intradayTimeline: finalTimeline };
         globalOiCache = fullData;
         setOiData(fullData);
+        try {
+          localStorage.setItem("nifty_saved_session_v3", JSON.stringify(fullData));
+        } catch (e) {}
 
         // Sync EOD History
         if (data.eodHistory || data.eodDecision) {
