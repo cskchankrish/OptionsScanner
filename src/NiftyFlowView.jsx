@@ -55,17 +55,33 @@ function formatLots(n) {
 function getMarketSessionStatus() {
   const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const day = nowIst.getDay(); // 0 = Sunday, 6 = Saturday
-  const isWeekend = day === 0 || day === 6;
+  const isSunday = day === 0;
+  const isSaturday = day === 6;
   const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
 
-  // Active market auto-refresh window: 09:15 AM (555 mins) to 03:40 PM (940 mins) IST
-  const isWithinHours = mins >= 555 && mins <= 940;
-  const isAutoActive = !isWeekend && isWithinHours;
+  // Sunday Diwali Muhurat Trading Window: 14:00 to 16:00 IST (mins 840 to 960)
+  if (isSunday) {
+    const isMuhuratActive = mins >= 840 && mins <= 960;
+    let reason = "";
+    if (mins < 840) {
+      reason = "🪔 Diwali Muhurat Pre-market · Opens 14:00 IST (Trading 14:20 - 15:20)";
+    } else if (mins >= 1380) {
+      reason = "Session Reset (23:00 IST) · Resumes Mon 09:15 AM";
+    } else if (mins > 960) {
+      reason = "🪔 Diwali Muhurat Closed · Settled at 16:00 IST (Active until 23:00 IST)";
+    }
+    return { isAutoActive: isMuhuratActive, reason, isSundayDiwali: true };
+  }
 
+  // Saturday
+  if (isSaturday) {
+    return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST" };
+  }
+
+  // Weekday (Mon-Fri)
+  const isWithinHours = mins >= 555 && mins <= 940;
   let reason = "";
-  if (isWeekend) {
-    reason = "Weekend · Resumes Mon 09:15 AM";
-  } else if (mins < 555) {
+  if (mins < 555) {
     reason = "Pre-market · Resumes 09:15 AM";
   } else if (mins >= 1380) {
     reason = "Session Reset (23:00 IST) · Resumes 09:15 AM";
@@ -73,7 +89,7 @@ function getMarketSessionStatus() {
     reason = "Market Closed · Settled at 15:40 IST (Active until 23:00 IST)";
   }
 
-  return { isAutoActive, reason };
+  return { isAutoActive: isWithinHours, reason };
 }
 
 function getIstDayInfo() {
@@ -308,9 +324,12 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   const plotW = svgWidth - padLeft - padRight;
   const plotH = svgHeight - padTop - padBottom;
 
-  const startMin = 555; // 09:15
-  const endMin = 940;   // 15:40 (Extended for Futures & reconciliation ticks)
-  const spanMin = endMin - startMin; // 385
+  const isSundayChart = (new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })).getDay() === 0) ||
+    (points.length > 0 && points.every(p => (p.minutes || 0) >= 800));
+
+  const startMin = isSundayChart ? 840 : 555; // 14:00 on Sunday Muhurat, 09:15 on weekdays
+  const endMin = isSundayChart ? 960 : 940;   // 16:00 on Sunday Muhurat, 15:40 on weekdays
+  const spanMin = endMin - startMin;
 
   const xPos = (m) => padLeft + ((Math.max(startMin, Math.min(endMin, m)) - startMin) / spanMin) * plotW;
 
@@ -379,16 +398,26 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   }, [points, maxDual]);
 
   // Hourly grid points
-  const timeLabels = [
-    { label: "09:15", min: 555 },
-    { label: "10:00", min: 600 },
-    { label: "11:00", min: 660 },
-    { label: "12:00", min: 720 },
-    { label: "13:00", min: 780 },
-    { label: "14:00", min: 840 },
-    { label: "15:00", min: 900 },
-    { label: "15:40", min: 940 },
-  ];
+  const timeLabels = isSundayChart
+    ? [
+        { label: "14:00", min: 840 },
+        { label: "14:20", min: 860 },
+        { label: "14:40", min: 880 },
+        { label: "15:00", min: 900 },
+        { label: "15:20", min: 920 },
+        { label: "15:40", min: 940 },
+        { label: "16:00", min: 960 },
+      ]
+    : [
+        { label: "09:15", min: 555 },
+        { label: "10:00", min: 600 },
+        { label: "11:00", min: 660 },
+        { label: "12:00", min: 720 },
+        { label: "13:00", min: 780 },
+        { label: "14:00", min: 840 },
+        { label: "15:00", min: 900 },
+        { label: "15:40", min: 940 },
+      ];
 
   const latestPoint = points[points.length - 1];
   const hovered = hoverIdx !== null && points[hoverIdx] ? points[hoverIdx] : latestPoint;
@@ -1012,12 +1041,12 @@ function getTodayDateKey() {
 function mergeTimelineArrays(localArr = [], serverArr = []) {
   const map = new Map();
   for (const item of (Array.isArray(localArr) ? localArr : [])) {
-    if (item && item.time && (item.minutes || 0) <= 940 && item.time <= "15:40") {
+    if (item && item.time && (item.minutes || 0) <= 960 && item.time <= "16:00") {
       map.set(item.time, item);
     }
   }
   for (const item of (Array.isArray(serverArr) ? serverArr : [])) {
-    if (item && item.time && (item.minutes || 0) <= 940 && item.time <= "15:40") {
+    if (item && item.time && (item.minutes || 0) <= 960 && item.time <= "16:00") {
       map.set(item.time, item);
     }
   }
@@ -1031,7 +1060,7 @@ function mergeTimelineArrays(localArr = [], serverArr = []) {
     const cur = raw[i];
     bridged.push(cur);
     const next = raw[i + 1];
-    if (next && next.minutes - cur.minutes > 2 && next.minutes <= 940) {
+    if (next && next.minutes - cur.minutes > 2 && next.minutes <= 960) {
       const gapSteps = next.minutes - cur.minutes;
       for (let m = cur.minutes + 1; m < next.minutes; m++) {
         const fraction = (m - cur.minutes) / gapSteps;
@@ -1084,10 +1113,13 @@ export function NiftyFlowView({ t, isDark }) {
     try {
       const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
       const nowMins = istDate.getHours() * 60 + istDate.getMinutes();
+      const day = istDate.getDay();
+      const isSunday = day === 0;
+      const openMins = isSunday ? 840 : 555;
       const todayKey = getTodayDateKey();
 
-      // If past 23:00 IST or before 09:15 IST, clear previous day timeline from localStorage
-      if (nowMins >= 1380 || nowMins < 555) {
+      // If past 23:00 IST or before session open (09:15 weekdays / 14:00 Sunday), clear previous day timeline
+      if (nowMins >= 1380 || nowMins < openMins) {
         localStorage.removeItem(`nifty_timeline_v2_${todayKey}`);
       } else {
         const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);

@@ -387,3 +387,120 @@ test("calculateEODDecision sets evening review status active until 23:00 IST and
 
   assert.equal(overnightResult.statusLabel, "PRE-MARKET · AWAITING 09:15 IST OPEN");
 });
+
+test("calculateEODDecision handles Sunday Diwali Muhurat session lifecycles (pre-market, monitoring, execution window, settled evening review)", () => {
+  const diwaliTimeline = [
+    { minutes: 840, netDiff: 5000, time: "14:00" },
+    { minutes: 860, netDiff: 15000, time: "14:20" },
+    { minutes: 900, netDiff: 45000, time: "15:00" },
+    { minutes: 920, netDiff: 65000, time: "15:20" },
+    { minutes: 960, netDiff: 75000, time: "16:00" }
+  ];
+
+  // 1. Sunday Pre-market (e.g. 11:30 IST / 690 mins)
+  const preRes = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    timeline: diwaliTimeline,
+    dayOfWeek: 0, // Sunday
+    nowMins: 690,
+  });
+  assert.equal(preRes.isSunday, true);
+  assert.equal(preRes.isFriday, false);
+  assert.ok(preRes.statusLabel.includes("DIWALI MUHURAT PRE-MARKET"));
+  assert.ok(preRes.statusLabel.includes("WINDOW OPENS AT 14:00 IST"));
+
+  // 2. Sunday Monitoring & Trading Active (e.g. 14:35 IST / 875 mins)
+  const monitorRes = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    timeline: diwaliTimeline,
+    dayOfWeek: 0,
+    nowMins: 875,
+  });
+  assert.ok(monitorRes.statusLabel.includes("DIWALI MUHURAT MONITORING"));
+  assert.ok(monitorRes.statusLabel.includes("TRADING ACTIVE (14:20 - 15:20 IST)"));
+
+  // 3. Sunday Execution Window (e.g. 15:10 IST / 910 mins)
+  const execRes = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 250000,
+    totCallWriting: 100000,
+    pcr: 1.25,
+    deltaPcr: 1.6,
+    timeline: diwaliTimeline,
+    dayOfWeek: 0,
+    nowMins: 910,
+  });
+  assert.equal(execRes.isDecisionWindow, true);
+  assert.ok(execRes.statusLabel.includes("DIWALI MUHURAT EXECUTION WINDOW"));
+  assert.equal(execRes.verdict, "CARRY NIFTY CE (BTST)");
+  assert.equal(execRes.sizing, "75% Normal Size"); // Normal sizing, Monday opens in <18 hours
+
+  // 4. Sunday Evening Review Window (e.g. 17:30 IST / 1050 mins)
+  const eveRes = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 250000,
+    totCallWriting: 100000,
+    pcr: 1.25,
+    deltaPcr: 1.6,
+    timeline: diwaliTimeline,
+    dayOfWeek: 0,
+    nowMins: 1050,
+  });
+  assert.ok(eveRes.statusLabel.includes("DIWALI MUHURAT CLOSED · EOD DECISION SETTLED AT 16:00 IST"));
+  assert.ok(eveRes.statusLabel.includes("Active until 23:00 IST"));
+  assert.equal(eveRes.isClosingDataValid, true);
+
+  // 5. Sunday 23:00+ Reset
+  const resetRes = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    timeline: diwaliTimeline,
+    dayOfWeek: 0,
+    nowMins: 1390,
+  });
+  assert.ok(resetRes.statusLabel.includes("DIWALI MUHURAT PRE-MARKET"));
+});
+
+test("calculateEODDecision anchors closing flow at 14:20 and handles late blitz in Sunday Diwali Muhurat session", () => {
+  const diwaliLateCallTimeline = [
+    { minutes: 840, netDiff: 10000, time: "14:00" },
+    { minutes: 860, netDiff: 20000, time: "14:20" },
+    { minutes: 900, netDiff: -20000, time: "15:00" },
+    { minutes: 920, netDiff: -65000, time: "15:20" } // Drop of 85k lots from 14:20
+  ];
+
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24600,
+    totPutWriting: 150000,
+    totCallWriting: 140000,
+    pcr: 1.05,
+    deltaPcr: 0.95,
+    timeline: diwaliLateCallTimeline,
+    dayOfWeek: 0, // Sunday
+    nowMins: 920,
+  });
+
+  assert.equal(result.isClosingDataValid, true);
+  const closingAudit = result.audit.find(a => a.label.includes("Diwali Muhurat Closing Flow"));
+  assert.ok(closingAudit, "Must have Diwali Muhurat Closing Flow audit");
+  assert.equal(closingAudit.status, "INSTITUTIONAL_CALL_BLITZ");
+  assert.equal(closingAudit.impact, "-3 pts (Institutional Blitz)");
+
+  // Late Veto should trigger
+  const vetoAudit = result.audit.find(a => a.label.includes("Muhurat Institutional Veto Guardrail"));
+  assert.ok(vetoAudit, "Must have Muhurat Institutional Veto Guardrail");
+  assert.ok(result.action.includes("LATE CALL BLITZ VETO"));
+  assert.ok(result.action.includes("BTST strictly forbidden"));
+  assert.equal(result.stopLoss, 24600);
+});

@@ -2,8 +2,10 @@ name: Market Hours OI Pulse
 
 on:
   schedule:
-    # Run every 5 minutes during trading days (Monday to Friday)
-    - cron: "*/5 3-11 * * 1-5"
+    # Run every 5 minutes:
+    # Mon-Fri: 03:45 - 10:15 UTC (09:15 - 15:45 IST)
+    # Sunday (Diwali Muhurat Trading): 08:30 - 10:30 UTC (14:00 - 16:00 IST)
+    - cron: "*/5 3-11 * * 0-5"
   workflow_dispatch:
 
 jobs:
@@ -13,11 +15,27 @@ jobs:
     steps:
       - name: Hit Nifty OI Endpoint within Market Window
         run: |
+          IST_DOW=$(TZ='Asia/Kolkata' date +%w)
           IST_TIME=$(TZ='Asia/Kolkata' date +%H%M)
-          echo "Current IST Time: $IST_TIME"
-          if [ "$IST_TIME" -ge "0915" ] && [ "$IST_TIME" -le "1540" ]; then
-            echo "Within market window (09:15 - 15:40 IST). Pinging API..."
+          echo "Current IST DOW: $IST_DOW (0=Sun..6=Sat), IST Time: $IST_TIME"
+
+          IS_ACTIVE=false
+          # Regular weekday market (Mon-Fri 1-5): 09:15 to 15:40 IST
+          if [ "$IST_DOW" -ge 1 ] && [ "$IST_DOW" -le 5 ]; then
+            if [ "$IST_TIME" -ge "0915" ] && [ "$IST_TIME" -le "1540" ]; then
+              IS_ACTIVE=true
+            fi
+          # Sunday Diwali Muhurat Trading exception (0=Sun): 14:00 to 16:00 IST
+          elif [ "$IST_DOW" -eq 0 ]; then
+            if [ "$IST_TIME" -ge "1400" ] && [ "$IST_TIME" -le "1600" ]; then
+              IS_ACTIVE=true
+              echo "🪔 Diwali Muhurat Trading session active (14:00 - 16:00 IST)!"
+            fi
+          fi
+
+          if [ "$IS_ACTIVE" = true ]; then
+            echo "Within active market window. Pinging API..."
             curl -s -m 12 "https://options-scanner-seven.vercel.app/api/nifty-oi" > /dev/null || true
           else
-            echo "Outside market window (09:15 - 15:40 IST). Skipping ping to protect EOD settlement integrity."
+            echo "Outside market window. Skipping ping to protect EOD settlement integrity."
           fi

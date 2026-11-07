@@ -83,6 +83,11 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   const dayName = new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" });
   const timeStr = `${getISTTimeStr()} IST`;
   const nowMins = getISTMinutes();
+  const dayOfWeek = getISTDayOfWeek();
+  const isSunday = (dayOfWeek === 0);
+  const openMins = isSunday ? 840 : 555;
+  const closeMins = isSunday ? 960 : 940;
+  const closeTimeStr = isSunday ? "16:00" : "15:40";
 
   let history = null;
   if (REDIS_URL) {
@@ -92,8 +97,8 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     history = [...CANONICAL_EOD_SEED_HISTORY];
   }
 
-  // 1. If previous session is PENDING and market has opened today (nowMins >= 555), auto-resolve next morning open outcome
-  if (nowMins >= 555 && history.length > 0) {
+  // 1. If previous session is PENDING and market has opened today, auto-resolve next morning open outcome
+  if (nowMins >= openMins && history.length > 0) {
     for (let i = 0; i < Math.min(3, history.length); i++) {
       const item = history[i];
       const itemIso = normalizeDateToIso(item?.isoDate || item?.date || item?.id);
@@ -147,7 +152,7 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     pcrWarning: eodDecision.pcrWarning,
     action: eodDecision.action,
     keyReasons: (eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
-    notes: (eodDecision.isDecisionWindow || nowMins >= 940) ? "Decision finalized on closing settlement (15:40 IST)." : "Intraday monitoring snapshot.",
+    notes: (eodDecision.isDecisionWindow || nowMins >= closeMins) ? `Decision finalized on closing settlement (${closeTimeStr} IST).` : "Intraday monitoring snapshot.",
   };
 
   if (existingIdx >= 0) {
@@ -235,9 +240,14 @@ async function setRedisTimeline(dateKey, timelineArray) {
 
 async function syncRedisHistory(today) {
   const nowMins = getISTMinutes();
+  const dayOfWeek = getISTDayOfWeek();
+  const isSunday = (dayOfWeek === 0);
+  const openMins = isSunday ? 840 : 555;
+  const closeMins = isSunday ? 960 : 940;
+  const closeTimeStr = isSunday ? "16:00" : "15:40";
 
-  // Reset session after 23:00 IST or before 09:15 IST
-  if (nowMins >= 1380 || nowMins < 555) {
+  // Reset session after 23:00 IST or before market open (09:15 weekdays / 14:00 Sunday Muhurat)
+  if (nowMins >= 1380 || nowMins < openMins) {
     intradayHistory = [];
     sessionDate = today;
     return;
@@ -252,7 +262,7 @@ async function syncRedisHistory(today) {
     const remote = await getRedisTimeline(today);
     if (Array.isArray(remote) && remote.length > (intradayHistory ? intradayHistory.length : 0)) {
       intradayHistory = remote
-        .filter(pt => pt && (pt.minutes || 0) <= 940 && (pt.time || "") <= "15:40")
+        .filter(pt => pt && (pt.minutes || 0) <= closeMins && (pt.time || "") <= closeTimeStr)
         .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
     }
   }
@@ -297,10 +307,15 @@ function buildTimeline(totPut, totCall, spot) {
   const today = getISTDateStr();
   const nowMins = getISTMinutes();
   const nowStr = getISTTimeStr();
+  const dayOfWeek = getISTDayOfWeek();
+  const isSunday = (dayOfWeek === 0);
+  const openMins = isSunday ? 840 : 555;
+  const closeMins = isSunday ? 960 : 940;
+  const closeTimeStr = isSunday ? "16:00" : "15:40";
 
-  // 1. Overnight / Pre-Market Reset Window (23:00 to 09:15 IST)
+  // 1. Overnight / Pre-Market Reset Window (23:00 to session open IST)
   // At 23:00 IST sharp, the session resets in preparation for the next trading day
-  if (nowMins >= 1380 || nowMins < 555) {
+  if (nowMins >= 1380 || nowMins < openMins) {
     intradayHistory = [];
     sessionDate = today;
     return [];
@@ -311,18 +326,18 @@ function buildTimeline(totPut, totCall, spot) {
     sessionDate = today;
   }
 
-  // 2. Post-Market Evening Review Window (15:40 to 23:00 IST)
+  // 2. Post-Market Evening Review Window (closeMins to 23:00 IST)
   // Market is closed. Today's minute-by-minute data must be preserved until 23:00 IST.
   // Never wipe or mutate the timeline with ad-hoc post-market ticks.
-  if (nowMins > 940) {
-    intradayHistory = intradayHistory.filter(pt => pt && (pt.minutes || 0) <= 940 && (pt.time || "") <= "15:40");
+  if (nowMins > closeMins) {
+    intradayHistory = intradayHistory.filter(pt => pt && (pt.minutes || 0) <= closeMins && (pt.time || "") <= closeTimeStr);
 
     const last = intradayHistory[intradayHistory.length - 1];
-    if (last && last.minutes < 940 && intradayHistory.length >= 3) {
-      // Add official 15:40 closing settlement tick if missing
+    if (last && last.minutes < closeMins && intradayHistory.length >= 3) {
+      // Add official closing settlement tick if missing
       intradayHistory.push({
-        time: "15:40",
-        minutes: 940,
+        time: closeTimeStr,
+        minutes: closeMins,
         putWriting: totPut,
         callWriting: totCall,
         netDiff: totPut - totCall,
@@ -332,7 +347,7 @@ function buildTimeline(totPut, totCall, spot) {
       if (REDIS_URL) {
         setRedisTimeline(today, intradayHistory).catch(() => {});
       }
-    } else if (last && last.minutes === 940) {
+    } else if (last && last.minutes === closeMins) {
       last.putWriting = totPut;
       last.callWriting = totCall;
       last.netDiff = totPut - totCall;
@@ -342,12 +357,12 @@ function buildTimeline(totPut, totCall, spot) {
     return intradayHistory;
   }
 
-  // 3. Live Market Hours (09:15 to 15:40 IST)
-  const capMins = Math.min(940, nowMins);
-  const tickTime = nowMins >= 940 ? "15:40" : nowStr;
+  // 3. Live Market Hours (openMins to closeMins IST)
+  const capMins = Math.min(closeMins, nowMins);
+  const tickTime = nowMins >= closeMins ? closeTimeStr : nowStr;
 
   // Filter out any invalid post-market ticks that may have been previously appended
-  intradayHistory = intradayHistory.filter(pt => pt && pt.minutes <= 940 && pt.time <= "15:40");
+  intradayHistory = intradayHistory.filter(pt => pt && pt.minutes <= closeMins && pt.time <= closeTimeStr);
 
   // Append or update latest live tick (1-min granularity) strictly with REAL exchange data
   const last = intradayHistory[intradayHistory.length - 1];
@@ -703,6 +718,16 @@ export function calculateEODDecision({
   let score = 0;
   const audit = [];
 
+  const isSunday = (dayOfWeek === 0);
+  const isFriday = (dayOfWeek === 5);
+  const openMins = isSunday ? 840 : 555;
+  const closeMins = isSunday ? 960 : 940;
+  const closeTimeStr = isSunday ? "16:00" : "15:40";
+  const anchorTargetMins = isSunday ? 860 : 855; // 14:20 IST on Sunday Muhurat, 14:15 IST on weekdays
+  const flowActivateMins = isSunday ? 880 : 870; // 14:40 IST on Sunday Muhurat, 14:30 IST on weekdays
+  const flowAnchorStr = isSunday ? "14:20" : "14:15";
+  const flowLabel = isSunday ? "Diwali Muhurat Closing Flow (14:20+)" : "Closing Hour Flow (14:15+)";
+
   // 1. Full Day Writing Ratio
   let fullDayStatus = "NEUTRAL";
   let fullDayDetail = "Balanced / non-directional writing";
@@ -722,10 +747,10 @@ export function calculateEODDecision({
     impact: fullDayStatus === "BULLISH" ? "+2 pts" : fullDayStatus === "BEARISH" ? "-2 pts" : "0 pts",
   });
 
-  // 2. Final Hour Flow (14:15 to current) - Tiered Institutional Weighting (Up to ±3 pts)
+  // 2. Final Hour Flow (14:15+ weekdays / 14:20+ Sunday) - Tiered Institutional Weighting (Up to ±3 pts)
   // Data Integrity Validation: verify presence and continuity of closing window ticks
   const validTimeline = (Array.isArray(timeline) ? timeline : []).filter(
-    pt => pt && Number.isFinite(pt.minutes) && pt.minutes >= 555 && pt.minutes <= 940 && Number.isFinite(pt.netDiff)
+    pt => pt && Number.isFinite(pt.minutes) && pt.minutes >= openMins && pt.minutes <= closeMins && Number.isFinite(pt.netDiff)
   );
 
   let isClosingDataValid = false;
@@ -733,27 +758,28 @@ export function calculateEODDecision({
   let pClose = null;
   let lastHourNetDelta = 0;
   let closingFlowStatus = "NEUTRAL";
-  let closingFlowDetail = "Neutral closing hour flow";
+  let closingFlowDetail = isSunday ? "Neutral Diwali Muhurat flow" : "Neutral closing hour flow";
   let closingImpact = "0 pts";
 
   if (validTimeline.length >= 3) {
     let minAnchorDiff = Infinity;
     for (const pt of validTimeline) {
-      const d = Math.abs(pt.minutes - 855); // 855 = 14:15 IST
-      if (d <= 25 && d < minAnchorDiff) {
+      const d = Math.abs(pt.minutes - anchorTargetMins);
+      if (d <= (isSunday ? 30 : 25) && d < minAnchorDiff) {
         minAnchorDiff = d;
         p1415 = pt;
       }
     }
 
-    if (nowMins < 870) {
-      // Before 14:30 IST: Closing window is still accumulating
+    if (nowMins < flowActivateMins) {
       closingFlowStatus = "MONITORING";
-      closingFlowDetail = "Intraday flow accumulating (14:15+ closing window activates after 14:30 IST)";
-      closingImpact = "0 pts (Pending 14:30+)";
+      closingFlowDetail = isSunday
+        ? "Diwali Muhurat flow accumulating (14:20+ window activates after 14:40 IST)"
+        : "Intraday flow accumulating (14:15+ closing window activates after 14:30 IST)";
+      closingImpact = isSunday ? "0 pts (Pending 14:40+)" : "0 pts (Pending 14:30+)";
     } else if (!p1415) {
       closingFlowStatus = "AWAITING_DATA";
-      closingFlowDetail = "Data Integrity Notice: Missing 14:15 IST baseline tick. Closing flow scoring held neutral.";
+      closingFlowDetail = `Data Integrity Notice: Missing ${flowAnchorStr} IST baseline tick. Closing flow scoring held neutral.`;
       closingImpact = "0 pts (Data Pending)";
     } else {
       pClose = validTimeline[validTimeline.length - 1];
@@ -766,7 +792,7 @@ export function calculateEODDecision({
       } else {
         isClosingDataValid = true;
         lastHourNetDelta = (pClose.netDiff || 0) - (p1415.netDiff || 0);
-        const windowStr = `(${p1415.time || "14:15"} to ${pClose.time || "15:40"})`;
+        const windowStr = `(${p1415.time || flowAnchorStr} to ${pClose.time || closeTimeStr})`;
 
         if (lastHourNetDelta >= 75000) {
           score += 3;
@@ -811,7 +837,7 @@ export function calculateEODDecision({
   }
 
   audit.push({
-    label: "Closing Hour Flow (14:15+)",
+    label: flowLabel,
     status: closingFlowStatus,
     detail: closingFlowDetail,
     impact: closingImpact,
@@ -902,18 +928,31 @@ export function calculateEODDecision({
     impact: levelStatus === "BULLISH" ? "+1 pt" : levelStatus === "BEARISH" ? "-1 pt" : "0 pts",
   });
 
-  const isFriday = (dayOfWeek === 5);
-  const isDecisionWindow = (nowMins >= 885 && nowMins <= 940); // 14:45 to 15:40 IST
+  const isDecisionWindow = isSunday
+    ? (nowMins >= 900 && nowMins <= 960) // 15:00 to 16:00 IST on Sunday Muhurat
+    : (nowMins >= 885 && nowMins <= 940); // 14:45 to 15:40 IST on weekdays
 
   let statusLabel = "EARLY MONITORING";
-  if (isDecisionWindow) {
-    statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
-  } else if (nowMins > 940 && nowMins < 1380) {
-    statusLabel = "MARKET CLOSED · EOD DECISION SETTLED AT 15:40 IST (Active until 23:00 IST)";
-  } else if (nowMins >= 1380 || nowMins < 555) {
-    statusLabel = "PRE-MARKET · AWAITING 09:15 IST OPEN";
+  if (isSunday) {
+    if (isDecisionWindow) {
+      statusLabel = "🪔 DIWALI MUHURAT EXECUTION WINDOW (15:00 - 15:20 IST)";
+    } else if (nowMins > 960 && nowMins < 1380) {
+      statusLabel = "🪔 DIWALI MUHURAT CLOSED · EOD DECISION SETTLED AT 16:00 IST (Active until 23:00 IST)";
+    } else if (nowMins >= 1380 || nowMins < 840) {
+      statusLabel = "🪔 DIWALI MUHURAT PRE-MARKET · WINDOW OPENS AT 14:00 IST (Trading 14:20 - 15:20)";
+    } else {
+      statusLabel = "🪔 DIWALI MUHURAT MONITORING · TRADING ACTIVE (14:20 - 15:20 IST)";
+    }
   } else {
-    statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
+    if (isDecisionWindow) {
+      statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
+    } else if (nowMins > 940 && nowMins < 1380) {
+      statusLabel = "MARKET CLOSED · EOD DECISION SETTLED AT 15:40 IST (Active until 23:00 IST)";
+    } else if (nowMins >= 1380 || nowMins < 555) {
+      statusLabel = "PRE-MARKET · AWAITING 09:15 IST OPEN";
+    } else {
+      statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
+    }
   }
 
   let verdict = "EXIT TO CASH / DO NOT CARRY";
@@ -923,7 +962,7 @@ export function calculateEODDecision({
   let action = "No overnight edge. Balanced flow or chop. Carry zero leverage into next session.";
 
   // Thresholds: on Friday, require score >= 4 or <= -4 due to weekend decay
-  // Late Institutional Divergence Guardrails (14:15+ Veto)
+  // Late Institutional Divergence Guardrails (14:15+ Veto / Sunday Muhurat Veto)
   // If late flow aggressively contradicts full-day writing, block carry trade to avoid gap traps
   // GATED: Only fire if closing window data is verified valid!
   let lateVetoWarning = null;
@@ -936,13 +975,15 @@ export function calculateEODDecision({
   const slLong = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 35);
   const targetLong = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 70);
 
+  const vetoAnchorTime = p1415?.time || flowAnchorStr;
+
   if (isLateCallBlitz) {
     // Neutralize BTST: Smart money wrote heavy Calls into close (like Nov 5th)
     score = Math.min(1, score);
     const callLots = formatLotsAbs(lastHourNetDelta);
-    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots) entered after 14:15. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
+    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots) entered after ${vetoAnchorTime}. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
     audit.push({
-      label: "14:15+ Institutional Veto Guardrail",
+      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
       status: "BEARISH_VETO",
       detail: lateVetoWarning,
       impact: `VETO BTST · Short SL: ${slShort}`,
@@ -951,9 +992,9 @@ export function calculateEODDecision({
     // Neutralize STBT: Smart money underwrote heavy Puts into close
     score = Math.max(-1, score);
     const putLots = formatLotsAbs(lastHourNetDelta);
-    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots) entered after 14:15. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
+    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots) entered after ${vetoAnchorTime}. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
     audit.push({
-      label: "14:15+ Institutional Veto Guardrail",
+      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
       status: "BULLISH_VETO",
       detail: lateVetoWarning,
       impact: `VETO STBT · Long SL: ${slLong}`,
@@ -990,6 +1031,8 @@ export function calculateEODDecision({
     } else {
       const riskReason = isFriday
         ? "Friday weekend alert: 2 full days of theta decay + weekend event risk without clear 80%+ institutional dominance"
+        : isSunday
+        ? "Diwali Muhurat session showing balanced writing without clear overnight edge"
         : pcrWarning
         ? `Market showing mixed signals under ${pcrWarning}`
         : "Balanced intraday flow without clear overnight edge";
@@ -1007,6 +1050,7 @@ export function calculateEODDecision({
     target: (bias === "BEARISH" || isLateCallBlitz) ? targetShort : (bias === "BULLISH" || isLatePutBlitz) ? targetLong : null,
     score,
     isFriday,
+    isSunday,
     isDecisionWindow,
     statusLabel,
     audit,
@@ -1045,15 +1089,15 @@ export default async function handler(req, res) {
       if (Array.isArray(incoming) && incoming.length > 0) {
         if (body?.replaceTimeline) {
           intradayHistory = incoming
-            .filter(pt => pt && pt.minutes <= 940 && pt.time <= "15:40")
+            .filter(pt => pt && pt.minutes <= 960 && pt.time <= "16:00")
             .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         } else {
           const map = new Map();
           for (const pt of intradayHistory) {
-            if (pt && pt.time && pt.minutes <= 940 && pt.time <= "15:40") map.set(pt.time, pt);
+            if (pt && pt.time && pt.minutes <= 960 && pt.time <= "16:00") map.set(pt.time, pt);
           }
           for (const pt of incoming) {
-            if (pt && pt.time && pt.minutes <= 940 && pt.time <= "15:40") map.set(pt.time, pt);
+            if (pt && pt.time && pt.minutes <= 960 && pt.time <= "16:00") map.set(pt.time, pt);
           }
           intradayHistory = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         }
@@ -1293,12 +1337,20 @@ export default async function handler(req, res) {
       intradayTimeline: timeline,
       hasRedis: Boolean(REDIS_URL),
       sessionWindow: {
-        isLiveMarket: getISTMinutes() >= 555 && getISTMinutes() <= 940,
-        isEveningReview: getISTMinutes() > 940 && getISTMinutes() < 1380,
-        isPreMarketOrReset: getISTMinutes() >= 1380 || getISTMinutes() < 555,
+        isSundayDiwali: getISTDayOfWeek() === 0,
+        tradingWindow: getISTDayOfWeek() === 0 ? "14:20 - 15:20 IST" : "09:15 - 15:30 IST",
+        isLiveMarket: getISTDayOfWeek() === 0
+          ? getISTMinutes() >= 840 && getISTMinutes() <= 960
+          : getISTMinutes() >= 555 && getISTMinutes() <= 940,
+        isEveningReview: getISTDayOfWeek() === 0
+          ? getISTMinutes() > 960 && getISTMinutes() < 1380
+          : getISTMinutes() > 940 && getISTMinutes() < 1380,
+        isPreMarketOrReset: getISTDayOfWeek() === 0
+          ? getISTMinutes() >= 1380 || getISTMinutes() < 840
+          : getISTMinutes() >= 1380 || getISTMinutes() < 555,
         resetTime: "23:00 IST",
-        openTime: "09:15 IST",
-        settlementTime: "15:40 IST",
+        openTime: getISTDayOfWeek() === 0 ? "14:00 IST" : "09:15 IST",
+        settlementTime: getISTDayOfWeek() === 0 ? "16:00 IST" : "15:40 IST",
       },
     };
 
