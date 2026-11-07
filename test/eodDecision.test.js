@@ -504,3 +504,94 @@ test("calculateEODDecision anchors closing flow at 14:20 and handles late blitz 
   assert.ok(result.action.includes("BTST strictly forbidden"));
   assert.equal(result.stopLoss, 24600);
 });
+
+test("calculateEODDecision integrates Smart Money Futures Fusion and enforces Bull Trap VETO_BTST", () => {
+  // Scenario: Options show bullish put writing (score would normally be +3 BTST)
+  // But Futures show Short-Covering rally into a massive Call wall at Roof -> BULL_TRAP
+  const fusionBullTrap = {
+    scenarioId: "BULL_TRAP",
+    badge: "🚨 BULL TRAP DETECTED",
+    headline: "Price Up on Short-Covering + Call Blitz at Roof",
+    actionableVerdict: "Veto Longs / Short with Strict SL",
+    eodCarryVeto: "VETO_BTST",
+    scoreBoost: -1,
+    color: "#f59e0b",
+    rationale: "Rally is driven only by short-covering while institutions write massive Calls at Roof.",
+  };
+
+  const result = calculateEODDecision({
+    spot: 24500,
+    floorStrike: 24400,
+    roofStrike: 24650,
+    totPutWriting: 250000,
+    totCallWriting: 140000,
+    pcr: 1.25,
+    deltaPcr: 1.55,
+    timeline: [
+      { minutes: 855, netDiff: 10000, time: "14:15" },
+      { minutes: 900, netDiff: 35000, time: "15:00" },
+      { minutes: 930, netDiff: 45000, time: "15:30" }
+    ],
+    dayOfWeek: 3, // Wednesday
+    nowMins: 930,
+    fusion: fusionBullTrap,
+  });
+
+  // Verdict MUST be downgraded from BTST to CASH
+  assert.equal(result.verdict, "EXIT TO CASH / DO NOT CARRY");
+  assert.equal(result.bias, "NEUTRAL");
+  assert.ok(result.action.includes("FUSION BULL TRAP VETO"));
+  assert.ok(result.action.includes("BTST strictly forbidden"));
+
+  // Check 5th Confluence Pillar in Audit
+  const fusionAudit = result.audit.find(a => a.label === "Smart Money Futures Fusion");
+  assert.ok(fusionAudit, "Must have 5th pillar 'Smart Money Futures Fusion' in audit");
+  assert.equal(fusionAudit.status, "BEARISH_VETO");
+  assert.equal(fusionAudit.impact, "VETO BTST (Bull Trap)");
+});
+
+test("calculateEODDecision integrates Smart Money Futures Fusion and enforces Bear Trap VETO_STBT", () => {
+  // Scenario: Options show bearish call writing (score would normally be -3 STBT)
+  // But Futures show Long-Unwinding dip absorbed by massive Floor Put writing -> BEAR_TRAP
+  const fusionBearTrap = {
+    scenarioId: "BEAR_TRAP",
+    badge: "🟢 BEAR TRAP (DIP ABSORPTION)",
+    headline: "Price Down on Long Unwinding + Put Blitz at Floor",
+    actionableVerdict: "Veto Shorts / Buy Dips at Support",
+    eodCarryVeto: "VETO_STBT",
+    scoreBoost: +1,
+    color: "#10b981",
+    rationale: "Drop is driven by long unwinding while institutions absorb the dip with heavy Put writing.",
+  };
+
+  const result = calculateEODDecision({
+    spot: 24180,
+    floorStrike: 24100,
+    roofStrike: 24300,
+    totPutWriting: 80000,
+    totCallWriting: 220000,
+    pcr: 0.82,
+    deltaPcr: 0.55,
+    timeline: [
+      { minutes: 855, netDiff: -10000, time: "14:15" },
+      { minutes: 900, netDiff: -35000, time: "15:00" },
+      { minutes: 930, netDiff: -45000, time: "15:30" }
+    ],
+    dayOfWeek: 4, // Thursday
+    nowMins: 930,
+    fusion: fusionBearTrap,
+  });
+
+  // Verdict MUST be downgraded from STBT to CASH
+  assert.equal(result.verdict, "EXIT TO CASH / DO NOT CARRY");
+  assert.equal(result.bias, "NEUTRAL");
+  assert.ok(result.action.includes("FUSION BEAR TRAP VETO"));
+  assert.ok(result.action.includes("STBT strictly forbidden"));
+
+  // Check 5th Confluence Pillar in Audit
+  const fusionAudit = result.audit.find(a => a.label === "Smart Money Futures Fusion");
+  assert.ok(fusionAudit, "Must have 5th pillar 'Smart Money Futures Fusion' in audit");
+  assert.equal(fusionAudit.status, "BULLISH_VETO");
+  assert.equal(fusionAudit.impact, "VETO STBT (Bear Trap)");
+});
+

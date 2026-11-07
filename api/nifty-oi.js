@@ -3,6 +3,11 @@ import {
   normalizeDateToIso,
   formatIsoToDisplayDate,
 } from "../src/eodTrackRecord.js";
+import {
+  parseNseFuturesPayload,
+  classifyFuturesQuadrant,
+  evaluateSmartMoneyFusion,
+} from "../src/smartMoneyFusion.js";
 
 let cache = {
   data: null,
@@ -55,6 +60,40 @@ export async function saveRedisEodHistory(historyArray) {
     return res.ok;
   } catch (e) {
     console.warn("Redis EOD history save error:", e.message);
+    return false;
+  }
+}
+
+export async function getRedisFuturesSnapshot() {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  try {
+    const res = await fetch(`${REDIS_URL}/get/nifty_futures_latest_v1`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.result) return null;
+    return typeof json.result === "string" ? JSON.parse(json.result) : json.result;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function saveRedisFuturesSnapshot(futuresData) {
+  if (!REDIS_URL || !REDIS_TOKEN || !futuresData) return false;
+  try {
+    await fetch(`${REDIS_URL}/set/nifty_futures_latest_v1?ex=86400`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify(futuresData),
+      signal: AbortSignal.timeout(2000),
+    });
+    return true;
+  } catch (e) {
     return false;
   }
 }
@@ -714,9 +753,15 @@ export function calculateEODDecision({
   timeline = [],
   dayOfWeek = 5,
   nowMins = 905,
+  fusion = null,
 }) {
   let score = 0;
   const audit = [];
+
+  // Apply Smart Money Futures Fusion Score Boost (+1 on Bullish Synergy, -1 on Bearish Synergy, -1 on Bull Trap, +1 on Bear Trap)
+  if (fusion?.scoreBoost && Number.isFinite(fusion.scoreBoost)) {
+    score += fusion.scoreBoost;
+  }
 
   const isSunday = (dayOfWeek === 0);
   const isFriday = (dayOfWeek === 5);
@@ -1001,6 +1046,35 @@ export function calculateEODDecision({
     });
   }
 
+  // 5. Smart Money Futures + Options Fusion Vetoes & Confluence Pillar
+  let fusionVetoWarning = null;
+  if (fusion?.eodCarryVeto === "VETO_BTST") {
+    score = Math.min(1, score);
+    fusionVetoWarning = `🚨 FUSION BULL TRAP VETO: ${fusion.headline}. BTST strictly forbidden. ${fusion.rationale}`;
+    audit.push({
+      label: "Smart Money Futures Fusion",
+      status: "BEARISH_VETO",
+      impact: "VETO BTST (Bull Trap)",
+      detail: fusionVetoWarning,
+    });
+  } else if (fusion?.eodCarryVeto === "VETO_STBT") {
+    score = Math.max(-1, score);
+    fusionVetoWarning = `🟢 FUSION BEAR TRAP VETO: ${fusion.headline}. STBT strictly forbidden. ${fusion.rationale}`;
+    audit.push({
+      label: "Smart Money Futures Fusion",
+      status: "BULLISH_VETO",
+      impact: "VETO STBT (Bear Trap)",
+      detail: fusionVetoWarning,
+    });
+  } else if (fusion) {
+    audit.push({
+      label: "Smart Money Futures Fusion",
+      status: fusion.scenarioId,
+      impact: fusion.actionableVerdict,
+      detail: `${fusion.badge}: ${fusion.headline}. ${fusion.rationale}`,
+    });
+  }
+
   const thresh = isFriday ? 4 : 3;
 
   if (score >= thresh) {
@@ -1026,7 +1100,9 @@ export function calculateEODDecision({
     bias = "NEUTRAL";
     conviction = 80;
     sizing = "0% (Cash Only)";
-    if (lateVetoWarning) {
+    if (fusionVetoWarning) {
+      action = `${fusionVetoWarning} Carry 0 overnight leverage in cash.`;
+    } else if (lateVetoWarning) {
       action = `${lateVetoWarning} Conservative / Friday weekend risk: Carry 0 leverage in cash.`;
     } else {
       const riskReason = isFriday
@@ -1046,8 +1122,8 @@ export function calculateEODDecision({
     conviction,
     sizing,
     action,
-    stopLoss: (bias === "BEARISH" || isLateCallBlitz) ? slShort : (bias === "BULLISH" || isLatePutBlitz) ? slLong : null,
-    target: (bias === "BEARISH" || isLateCallBlitz) ? targetShort : (bias === "BULLISH" || isLatePutBlitz) ? targetLong : null,
+    stopLoss: (bias === "BEARISH" || isLateCallBlitz || fusion?.eodCarryVeto === "VETO_BTST") ? slShort : (bias === "BULLISH" || isLatePutBlitz || fusion?.eodCarryVeto === "VETO_STBT") ? slLong : null,
+    target: (bias === "BEARISH" || isLateCallBlitz || fusion?.eodCarryVeto === "VETO_BTST") ? targetShort : (bias === "BULLISH" || isLatePutBlitz || fusion?.eodCarryVeto === "VETO_STBT") ? targetLong : null,
     score,
     isFriday,
     isSunday,
@@ -1059,6 +1135,7 @@ export function calculateEODDecision({
     deltaPcr: numDelta,
     isClosingDataValid,
     lastHourNetDelta,
+    fusion,
   };
 }
 
@@ -1154,19 +1231,45 @@ export default async function handler(req, res) {
     const contractData = await contractRes.json();
     const expiry = contractData.expiryDates?.[0] || "";
 
-    // 3. Fetch v3 option chain with 6.5s timeout
+    // 3. Fetch v3 option chain AND Nifty Futures concurrently via Promise.allSettled
     const v3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(expiry)}`;
-    const v3Res = await fetch(v3Url, {
-      headers: sessionHeaders,
-      signal: AbortSignal.timeout(6500),
-    });
-    if (!v3Res.ok) throw new Error(`v3 status ${v3Res.status}`);
-    const v3Data = await v3Res.json();
+    const futUrl = "https://www.nseindia.com/api/liveEquity-derivatives?index=nse50_fut";
+
+    const [v3Settled, futSettled] = await Promise.allSettled([
+      fetch(v3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }),
+      fetch(futUrl, { headers: sessionHeaders, signal: AbortSignal.timeout(4500) }),
+    ]);
+
+    if (v3Settled.status !== "fulfilled" || !v3Settled.value.ok) {
+      throw new Error(`v3 option chain failed: status ${v3Settled.status === "fulfilled" ? v3Settled.value.status : v3Settled.reason?.message}`);
+    }
+    const v3Data = await v3Settled.value.json();
 
     const spot = Number(v3Data.records?.underlyingValue) || 22696.65;
     const records = v3Data.filtered?.data || v3Data.records?.data || [];
     const expiryDate = expiry;
     const timestampStr = v3Data.records?.timestamp || new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
+
+    // Parse Nifty Futures with Rollover Protection & Graceful Degradation
+    let futuresMetrics = null;
+    if (futSettled.status === "fulfilled" && futSettled.value.ok) {
+      try {
+        const rawFutJson = await futSettled.value.json();
+        futuresMetrics = parseNseFuturesPayload(rawFutJson, spot);
+        if (futuresMetrics && REDIS_URL) {
+          saveRedisFuturesSnapshot(futuresMetrics).catch(() => {});
+        }
+      } catch (e) {
+        console.warn("Futures parse error:", e.message);
+      }
+    }
+
+    if (!futuresMetrics && REDIS_URL) {
+      const cachedFut = await getRedisFuturesSnapshot();
+      if (cachedFut) {
+        futuresMetrics = { ...cachedFut, isStale: true };
+      }
+    }
 
     // Focus on strikes near spot (e.g. +/- 550 points)
     const filteredRows = records.filter(r => {
@@ -1274,6 +1377,31 @@ export default async function handler(req, res) {
 
     const deltaPcr = calculateDeltaPcr(totPutWriting, totCallWriting);
 
+    // Evaluate strike concentration for Corridor Blitz
+    let roofCallDelta = 0;
+    let floorPutDelta = 0;
+    let totalCorridorDoi = 0;
+    for (const s of strikes) {
+      const pD = Math.max(0, s.putDeltaOI || 0);
+      const cD = Math.max(0, s.callDeltaOI || 0);
+      totalCorridorDoi += (pD + cD);
+      if (s.strike === roofStrike) roofCallDelta = cD;
+      if (s.strike === floorStrike) floorPutDelta = pD;
+    }
+    const roofCallWritingBlitz = totalCorridorDoi > 0 && (roofCallDelta / totalCorridorDoi) >= 0.20 && (totCallWriting > 1.2 * totPutWriting);
+    const floorPutWritingBlitz = totalCorridorDoi > 0 && (floorPutDelta / totalCorridorDoi) >= 0.20 && (totPutWriting > 1.2 * totCallWriting);
+
+    const optionsMetrics = {
+      deltaPcr,
+      pcr,
+      totalPutWriting,
+      totalCallWriting,
+      roofCallWritingBlitz,
+      floorPutWritingBlitz,
+    };
+
+    const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics);
+
     const timeline = buildTimeline(totPutWriting, totCallWriting, spot);
 
     // Compute Smart Money / Institutional Analysis
@@ -1296,6 +1424,7 @@ export default async function handler(req, res) {
       timeline,
       dayOfWeek: getISTDayOfWeek(),
       nowMins: getISTMinutes(),
+      fusion,
     });
 
     smartMoney.eodDecision = eodDecision;
@@ -1332,6 +1461,8 @@ export default async function handler(req, res) {
       pcrWarning: eodDecision.pcrWarning,
       strikes,
       smartMoney,
+      futures: futuresMetrics,
+      fusion,
       eodDecision,
       eodHistory,
       intradayTimeline: timeline,
@@ -1414,6 +1545,38 @@ function getFallbackData() {
     intradayHistory: timeline,
   });
 
+  const fallbackFutMetrics = {
+    contract: "NIFTY 23-Nov-2026",
+    expiryDate: "23-Nov-2026",
+    dte: 16,
+    lastPrice: 25008,
+    spotPrice: spot,
+    priceChange: 420,
+    priceChangePct: 1.71,
+    nearOI: 185977,
+    nearChgOI: 3850,
+    nextOI: 22786,
+    nextChgOI: 1200,
+    combinedOI: 208763,
+    combinedChgOI: 5050,
+    combinedOiChangePct: 2.48,
+    rawBasis: -22.35,
+    fairBasis: 67.85,
+    adjustedBasisSpread: -90.20,
+    intradayBasisDelta: 0,
+    volume: 8133905,
+    isStale: true,
+  };
+
+  const fallbackFusion = evaluateSmartMoneyFusion(fallbackFutMetrics, {
+    deltaPcr: 1.77,
+    pcr: 1.28,
+    totalPutWriting: 279500,
+    totalCallWriting: 157500,
+    roofCallWritingBlitz: false,
+    floorPutWritingBlitz: true,
+  });
+
   const eodDecision = calculateEODDecision({
     spot,
     floorStrike: 22600,
@@ -1425,6 +1588,7 @@ function getFallbackData() {
     timeline,
     dayOfWeek: getISTDayOfWeek(),
     nowMins: getISTMinutes(),
+    fusion: fallbackFusion,
   });
 
   smartMoney.eodDecision = eodDecision;
@@ -1452,6 +1616,8 @@ function getFallbackData() {
     pcrWarning: eodDecision.pcrWarning,
     strikes,
     smartMoney,
+    futures: fallbackFutMetrics,
+    fusion: fallbackFusion,
     eodDecision,
     eodHistory: CANONICAL_EOD_SEED_HISTORY,
     intradayTimeline: timeline,

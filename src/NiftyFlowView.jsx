@@ -6,6 +6,9 @@ import {
   normalizeDateToIso,
   formatIsoToDisplayDate,
 } from "./eodTrackRecord.js";
+import {
+  classifyFuturesQuadrant,
+} from "./smartMoneyFusion.js";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -50,6 +53,14 @@ function formatLots(n) {
   if (abs >= 100000) return `${sign}${(abs / 100000).toFixed(1)}L`;
   if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(1)}k`;
   return `${sign}${abs.toLocaleString("en-IN")}`;
+}
+
+function formatLotsAbs(n) {
+  if (n == null || isNaN(n)) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 100000) return `${(abs / 100000).toFixed(1)}L`;
+  if (abs >= 1000) return `${(abs / 1000).toFixed(1)}k`;
+  return `${abs.toLocaleString("en-IN")}`;
 }
 
 function getMarketSessionStatus() {
@@ -1591,6 +1602,148 @@ export function NiftyFlowView({ t, isDark }) {
           </div>
         </div>
       </div>
+
+      {/* ── ⚡ SMART MONEY FUTURES & OPTIONS FUSION STRIP ── */}
+      {Boolean(oiData?.futures || oiData?.fusion) && (() => {
+        const fut = oiData?.futures;
+        const fusion = oiData?.fusion || oiData?.eodDecision?.fusion;
+        const quadrant = fusion?.quadrantInfo || (fut ? classifyFuturesQuadrant(fut) : null);
+        const isBasisPos = (fut?.rawBasis || 0) >= 0;
+        const basisColor = (fut?.rawBasis || 0) < 0 ? "#ef4444" : (fut?.adjustedBasisSpread || 0) >= -5 ? "#16a34a" : "#d97706";
+
+        return (
+          <div style={{
+            background: isDark ? "#081324" : "#f0fdfa",
+            border: `1.5px solid ${isDark ? "#1e3a8a66" : "#0d948833"}`,
+            borderRadius: 12,
+            padding: isMobile ? "12px 14px" : "14px 18px",
+            marginBottom: 16,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
+          }}>
+            {/* Header */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: isMobile ? 13 : 15, fontWeight: 900, color: t.text, display: "flex", alignItems: "center", gap: 6 }}>
+                  ⚡ SMART MONEY FUTURES + OPTIONS FUSION
+                </span>
+                {fut?.isStale && (
+                  <span style={{ fontSize: 9.5, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: "#f59e0b22", color: "#f59e0b", border: "1px solid #f59e0b44" }}>
+                    Cached Snapshot
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: isMobile ? 10.5 : 11.5, color: t.textSub, fontWeight: 600 }}>
+                Near + Next Month Co-integration · Dynamic Fair-Value Spread
+              </div>
+            </div>
+
+            {/* 4 Compact Fusion Cells */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: isMobile ? "1fr 1fr" : isTablet ? "repeat(2, 1fr)" : "repeat(4, 1fr)",
+              gap: isMobile ? 8 : 10,
+            }}>
+              {/* Cell 1: Nifty Futures LTP & Basis */}
+              <div style={{
+                background: isDark ? "#0d1b2e" : "#ffffff",
+                border: `1px solid ${t.border}`,
+                borderRadius: 8,
+                padding: isMobile ? "9px 10px" : "11px 13px",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
+                    Nifty Futures (LTP)
+                  </span>
+                  <span style={{ fontSize: 9.5, fontWeight: 800, color: (fut?.priceChange || 0) >= 0 ? "#16a34a" : "#ef4444" }}>
+                    {(fut?.priceChange || 0) >= 0 ? "+" : ""}{fut?.priceChange ?? "0"} ({(fut?.priceChangePct || 0) >= 0 ? "+" : ""}{fut?.priceChangePct ?? "0"}%)
+                  </span>
+                </div>
+                <div style={{ fontFamily: "monospace", fontSize: isMobile ? 15 : 18, fontWeight: 900, color: t.text, margin: "2px 0" }}>
+                  ₹{(fut?.lastPrice || spot).toLocaleString("en-IN", { minimumFractionDigits: 1, maximumFractionDigits: 2 })}
+                </div>
+                <div style={{ fontSize: isMobile ? 10 : 11, color: basisColor, fontWeight: 700 }}>
+                  Basis: {fut?.rawBasis >= 0 ? `+${fut?.rawBasis}` : `${fut?.rawBasis ?? "0"}`} pts {isBasisPos ? "(Premium)" : "(Discount)"}
+                  {fut?.adjustedBasisSpread !== undefined && (
+                    <span style={{ fontSize: 9.5, color: t.textSub, marginLeft: 4, fontWeight: 500 }}>
+                      · Spread: {fut.adjustedBasisSpread >= 0 ? `+${fut.adjustedBasisSpread}` : fut.adjustedBasisSpread}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Cell 2: Futures 4-Quadrant Buildup */}
+              <div style={{
+                background: isDark ? "#0d1b2e" : "#ffffff",
+                border: `1px solid ${t.border}`,
+                borderRadius: 8,
+                padding: isMobile ? "9px 10px" : "11px 13px",
+              }}>
+                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
+                  Futures Flow Buildup
+                </div>
+                <div style={{
+                  display: "inline-block",
+                  fontSize: isMobile ? 11.5 : 13,
+                  fontWeight: 900,
+                  color: quadrant?.color || "#94a3b8",
+                  margin: "3px 0",
+                }}>
+                  {quadrant?.label || "NEUTRAL / CONSOLIDATION"}
+                </div>
+                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
+                  Combined ΔOI: <strong>{fut?.combinedChgOI >= 0 ? `+${formatLotsAbs(fut?.combinedChgOI)}` : `-${formatLotsAbs(fut?.combinedChgOI || 0)}`}</strong> ({fut?.combinedOiChangePct >= 0 ? `+${fut?.combinedOiChangePct}` : `${fut?.combinedOiChangePct || 0}`}%) · DTE: <strong>{fut?.dte ?? "—"}d</strong>
+                </div>
+              </div>
+
+              {/* Cell 3: Smart Money Fusion Matrix Scenario */}
+              <div style={{
+                background: isDark ? "#0d1b2e" : "#ffffff",
+                border: `1px solid ${t.border}`,
+                borderRadius: 8,
+                padding: isMobile ? "9px 10px" : "11px 13px",
+              }}>
+                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
+                  Fusion Alignment
+                </div>
+                <div style={{
+                  fontSize: isMobile ? 11.5 : 13,
+                  fontWeight: 900,
+                  color: fusion?.color || t.text,
+                  margin: "3px 0",
+                }}>
+                  {fusion?.badge || "⚪ BALANCED FLOW"}
+                </div>
+                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
+                  {fusion?.headline || "Futures & Options flow aligned"}
+                </div>
+              </div>
+
+              {/* Cell 4: Actionable EOD / Intraday Verdict */}
+              <div style={{
+                background: isDark ? "#0d1b2e" : "#ffffff",
+                border: `1px solid ${t.border}`,
+                borderRadius: 8,
+                padding: isMobile ? "9px 10px" : "11px 13px",
+              }}>
+                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
+                  Institutional Action
+                </div>
+                <div style={{
+                  fontSize: isMobile ? 11.5 : 13,
+                  fontWeight: 900,
+                  color: fusion?.eodCarryVeto ? "#f59e0b" : (fusion?.scoreBoost > 0 ? "#16a34a" : fusion?.scoreBoost < 0 ? "#ef4444" : t.text),
+                  margin: "3px 0",
+                }}>
+                  {fusion?.actionableVerdict || "Trade Normal"}
+                </div>
+                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
+                  {fusion?.eodCarryVeto ? `Veto: ${fusion.eodCarryVeto.replace("_", " ")}` : (fusion?.rationale || "Balanced leverage")}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── 🧠 SMART MONEY & INSTITUTIONAL RADAR ── */}
       {oiData?.smartMoney && (
