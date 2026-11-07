@@ -301,7 +301,7 @@ function findBestSessionIndex(sessions, serverDayName, todaySession) {
   return 0;
 }
 
-function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, hasRedis }) {
+function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, hasRedis, eodHistory = [] }) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
@@ -309,17 +309,117 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
   const [zoom, setZoom] = useState(1); // 1 = Fit, 1.5 = 1.5x, 2 = 2x
   const [isFullscreen, setIsFullscreen] = useState(false);
   const chartWrapperRef = useRef(null);
+  const [selectedSessionIdx, setSelectedSessionIdx] = useState(0);
+  const [historicalTimelines, setHistoricalTimelines] = useState({});
+  const [loadingTimeline, setLoadingTimeline] = useState(false);
 
-  // Fallback points if empty
+  // Available trading sessions (Latest + last 7 to 14 days)
+  const availableSessions = useMemo(() => {
+    const sessions = [];
+    const latestDateStr = (eodHistory && eodHistory[0]?.date) || "06-Nov-2026";
+    const latestIso = (eodHistory && eodHistory[0]?.isoDate) || "2026-11-06";
+    const latestDay = (eodHistory && eodHistory[0]?.dayName) || "Friday";
+
+    sessions.push({
+      index: 0,
+      isoDate: latestIso,
+      date: latestDateStr,
+      dayName: latestDay,
+      label: "⚡ Latest",
+      display: `${latestDateStr.slice(0, 6)} (${latestDay.slice(0, 3)})`,
+      fullTitle: `${latestDateStr} (${latestDay}) · Latest Session`,
+      pcr: eodHistory && eodHistory[0]?.pcr,
+      floor: eodHistory && eodHistory[0]?.floor,
+      roof: eodHistory && eodHistory[0]?.roof,
+      verdict: eodHistory && eodHistory[0]?.verdict,
+      isLatest: true,
+    });
+
+    if (Array.isArray(eodHistory)) {
+      eodHistory.slice(1, 12).forEach((s, i) => {
+        const iso = s.isoDate || s.id?.replace("eod_", "") || s.date;
+        sessions.push({
+          index: i + 1,
+          isoDate: iso,
+          date: s.date,
+          dayName: s.dayName || "",
+          label: s.date.slice(0, 6),
+          display: `${s.date.slice(0, 6)} (${(s.dayName || "").slice(0, 3)})`,
+          fullTitle: `${s.date} (${s.dayName || ""})`,
+          pcr: s.pcr,
+          floor: s.floor,
+          roof: s.roof,
+          verdict: s.verdict,
+          isLatest: false,
+        });
+      });
+    }
+
+    return sessions;
+  }, [eodHistory]);
+
+  const activeSession = availableSessions[selectedSessionIdx] || availableSessions[0];
+
+  // Load timeline for historical session when selected
+  useEffect(() => {
+    if (selectedSessionIdx === 0) return;
+    const iso = activeSession?.isoDate;
+    if (!iso || historicalTimelines[iso]) return;
+
+    let cancelled = false;
+    setLoadingTimeline(true);
+
+    try {
+      const local = localStorage.getItem(`nifty_timeline_v2_${iso}`);
+      if (local) {
+        const parsed = JSON.parse(local);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setHistoricalTimelines(prev => ({ ...prev, [iso]: parsed }));
+          setLoadingTimeline(false);
+          return;
+        }
+      }
+    } catch (e) {}
+
+    fetch(`/api/nifty-oi?timelineDate=${encodeURIComponent(iso)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!cancelled && data?.timeline && Array.isArray(data.timeline)) {
+          setHistoricalTimelines(prev => ({ ...prev, [iso]: data.timeline }));
+          try {
+            localStorage.setItem(`nifty_timeline_v2_${iso}`, JSON.stringify(data.timeline));
+          } catch (e) {}
+        }
+      })
+      .catch(err => {
+        console.warn("Failed to load historical timeline:", err);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingTimeline(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [selectedSessionIdx, activeSession?.isoDate, historicalTimelines]);
+
+  const activeTimeline = useMemo(() => {
+    if (selectedSessionIdx === 0) {
+      return timeline && timeline.length > 0 ? timeline : [];
+    }
+    const iso = activeSession?.isoDate;
+    return historicalTimelines[iso] || [];
+  }, [selectedSessionIdx, timeline, activeSession?.isoDate, historicalTimelines]);
+
+  // Fallback points if empty (switches smoothly based on selected date)
   const points = useMemo(() => {
-    if (timeline && timeline.length > 0) return timeline;
+    if (activeTimeline && activeTimeline.length > 0) return activeTimeline;
+    if (selectedSessionIdx === 0 && timeline && timeline.length > 0) return timeline;
     return [
       { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot },
       { time: "10:00", minutes: 600, putWriting: 45000, callWriting: 25000, netDiff: 20000, spot },
       { time: "11:30", minutes: 690, putWriting: 140000, callWriting: 80000, netDiff: 60000, spot },
       { time: "13:30", minutes: 810, putWriting: 279500, callWriting: 157500, netDiff: 122000, spot },
     ];
-  }, [timeline, spot]);
+  }, [activeTimeline, timeline, selectedSessionIdx, spot]);
 
   // Responsive SVG canvas dimensions
   const svgWidth = isMobile ? 850 : isTablet ? 980 : 1100;
@@ -745,6 +845,172 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
         marginBottom: 16,
         boxShadow: "0 4px 14px rgba(0,0,0,0.06)"
       }}>
+        {/* ── DAY SELECTOR WITH LEFT / RIGHT ARROWS (PAST 7-14 DAYS) ── */}
+        <div style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: 8,
+          background: isDark ? "#091220" : "#f1f5f9",
+          border: `1px solid ${t.border}`,
+          borderRadius: 8,
+          padding: isMobile ? "6px 8px" : "8px 12px",
+          marginBottom: 10,
+        }}>
+          {/* LEFT / RIGHT ARROW BUTTONS */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button
+              onClick={() => setSelectedSessionIdx(prev => Math.min(availableSessions.length - 1, prev + 1))}
+              disabled={selectedSessionIdx >= availableSessions.length - 1}
+              title="Previous Trading Day (Older)"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                background: selectedSessionIdx < availableSessions.length - 1 ? (isDark ? "#1e293b" : "#ffffff") : "transparent",
+                color: selectedSessionIdx < availableSessions.length - 1 ? t.text : t.textMuted,
+                border: `1px solid ${selectedSessionIdx < availableSessions.length - 1 ? t.border : "transparent"}`,
+                borderRadius: 6,
+                padding: isMobile ? "5px 8px" : "6px 12px",
+                fontSize: isMobile ? 11 : 12,
+                fontWeight: 800,
+                cursor: selectedSessionIdx < availableSessions.length - 1 ? "pointer" : "not-allowed",
+                opacity: selectedSessionIdx >= availableSessions.length - 1 ? 0.4 : 1,
+                transition: "all 0.15s ease",
+              }}
+            >
+              ◀ <span>Older</span>
+            </button>
+
+            <div style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              background: isDark ? "#132338" : "#ffffff",
+              border: `1px solid ${isDark ? "#38bdf855" : "#bae6fd"}`,
+              padding: isMobile ? "4px 8px" : "5px 12px",
+              borderRadius: 6,
+              fontWeight: 800,
+              fontSize: isMobile ? 11 : 12.5,
+              color: isDark ? "#38bdf8" : "#0284c7",
+            }}>
+              <span>📅</span>
+              <span>{activeSession?.display || activeSession?.date}</span>
+              {activeSession?.isLatest && (
+                <span style={{
+                  fontSize: 9.5,
+                  fontWeight: 900,
+                  padding: "1px 5px",
+                  borderRadius: 4,
+                  background: isDark ? "#15803d" : "#dcfce7",
+                  color: isDark ? "#86efac" : "#166534",
+                }}>
+                  LATEST
+                </span>
+              )}
+            </div>
+
+            <button
+              onClick={() => setSelectedSessionIdx(prev => Math.max(0, prev - 1))}
+              disabled={selectedSessionIdx <= 0}
+              title="Next Trading Day (Newer)"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                background: selectedSessionIdx > 0 ? (isDark ? "#1e293b" : "#ffffff") : "transparent",
+                color: selectedSessionIdx > 0 ? t.text : t.textMuted,
+                border: `1px solid ${selectedSessionIdx > 0 ? t.border : "transparent"}`,
+                borderRadius: 6,
+                padding: isMobile ? "5px 8px" : "6px 12px",
+                fontSize: isMobile ? 11 : 12,
+                fontWeight: 800,
+                cursor: selectedSessionIdx > 0 ? "pointer" : "not-allowed",
+                opacity: selectedSessionIdx <= 0 ? 0.4 : 1,
+                transition: "all 0.15s ease",
+              }}
+            >
+              <span>Newer</span> ▶
+            </button>
+          </div>
+
+          {/* DAY SELECTOR PILLS */}
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            overflowX: "auto",
+            maxWidth: isMobile ? "100%" : "60%",
+            padding: "2px 0",
+            WebkitOverflowScrolling: "touch",
+          }}>
+            {availableSessions.map((s, idx) => {
+              const isSelected = selectedSessionIdx === idx;
+              return (
+                <button
+                  key={s.isoDate || idx}
+                  onClick={() => setSelectedSessionIdx(idx)}
+                  style={{
+                    whiteSpace: "nowrap",
+                    padding: isMobile ? "3px 7px" : "4px 9px",
+                    borderRadius: 6,
+                    fontSize: isMobile ? 10 : 11,
+                    fontWeight: isSelected ? 800 : 600,
+                    cursor: "pointer",
+                    border: isSelected ? `1.5px solid ${t.accent}` : `1px solid ${t.border}`,
+                    background: isSelected ? t.accent : (isDark ? "#111c2e" : "#ffffff"),
+                    color: isSelected ? "#ffffff" : t.textMuted,
+                    transition: "all 0.15s ease",
+                  }}
+                >
+                  {s.isLatest ? "⚡ Latest" : s.display}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* HISTORICAL SESSION CONTEXT BANNER */}
+        {selectedSessionIdx > 0 && activeSession && (
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 8,
+            padding: isMobile ? "6px 8px" : "8px 12px",
+            borderRadius: 6,
+            background: isDark ? "rgba(234, 179, 8, 0.12)" : "#fef9c3",
+            border: `1px solid ${isDark ? "#ca8a0466" : "#fde047"}`,
+            color: isDark ? "#fde047" : "#854d0e",
+            fontSize: isMobile ? 11 : 12,
+            marginBottom: 10,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <span>📜 <strong>Viewing Past Session:</strong> {activeSession.fullTitle}</span>
+              {activeSession.pcr && <span>· PCR: <strong>{activeSession.pcr}</strong></span>}
+              {activeSession.floor && activeSession.roof && <span>· Corridor: <strong>{activeSession.floor} – {activeSession.roof}</strong></span>}
+              {activeSession.verdict && <span>· EOD: <strong>{activeSession.verdict}</strong></span>}
+            </div>
+            <button
+              onClick={() => setSelectedSessionIdx(0)}
+              style={{
+                background: isDark ? "#ca8a04" : "#eab308",
+                color: "#ffffff",
+                border: "none",
+                borderRadius: 4,
+                padding: "3px 8px",
+                fontSize: 10.5,
+                fontWeight: 800,
+                cursor: "pointer",
+              }}
+            >
+              ↺ Back to Latest
+            </button>
+          </div>
+        )}
+
         {/* HEADER & VIEW TOGGLES */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
           <div>
@@ -956,6 +1222,38 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
                 {(hovered?.netDiff || 0) >= 0 ? "+" : ""}{formatLots(hovered?.netDiff)}
               </span>
             </span>
+            {hovered?.futPrice && (
+              <span>
+                <strong style={{ color: "#38bdf8" }}>Fut:</strong>{" "}
+                <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}>
+                  ₹{Number(hovered.futPrice).toLocaleString("en-IN")}
+                </span>
+              </span>
+            )}
+            {hovered?.futBasis != null && (
+              <span>
+                <strong style={{ color: t.textMuted }}>Basis:</strong>{" "}
+                <span style={{
+                  fontFamily: "monospace",
+                  fontWeight: 700,
+                  color: hovered.futBasis >= 0 ? "#16a34a" : "#ef4444"
+                }}>
+                  {hovered.futBasis >= 0 ? "+" : ""}{hovered.futBasis}
+                </span>
+              </span>
+            )}
+            {hovered?.futQuadrant && (
+              <span style={{
+                fontSize: 10,
+                fontWeight: 800,
+                padding: "2px 6px",
+                borderRadius: 4,
+                background: isDark ? "rgba(56, 189, 248, 0.15)" : "#e0f2fe",
+                color: isDark ? "#38bdf8" : "#0284c7"
+              }}>
+                {String(hovered.futQuadrant).replace(/_/g, " ")}
+              </span>
+            )}
           </div>
 
           <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted, fontWeight: 600 }}>
@@ -2683,6 +2981,7 @@ export function NiftyFlowView({ t, isDark }) {
         isDark={isDark}
         t={t}
         hasRedis={oiData?.hasRedis}
+        eodHistory={oiData?.eodHistory}
       />
 
       {/* MOBILE SEGMENT SELECTOR (Strike Profile vs Argon Prediction) */}

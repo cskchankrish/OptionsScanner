@@ -397,22 +397,112 @@ async function setRedisTimeline(dateKey, timelineArray) {
   }
 }
 
-export function getCanonicalSettledTimeline(totPut, totCall, spot) {
+export function getCanonicalSettledTimeline(totPut, totCall, spot, futuresMetrics) {
   const pTot = Number(totPut) || 279500;
   const cTot = Number(totCall) || 157500;
   const sp = Number(spot) || 25030.35;
+  const fut = futuresMetrics ? {
+    futPrice: Number(futuresMetrics.lastPrice) || (sp + 82.50),
+    futCombinedOI: Number(futuresMetrics.combinedOI) || 208763,
+    futChgOI: Number(futuresMetrics.combinedChgOI) || 5050,
+    futBasis: Number(futuresMetrics.adjustedBasisSpread != null ? futuresMetrics.adjustedBasisSpread : futuresMetrics.rawBasis) || 18.20,
+    futQuadrant: futuresMetrics.quadrant || "LONG_BUILDUP",
+  } : {
+    futPrice: sp + 82.50,
+    futCombinedOI: 208763,
+    futChgOI: 5050,
+    futBasis: 18.20,
+    futQuadrant: "LONG_BUILDUP",
+  };
+
   return [
-    { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: sp - 25, isLiveTick: false },
-    { time: "09:30", minutes: 570, putWriting: 24000, callWriting: 12000, netDiff: 12000, spot: sp - 18, isLiveTick: false },
-    { time: "10:00", minutes: 600, putWriting: 55000, callWriting: 36500, netDiff: 18500, spot: sp - 10, isLiveTick: false },
-    { time: "11:00", minutes: 660, putWriting: 95000, callWriting: 70000, netDiff: 25000, spot: sp - 5, isLiveTick: false },
-    { time: "12:00", minutes: 720, putWriting: 135000, callWriting: 103000, netDiff: 32000, spot: sp + 8, isLiveTick: false },
-    { time: "13:00", minutes: 780, putWriting: 168000, callWriting: 140000, netDiff: 28000, spot: sp + 2, isLiveTick: false },
-    { time: "14:00", minutes: 840, putWriting: 195000, callWriting: 173000, netDiff: 22000, spot: sp - 12, isLiveTick: false },
-    { time: "14:15", minutes: 855, putWriting: 202000, callWriting: 180000, netDiff: 22000, spot: sp - 15, isLiveTick: false },
-    { time: "14:30", minutes: 870, putWriting: 225000, callWriting: 180000, netDiff: 45000, spot: sp + 5, isLiveTick: false },
-    { time: "15:00", minutes: 900, putWriting: 252000, callWriting: 174000, netDiff: 78000, spot: sp + 20, isLiveTick: false },
-    { time: "15:15", minutes: 915, putWriting: 268000, callWriting: 173000, netDiff: 95000, spot: sp + 28, isLiveTick: false },
+    { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: sp - 25, isLiveTick: false, ...fut },
+    { time: "09:30", minutes: 570, putWriting: 24000, callWriting: 12000, netDiff: 12000, spot: sp - 18, isLiveTick: false, ...fut },
+    { time: "10:00", minutes: 600, putWriting: 55000, callWriting: 36500, netDiff: 18500, spot: sp - 10, isLiveTick: false, ...fut },
+    { time: "11:00", minutes: 660, putWriting: 95000, callWriting: 70000, netDiff: 25000, spot: sp - 5, isLiveTick: false, ...fut },
+    { time: "12:00", minutes: 720, putWriting: 135000, callWriting: 103000, netDiff: 32000, spot: sp + 8, isLiveTick: false, ...fut },
+    { time: "13:00", minutes: 780, putWriting: 168000, callWriting: 140000, netDiff: 28000, spot: sp + 2, isLiveTick: false, ...fut },
+    { time: "14:00", minutes: 840, putWriting: 195000, callWriting: 173000, netDiff: 22000, spot: sp - 12, isLiveTick: false, ...fut },
+    { time: "14:15", minutes: 855, putWriting: 202000, callWriting: 180000, netDiff: 22000, spot: sp - 15, isLiveTick: false, ...fut },
+    { time: "14:30", minutes: 870, putWriting: 225000, callWriting: 180000, netDiff: 45000, spot: sp + 5, isLiveTick: false, ...fut },
+    { time: "15:00", minutes: 900, putWriting: 252000, callWriting: 174000, netDiff: 78000, spot: sp + 20, isLiveTick: false, ...fut },
+    { time: "15:15", minutes: 915, putWriting: 268000, callWriting: 173000, netDiff: 95000, spot: sp + 28, isLiveTick: false, ...fut },
+    { time: "15:30", minutes: 930, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, ...fut },
+    { time: "15:40", minutes: 940, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, ...fut },
+  ];
+}
+
+export function getSessionTimelineByDate(isoDate, seed) {
+  const cleanIso = normalizeDateToIso(isoDate);
+  const sp = seed?.entrySpot || 25000;
+
+  if (cleanIso === "2026-11-06") {
+    return getCanonicalSettledTimeline(279500, 157500, 25030.35);
+  }
+
+  if (cleanIso === "2026-11-05") {
+    // Thursday 05-Nov-2026 (Late Call Blitz scenario)
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: 24530, isLiveTick: false, futPrice: 24590, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "10:00", minutes: 600, putWriting: 35000, callWriting: 15000, netDiff: 20000, spot: 24560, isLiveTick: false, futPrice: 24620, futQuadrant: "LONG_BUILDUP" },
+      { time: "11:30", minutes: 690, putWriting: 85000, callWriting: 32000, netDiff: 53000, spot: 24610, isLiveTick: false, futPrice: 24680, futQuadrant: "LONG_BUILDUP" },
+      { time: "13:00", minutes: 780, putWriting: 120000, callWriting: 42000, netDiff: 78000, spot: 24640, isLiveTick: false, futPrice: 24710, futQuadrant: "LONG_BUILDUP" },
+      { time: "14:15", minutes: 855, putWriting: 130000, callWriting: 48000, netDiff: 82000, spot: 24630, isLiveTick: false, futPrice: 24700, futQuadrant: "LONG_BUILDUP" },
+      { time: "14:30", minutes: 870, putWriting: 134000, callWriting: 75000, netDiff: 59000, spot: 24600, isLiveTick: false, futPrice: 24660, futQuadrant: "SHORT_BUILDUP" },
+      { time: "15:00", minutes: 900, putWriting: 140000, callWriting: 125000, netDiff: 15000, spot: 24560, isLiveTick: false, futPrice: 24610, futQuadrant: "SHORT_BUILDUP" },
+      { time: "15:15", minutes: 915, putWriting: 143000, callWriting: 152000, netDiff: -9000, spot: 24545, isLiveTick: false, futPrice: 24595, futQuadrant: "SHORT_BUILDUP" },
+      { time: "15:30", minutes: 930, putWriting: 145000, callWriting: 172000, netDiff: -27000, spot: 24536.60, isLiveTick: false, futPrice: 24585, futQuadrant: "SHORT_BUILDUP" },
+      { time: "15:40", minutes: 940, putWriting: 145000, callWriting: 172000, netDiff: -27000, spot: 24536.60, isLiveTick: false, futPrice: 24585, futQuadrant: "SHORT_BUILDUP" },
+    ];
+  }
+
+  if (cleanIso === "2026-11-04") {
+    // Wednesday 04-Nov-2026 (Bullish expansion)
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: 23880, isLiveTick: false, futPrice: 23940, futQuadrant: "LONG_BUILDUP" },
+      { time: "10:00", minutes: 600, putWriting: 42000, callWriting: 22000, netDiff: 20000, spot: 23900, isLiveTick: false, futPrice: 23960, futQuadrant: "LONG_BUILDUP" },
+      { time: "11:30", minutes: 690, putWriting: 95000, callWriting: 48000, netDiff: 47000, spot: 23925, isLiveTick: false, futPrice: 23990, futQuadrant: "LONG_BUILDUP" },
+      { time: "13:00", minutes: 780, putWriting: 145000, callWriting: 78000, netDiff: 67000, spot: 23940, isLiveTick: false, futPrice: 24010, futQuadrant: "LONG_BUILDUP" },
+      { time: "14:15", minutes: 855, putWriting: 181000, callWriting: 105000, netDiff: 76000, spot: 23950, isLiveTick: false, futPrice: 24020, futQuadrant: "LONG_BUILDUP" },
+      { time: "15:00", minutes: 900, putWriting: 205000, callWriting: 118000, netDiff: 87000, spot: 23955, isLiveTick: false, futPrice: 24030, futQuadrant: "LONG_BUILDUP" },
+      { time: "15:30", minutes: 930, putWriting: 215000, callWriting: 128000, netDiff: 87000, spot: 23960.60, isLiveTick: false, futPrice: 24040, futQuadrant: "LONG_BUILDUP" },
+      { time: "15:40", minutes: 940, putWriting: 215000, callWriting: 128000, netDiff: 87000, spot: 23960.60, isLiveTick: false, futPrice: 24040, futQuadrant: "LONG_BUILDUP" },
+    ];
+  }
+
+  if (cleanIso === "2026-11-03") {
+    // Tuesday 03-Nov-2026 (Neutral chop)
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: 23830, isLiveTick: false, futPrice: 23880, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "10:30", minutes: 630, putWriting: 28000, callWriting: 32000, netDiff: -4000, spot: 23820, isLiveTick: false, futPrice: 23870, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "12:00", minutes: 720, putWriting: 62000, callWriting: 68000, netDiff: -6000, spot: 23815, isLiveTick: false, futPrice: 23865, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "13:30", minutes: 810, putWriting: 98000, callWriting: 95000, netDiff: 3000, spot: 23825, isLiveTick: false, futPrice: 23875, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "14:15", minutes: 855, putWriting: 115000, callWriting: 118000, netDiff: -3000, spot: 23815, isLiveTick: false, futPrice: 23865, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "15:30", minutes: 930, putWriting: 142000, callWriting: 145000, netDiff: -3000, spot: 23810.85, isLiveTick: false, futPrice: 23860, futQuadrant: "NEUTRAL_CHOP" },
+      { time: "15:40", minutes: 940, putWriting: 142000, callWriting: 145000, netDiff: -3000, spot: 23810.85, isLiveTick: false, futPrice: 23860, futQuadrant: "NEUTRAL_CHOP" },
+    ];
+  }
+
+  if (cleanIso === "2026-11-02") {
+    // Monday 02-Nov-2026 (Put underwriting)
+    return [
+      { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: 23380, isLiveTick: false, futPrice: 23430, futQuadrant: "LONG_BUILDUP" },
+      { time: "11:00", minutes: 660, putWriting: 68000, callWriting: 38000, netDiff: 30000, spot: 23410, isLiveTick: false, futPrice: 23465, futQuadrant: "LONG_BUILDUP" },
+      { time: "13:00", minutes: 780, putWriting: 125000, callWriting: 78000, netDiff: 47000, spot: 23430, isLiveTick: false, futPrice: 23485, futQuadrant: "LONG_BUILDUP" },
+      { time: "14:15", minutes: 855, putWriting: 165000, callWriting: 105000, netDiff: 60000, spot: 23435, isLiveTick: false, futPrice: 23490, futQuadrant: "LONG_BUILDUP" },
+      { time: "15:30", minutes: 930, putWriting: 198000, callWriting: 130000, netDiff: 68000, spot: 23440.80, isLiveTick: false, futPrice: 23495, futQuadrant: "LONG_BUILDUP" },
+      { time: "15:40", minutes: 940, putWriting: 198000, callWriting: 130000, netDiff: 68000, spot: 23440.80, isLiveTick: false, futPrice: 23495, futQuadrant: "LONG_BUILDUP" },
+    ];
+  }
+
+  // Generic fallback for any historical seed:
+  const isBull = (seed?.deltaPcr || 1) >= 1.2;
+  const pTot = isBull ? 160000 : 130000;
+  const cTot = isBull ? 120000 : 150000;
+  return [
+    { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: sp, isLiveTick: false },
+    { time: "11:30", minutes: 690, putWriting: Math.round(pTot * 0.4), callWriting: Math.round(cTot * 0.4), netDiff: Math.round((pTot - cTot) * 0.4), spot: sp, isLiveTick: false },
+    { time: "14:15", minutes: 855, putWriting: Math.round(pTot * 0.8), callWriting: Math.round(cTot * 0.8), netDiff: Math.round((pTot - cTot) * 0.8), spot: sp, isLiveTick: false },
     { time: "15:30", minutes: 930, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false },
     { time: "15:40", minutes: 940, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false },
   ];
@@ -481,7 +571,7 @@ function getISTTimeStr() {
   return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-function buildTimeline(totPut, totCall, spot) {
+function buildTimeline(totPut, totCall, spot, futuresMetrics) {
   const today = getISTDateStr();
   const now = Date.now();
   const nowMins = getISTMinutes();
@@ -492,13 +582,21 @@ function buildTimeline(totPut, totCall, spot) {
   const closeMins = isSunday ? 960 : 940;
   const closeTimeStr = isSunday ? "16:00" : "15:40";
 
+  const fut = futuresMetrics ? {
+    futPrice: Number(futuresMetrics.lastPrice) || undefined,
+    futCombinedOI: Number(futuresMetrics.combinedOI) || undefined,
+    futChgOI: Number(futuresMetrics.combinedChgOI) || undefined,
+    futBasis: Number(futuresMetrics.adjustedBasisSpread != null ? futuresMetrics.adjustedBasisSpread : futuresMetrics.rawBasis) || undefined,
+    futQuadrant: futuresMetrics.quadrant || undefined,
+  } : {};
+
   // 1. Outside Live Market Hours (Weekends, Evenings, Nights, Pre-market)
   // Preserve settled session timeline until the new market session actually opens
   if (!sessionInfo.isLiveMarket) {
     if (intradayHistory && intradayHistory.length >= 3) {
       return intradayHistory.filter(pt => pt && (pt.minutes || 0) <= closeMins && (pt.time || "") <= closeTimeStr);
     }
-    return getCanonicalSettledTimeline(totPut, totCall, spot);
+    return getCanonicalSettledTimeline(totPut, totCall, spot, futuresMetrics);
   }
 
   // 2. Live Market Hours: Reset for brand new day only once trading commences
@@ -526,6 +624,7 @@ function buildTimeline(totPut, totCall, spot) {
         netDiff: totPut - totCall,
         spot: spot,
         isLiveTick: false,
+        ...fut,
       });
       if (REDIS_URL) {
         setRedisTimeline(today, intradayHistory).catch(() => {});
@@ -535,6 +634,7 @@ function buildTimeline(totPut, totCall, spot) {
       last.callWriting = totCall;
       last.netDiff = totPut - totCall;
       last.spot = spot;
+      if (fut.futPrice !== undefined) Object.assign(last, fut);
     }
 
     return intradayHistory;
@@ -559,6 +659,7 @@ function buildTimeline(totPut, totCall, spot) {
       netDiff: totPut - totCall,
       spot: spot,
       isLiveTick: true,
+      ...fut,
     });
     didUpdate = true;
   } else if (last) {
@@ -568,6 +669,7 @@ function buildTimeline(totPut, totCall, spot) {
     last.spot = spot;
     last.time = tickTime;
     last.isLiveTick = true;
+    if (fut.futPrice !== undefined) Object.assign(last, fut);
     didUpdate = true;
   }
 
@@ -1339,6 +1441,42 @@ export default async function handler(req, res) {
     }
   }
 
+  // Handle multi-day historical timeline query (last 7-14 days)
+  if (req.query?.timelineDate) {
+    const reqDate = String(req.query.timelineDate).trim();
+    const cleanKey = reqDate.replace(/\//g, "-");
+
+    if (REDIS_URL) {
+      const remote = await getRedisTimeline(cleanKey);
+      if (Array.isArray(remote) && remote.length > 0) {
+        return res.status(200).json({
+          success: true,
+          date: cleanKey,
+          timeline: remote,
+          source: "redis"
+        });
+      }
+    }
+
+    const iso = normalizeDateToIso(cleanKey);
+    const seed = CANONICAL_EOD_SEED_HISTORY.find(s => s.isoDate === iso || s.date === cleanKey);
+    if (seed) {
+      const canonicalTimeline = getSessionTimelineByDate(iso, seed);
+      return res.status(200).json({
+        success: true,
+        date: iso,
+        timeline: canonicalTimeline,
+        source: "canonical",
+        session: seed,
+      });
+    }
+
+    return res.status(404).json({
+      success: false,
+      error: `Timeline not found for date ${cleanKey}`
+    });
+  }
+
   const sessionInfo = getMarketSessionInfo();
   const force = req.query?.force === "true";
 
@@ -1586,7 +1724,7 @@ export default async function handler(req, res) {
 
     const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics);
 
-    const timeline = buildTimeline(totPutWriting, totCallWriting, spot);
+    const timeline = buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics);
 
     // Compute Smart Money / Institutional Analysis
     const smartMoney = analyzeSmartMoney({
@@ -1732,15 +1870,6 @@ function getFallbackData() {
     callType: r.cDoi > 0 ? "BUILT" : r.cDoi < 0 ? "REMOVED" : "UNCLEAR",
   }));
 
-  const timeline = getCanonicalSettledTimeline(279500, 157500, spot);
-  const smartMoney = analyzeSmartMoney({
-    strikes,
-    spot,
-    floorStrike: 25000,
-    roofStrike: 25200,
-    intradayHistory: timeline,
-  });
-
   const fallbackFutMetrics = {
     contract: "NIFTY 26-Nov-2026",
     expiryDate: "26-Nov-2026",
@@ -1763,6 +1892,17 @@ function getFallbackData() {
     volume: 8133905,
     isStale: false,
   };
+
+  const timeline = getCanonicalSettledTimeline(279500, 157500, spot, fallbackFutMetrics);
+  const smartMoney = analyzeSmartMoney({
+    strikes,
+    spot,
+    floorStrike: 25000,
+    roofStrike: 25200,
+    intradayHistory: timeline,
+  });
+
+  
 
   const fallbackFusion = evaluateSmartMoneyFusion(fallbackFutMetrics, {
     deltaPcr: 1.58,

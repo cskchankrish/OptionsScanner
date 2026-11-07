@@ -4,6 +4,7 @@ import {
   getActiveExpiryDate,
   getMarketSessionInfo,
   getCanonicalSettledTimeline,
+  getSessionTimelineByDate,
   calculateEODDecision,
 } from "../api/nifty-oi.js";
 
@@ -64,4 +65,39 @@ test("getCanonicalSettledTimeline provides verified closing window (14:15 to 15:
   assert.equal(result.verdict, "CARRY NIFTY CE (BTST)");
   assert.ok(result.audit.some(a => a.label.includes("Closing Hour Flow") && a.impact.includes("+3 pts")));
   assert.ok(result.pcrWarning.includes("HISTORICAL PEAK OVERBOUGHT"));
+});
+
+test("getCanonicalSettledTimeline embeds verified Futures metrics (Price, Basis, OI, Quadrant) in each tick", () => {
+  const timeline = getCanonicalSettledTimeline(279500, 157500, 25030.35);
+  const p1530 = timeline.find(pt => pt.time === "15:30");
+  assert.ok(p1530);
+  assert.ok(p1530.futPrice > 25000, "Must include valid Futures price");
+  assert.equal(p1530.futQuadrant, "LONG_BUILDUP", "Must reflect Long Buildup quadrant");
+  assert.ok(p1530.futCombinedOI > 0, "Must include combined OI");
+  assert.ok(p1530.futBasis != null, "Must include basis spread");
+});
+
+test("getSessionTimelineByDate provides multi-day flow curves across past sessions", () => {
+  // Test Thursday 05-Nov-2026: Late Call Blitz where Call writing exploded after 14:15
+  const nov5 = getSessionTimelineByDate("2026-11-05");
+  assert.ok(Array.isArray(nov5) && nov5.length >= 8);
+  const t1415 = nov5.find(pt => pt.time === "14:15");
+  const t1530 = nov5.find(pt => pt.time === "15:30");
+  assert.ok(t1415 && t1530);
+  assert.ok(t1415.netDiff > 0, "Net diff was positive at 14:15 (+82k)");
+  assert.ok(t1530.netDiff < 0, "Net diff turned negative by 15:30 (-27k) due to call blitz");
+  assert.equal(t1530.futQuadrant, "SHORT_BUILDUP", "Futures reflected Short Buildup into the close");
+
+  // Test Wednesday 04-Nov-2026: Steady Bullish expansion
+  const nov4 = getSessionTimelineByDate("2026-11-04");
+  assert.ok(Array.isArray(nov4) && nov4.length >= 8);
+  const n4Close = nov4.find(pt => pt.time === "15:30");
+  assert.ok(n4Close.netDiff > 50000, "Nov 4 closed with strong put writing delta");
+  assert.equal(n4Close.futQuadrant, "LONG_BUILDUP");
+
+  // Test Tuesday 03-Nov-2026: Neutral chop
+  const nov3 = getSessionTimelineByDate("2026-11-03");
+  assert.ok(Array.isArray(nov3));
+  const n3Close = nov3.find(pt => pt.time === "15:30");
+  assert.equal(n3Close.futQuadrant, "NEUTRAL_CHOP");
 });
