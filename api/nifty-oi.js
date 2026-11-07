@@ -38,11 +38,22 @@ export function getActiveExpiryDate(contractExpiry) {
     }
   }
 
-  // Calculate upcoming Thursday in IST
+  // NSE Special Holiday / Diwali Schedule (Diwali Muhurat week special Monday 09-Nov-2026 expiry)
   const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const year = istDate.getFullYear();
+  const month = istDate.getMonth(); // 10 = Nov
+  const date = istDate.getDate();
+  const mins = istDate.getHours() * 60 + istDate.getMinutes();
+
+  if (year === 2026 && month === 10) {
+    if (date <= 9 && (date < 9 || mins <= 930)) {
+      return "09-Nov-2026";
+    }
+  }
+
+  // Standard upcoming Thursday in IST
   const day = istDate.getDay(); // 0 = Sun, 4 = Thu
   let daysUntilThu = (4 - day + 7) % 7;
-  const mins = istDate.getHours() * 60 + istDate.getMinutes();
   if (day === 4 && mins > 930) {
     daysUntilThu = 7;
   }

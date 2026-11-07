@@ -8,13 +8,13 @@ import {
 } from "../api/nifty-oi.js";
 
 test("getActiveExpiryDate returns active November weekly expiry and rejects expired October dates", () => {
-  // If an expired past date is passed (e.g. 27-Oct-2026), it must roll to the active upcoming weekly expiry
+  // If an expired past date is passed (e.g. 27-Oct-2026), it must roll to the active upcoming Diwali week Monday expiry
   const expiredAttempt = getActiveExpiryDate("27-Oct-2026");
-  assert.equal(expiredAttempt, "12-Nov-2026", "Must roll expired October dates to active November expiry");
+  assert.equal(expiredAttempt, "09-Nov-2026", "Must roll expired October dates to active 09-Nov-2026 expiry");
 
-  // If no argument is passed on Saturday 07-Nov-2026, it must return 12-Nov-2026
+  // If no argument is passed on Saturday 07-Nov-2026, it must return 09-Nov-2026
   const activeNow = getActiveExpiryDate();
-  assert.equal(activeNow, "12-Nov-2026");
+  assert.equal(activeNow, "09-Nov-2026");
 
   // If a valid future expiry is passed, it preserves it
   const validFuture = getActiveExpiryDate("26-Nov-2026");
