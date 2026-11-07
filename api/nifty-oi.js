@@ -132,7 +132,25 @@ export async function getRedisSessionPayload() {
 export async function saveRedisSessionPayload(payload) {
   if (!REDIS_URL || !REDIS_TOKEN || !payload) return false;
   try {
-    await fetch(`${REDIS_URL}/set/nifty_latest_session_payload_v2?ex=1209600`, { // 14 days retention
+    const bridgeSnapshot = {
+      ...payload,
+      corridor: {
+        deltaPCR: payload.deltaPcr,
+        floorStrike: payload.floor,
+        roofStrike: payload.roof,
+        totalPutWriting: payload.totalPutWriting,
+        totalCallWriting: payload.totalCallWriting,
+        strikes: payload.strikes,
+      },
+      smartMoneyFusion: {
+        primaryScenario: payload.fusion?.scenarioId,
+        actionTag: payload.fusion?.eodCarryVeto,
+        scoreBoost: payload.fusion?.scoreBoost,
+        headline: payload.fusion?.headline,
+      },
+    };
+
+    const p1 = fetch(`${REDIS_URL}/set/nifty_latest_session_payload_v2?ex=1209600`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -141,6 +159,18 @@ export async function saveRedisSessionPayload(payload) {
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(3000),
     });
+
+    const p2 = fetch(`${REDIS_URL}/set/nifty:flow:latest?ex=86400`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify(bridgeSnapshot),
+      signal: AbortSignal.timeout(2500),
+    });
+
+    await Promise.allSettled([p1, p2]);
     return true;
   } catch (e) {
     console.warn("Redis session payload save error:", e.message);

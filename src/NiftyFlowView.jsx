@@ -1412,6 +1412,7 @@ export function NiftyFlowView({ t, isDark }) {
   const [expandedHistoryId, setExpandedHistoryId] = useState(null);
   const [editingOpenId, setEditingOpenId] = useState(null);
   const [customOpenSpot, setCustomOpenSpot] = useState("");
+  const [tvSignal, setTvSignal] = useState(null);
 
   // Restore settled session & timeline from localStorage on mount (instant display, zero delay across reloads)
   useEffect(() => {
@@ -1531,6 +1532,16 @@ export function NiftyFlowView({ t, isDark }) {
         const fullData = { ...data, intradayTimeline: finalTimeline };
         globalOiCache = fullData;
         setOiData(fullData);
+
+        // Fetch latest real-time TradingView v4.3 Webhook Bridge signal
+        fetch("/api/tv-webhook")
+          .then(r => r.ok ? r.json() : null)
+          .then(res => {
+            if (res?.latestSignal) {
+              setTvSignal(res.latestSignal);
+            }
+          })
+          .catch(() => {});
         try {
           localStorage.setItem("nifty_saved_session_v3", JSON.stringify(fullData));
         } catch (e) {}
@@ -2040,6 +2051,53 @@ export function NiftyFlowView({ t, isDark }) {
                 </div>
               </div>
             </div>
+
+            {/* TradingView v4.3 Real-Time Webhook Bridge Live Strip */}
+            {tvSignal && (
+              <div style={{
+                marginTop: 10,
+                padding: "8px 12px",
+                borderRadius: 8,
+                background: tvSignal.decision === "VETO_SIGNAL"
+                  ? (isDark ? "rgba(239,68,68,0.18)" : "#fee2e2")
+                  : tvSignal.direction === "LONG"
+                  ? (isDark ? "rgba(16,185,129,0.18)" : "#ecfdf5")
+                  : (isDark ? "rgba(245,158,11,0.18)" : "#fef3c7"),
+                border: `1px solid ${
+                  tvSignal.decision === "VETO_SIGNAL" ? "#ef4444" : tvSignal.direction === "LONG" ? "#10b981" : "#f59e0b"
+                }`,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 8,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 9.5, fontWeight: 900, padding: "2px 6px", borderRadius: 4, background: isDark ? "#0f172a" : "#ffffff", color: t.text, border: `1px solid ${t.border}` }}>
+                    ⚡ TV v4.3 BRIDGE
+                  </span>
+                  <span style={{
+                    fontSize: 11,
+                    fontWeight: 900,
+                    color: tvSignal.decision === "VETO_SIGNAL" ? "#ef4444" : tvSignal.direction === "LONG" ? "#16a34a" : "#d97706",
+                  }}>
+                    {tvSignal.decision === "VETO_SIGNAL" ? "🚫 " : tvSignal.direction === "LONG" ? "🟢 " : "🔴 "}
+                    {tvSignal.decision} · {tvSignal.grade} ({tvSignal.direction})
+                  </span>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: t.textSub }}>
+                    Size: <strong style={{ color: t.text }}>{tvSignal.recommendedLots} Lot(s)</strong> ({tvSignal.tier})
+                  </span>
+                  {tvSignal.entryPrice > 0 && (
+                    <span style={{ fontSize: 10.5, color: t.textMuted }}>
+                      Entry: ₹{tvSignal.entryPrice} {tvSignal.stopLoss > 0 ? `| SL: ₹${tvSignal.stopLoss}` : ""}
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: 10, color: t.textMuted, fontStyle: "italic" }}>
+                  {tvSignal.reasoning || tvSignal.istTime}
+                </div>
+              </div>
+            )}
           </div>
         );
       })()}

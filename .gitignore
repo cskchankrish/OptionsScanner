@@ -1,4 +1,7 @@
 node_modules/
 dist/
 .env.local
+.env
+secret key.txt
+*.txt
 pnpm-workspace.yaml
