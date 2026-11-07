@@ -847,15 +847,16 @@ else
     cumFutVolChg   += nz(futSignedVol, 0)
     cumFutTotalV   += fVol
 
-// 1. Fair-Value Cost-of-Carry Basis Math (r = 7.0% benchmark minus ~1.25% NIFTY dividend yield = 5.75% net carry)
+// 1. Fair-Value Cost-of-Carry Basis Math (r = 6.5% benchmark minus ~1.3% NIFTY dividend yield = 5.2% net carry)
 bool  hasDistinctFut      = hasFutFeed and math.abs(fLast - close) > 0.05
 float rawBasis            = hasDistinctFut ? (fLast - close) : 0.0
-float fairBasis           = hasDistinctFut ? (close * ((0.0575 * math.max(0, dteEff)) / 365.0)) : 0.0
+float fairBasis           = hasDistinctFut ? (close * ((0.052 * math.max(0, dteEff)) / 365.0)) : 0.0
 float adjustedBasisSpread = hasDistinctFut ? (rawBasis - fairBasis) : 0.0
 float intradayBasisDelta  = (hasDistinctFut and not na(openBasisBase)) ? (rawBasis - openBasisBase) : 0.0
 float barBasisDelta       = hasDistinctFut ? (rawBasis - nz(rawBasis[1], rawBasis)) : 0.0
+bool  isExpiryWeek        = dteEff <= 4
 
-// 2. Price Change % & Real Open Interest Change % (with 1.50x Volume + Basis Fallback)
+// 2. Price Change % & Real Open Interest Change % (with Intelligent Trend-Aware Accumulation Fallback)
 float refOpenP       = nz(sessFutOpen, fOpenBar)
 float futPriceChg    = fLast - refOpenP
 float futPriceChgPct = refOpenP > 0 ? (futPriceChg / refOpenP) * 100.0 : 0.0
@@ -863,17 +864,29 @@ float barRngNow      = math.max(high - low, syminfo.mintick)
 float bullClPos      = (close - low) / barRngNow
 float bearClPos      = (high - close) / barRngNow
 
-bool  inRegSession     = session.ismarket or isDailyChart
-bool  basisExpandingUp = hasDistinctFut ? ((adjustedBasisSpread >= -2.0 and barBasisDelta >= -1.0) or intradayBasisDelta >= 5.0) : (emaBull and stBull)
-bool  basisExpandingDn = hasDistinctFut ? (not isExpiryDay and (rawBasis < -2.0 or intradayBasisDelta <= -8.0)) : (emaBear and stBear)
-bool  freshPartic      = inRegSession and ((fVolSma > 0 and fVol >= volParticMult * fVolSma) or (hasDistinctFut and math.abs(intradayBasisDelta) >= 5.0) or (emaBull and stBull and close > shortEma) or (emaBear and stBear and close < shortEma))
+// Robust Trend Context Regimes
+bool inRegSession     = session.ismarket or isDailyChart
+bool isUptrendRegime   = (emaBull and close > longEma) or (stBull and close > shortEma) or (bullScore >= 4 and close > longEma)
+bool isDowntrendRegime = (emaBear and close < longEma) or (stBear and close < shortEma) or (bearScore >= 4 and close < longEma)
+
+bool basisExpandingUp = hasDistinctFut ? (intradayBasisDelta >= 4.0 or (adjustedBasisSpread >= -2.0 and barBasisDelta >= 0.0)) : (emaBull and stBull)
+bool basisExpandingDn = hasDistinctFut ? (not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -8.0)) : (emaBear and stBear)
+bool freshPartic      = inRegSession and ((fVolSma > 0 and fVol >= volParticMult * fVolSma) or (hasDistinctFut and math.abs(intradayBasisDelta) >= 5.0) or (emaBull and stBull and close > shortEma) or (emaBear and stBear and close < shortEma))
 
 // Real OI % change vs session open (or bar-over-bar if session open OI is equal)
 float realOiRef    = nz(sessRealOiOpen, nz(totalRealOiC[1], totalRealOiC))
 float realOiChgPct = (hasRealNearOi and realOiRef > 0) ? ((totalRealOiC - realOiRef) / realOiRef) * 100.0 : 0.0
-float proxyOiChgPct = freshPartic and ((futPriceChgPct >= 0.08 and basisExpandingUp) or (futPriceChgPct <= -0.08 and basisExpandingDn)) ?
-     math.max(0.55, math.abs(futPriceChgPct) * 1.5) :
-     (math.abs(futPriceChgPct) >= 0.08 ? -0.55 : 0.0)
+
+// Fallback Proxy OI:
+// In an uptrend (isUptrendRegime) with price rising, institutions accumulate long contracts (+0.35% to +1.5%), NOT -0.55%!
+// Short-covering (-0.55%) is ONLY inferred if basis severely collapses intraday while price rises.
+float proxyOiChgPct = 0.0
+if freshPartic and ((futPriceChgPct >= 0.08 and basisExpandingUp) or (futPriceChgPct <= -0.08 and basisExpandingDn))
+    proxyOiChgPct := math.max(0.55, math.abs(futPriceChgPct) * 1.5)
+else if futPriceChgPct >= 0.08
+    proxyOiChgPct := (not isExpiryWeek and intradayBasisDelta <= -8.0) ? -0.55 : (isUptrendRegime ? 0.35 : 0.0)
+else if futPriceChgPct <= -0.08
+    proxyOiChgPct := (intradayBasisDelta >= 8.0) ? -0.55 : (isDowntrendRegime ? 0.35 : 0.0)
 
 float effOiChgPct  = hasRealNearOi ? realOiChgPct : proxyOiChgPct
 float oiDeadband   = hasRealNearOi ? 0.50 : 0.25
@@ -894,9 +907,9 @@ float actFloor  = extFloorStrike > 0.0 ? extFloorStrike : autoFloor
 
 bool isManualOpt        = extOptMode == "Manual / Scanner Override (From OptionsScanner)"
 // In Manual mode: uses verified live DeltaPCR from OptionsScanner.
-// In Auto/Proxy mode: requires verified intraday basis shift or raw discount, eliminating false negative basis bias.
-bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : ((intradayBasisDelta >= 6.0 or (adjustedBasisSpread >= 5.0 and barBasisDelta >= 0.0)) and (bullClPos >= 0.50 or close > shortEma))
-bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.75) : ((intradayBasisDelta <= -8.0 or (rawBasis < -2.0 and not isExpiryDay)) and (bearClPos >= 0.50 or close < shortEma))
+// In Auto/Proxy mode: requires verified intraday basis shift or structural discount.
+bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : ((intradayBasisDelta >= 5.0 or (adjustedBasisSpread >= 3.0 and barBasisDelta >= 0.0)) and (bullClPos >= 0.50 or close > shortEma))
+bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.75) : (((not isExpiryWeek and rawBasis < -5.0) or intradayBasisDelta <= -8.0) and (bearClPos >= 0.50 or close < shortEma))
 
 // High-Conviction Synergies
 bool isBullSynergy      = futQuadrant == "LONG_BUILDUP"  and isPutWritingBlitz  and (basisExpandingUp or not hasDistinctFut)
@@ -911,43 +924,41 @@ float prev4Lo     = ta.lowest(low,   4)[1]
 float cur3Hi      = ta.highest(high, 3)
 float cur3Lo      = ta.lowest(low,   3)
 
-// Trend Context Filters to prevent counter-trend false traps during healthy rallies & selloffs
-bool isStrongUptrend   = emaBull and stBull and close > longEma and bullScore >= 6
-bool isStrongDowntrend = emaBear and stBear and close < longEma and bearScore >= 6
-
 // ── BULL TRAP LOGIC (Real-Time Chart Timeframe) ──
-// 1. Price Action: Price broke above local swing high, swept Roof Strike, or pierced Daily R1/R2, then rejected
+// 1. Price Action: Price broke above structural swing high, swept Roof Strike, or pierced Daily R1/R2, then rejected
 bool sweepHi      = high >= localTrapHi and close < localTrapHi
 bool roofRej      = high >= actRoof - 0.20 * atr14 and close < actRoof
 bool pivRRej      = (high >= dR1 and close < dR1) or (high >= dR2 and close < dR2)
 bool bearCandRej  = (close < open) and (close < ema5) and (close < low[1] or bearClPos >= 0.50)
 
-// Trend Safeguard: During a strong bull trend, shallow 1-bar pullbacks are dip-buying opportunities.
-// Bull Trap Sell requires a structural resistance sweep (localTrapHi/Roof) + close below 13-EMA (shortEma),
-// OR genuine Futures Short-Covering exhaustion.
-bool bullTrapPA   = isStrongUptrend ?
-     ((sweepHi or roofRej or pivRRej) and close < shortEma and bearCandRej) :
-     ((sweepHi or roofRej or pivRRej or (high >= prev4Hi and bearCandRej)) and bearCandRej)
+// Trend Guardrail:
+// - A Bull Trap Sell CANNOT fire from a shallow 4-bar blip.
+// - It MUST sweep a major resistance (sweepHi, roofRej, or pivRRej).
+// - In an uptrend regime, price MUST also close below the 13-EMA (shortEma), proving an actual trend breakdown.
+// - If price is still above the 13-EMA, it is a healthy pullback / dip, NOT a bull trap!
+bool bullTrapPA   = (sweepHi or roofRej or pivRRej) and bearCandRej and (isUptrendRegime ? (close < shortEma) : true)
 
-// 2. Smart Money Flow: Short-Covering (no fresh buyers) OR Call Blitz at Roof OR Negative Basis Collapse OR HTF Top Armed
-bool bullTrapFlow = (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (not isExpiryDay and (rawBasis < -2.0 or intradayBasisDelta <= -8.0)) or htfArmTop or htfScoutTop
+// 2. Smart Money Flow: Short-Covering (no fresh buyers) OR Call Blitz at Roof OR Negative Basis Collapse
+// (NOTE: HTF arming alone must NOT trigger 15m counter-trend trap sells without orderflow confirmation!)
+bool bullTrapFlow = (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (not isExpiryWeek and intradayBasisDelta <= -8.0) or (isDowntrendRegime and htfArmTop)
 
 // ── BEAR TRAP LOGIC (Real-Time Chart Timeframe) ──
-// 1. Price Action: Price dipped below local swing low, swept Floor Strike, or pierced Daily S1/S2, or retested CPR / 34-EMA, then absorbed
+// 1. Price Action: Price dipped below structural swing low, swept Floor Strike, pierced Daily S1/S2, or tested CPR / 13-34 EMA, then absorbed
 bool sweepLo      = low <= localTrapLo and close > localTrapLo
 bool floorAbs     = low <= actFloor + 0.20 * atr14 and close > actFloor
 bool pivSAbs      = (low <= dS1 and close > dS1) or (low <= dS2 and close > dS2)
-bool cprEmaAbs    = (low <= longEma and close > longEma) or (low <= dPP and close > dPP) or (low <= wPP and close > wPP)
+bool cprEmaAbs    = (low <= longEma and close > longEma) or (low <= shortEma and close > shortEma) or (low <= dPP and close > dPP) or (low <= wPP and close > wPP)
 bool bullCandAbs  = (close > open) and (close > ema5) and (close > high[1] or bullClPos >= 0.50)
 
-// Trend Alignment: During an established uptrend, testing the 34-EMA or CPR and absorbing back above 5-EMA
-// is the premier institutional Bear Trap / Dip Absorption pattern!
-bool bearTrapPA   = isStrongDowntrend ?
-     ((sweepLo or floorAbs or pivSAbs) and close > shortEma and bullCandAbs) :
-     ((sweepLo or floorAbs or pivSAbs or cprEmaAbs or (low <= prev4Lo and bullCandAbs)) and bullCandAbs)
+// Trend Alignment:
+// - In an uptrend regime, dipping into 13/34 EMA or CPR and closing back above 5-EMA (bullCandAbs) is the premier institutional Bear Trap / Dip Absorption!
+// - In a downtrend regime, Bear Trap Buy requires sweeping structural support (sweepLo, floorAbs, pivSAbs) AND closing above 13-EMA (shortEma).
+bool bearTrapPA   = isUptrendRegime ?
+     ((sweepLo or floorAbs or pivSAbs or cprEmaAbs or low <= prev4Lo) and bullCandAbs) :
+     ((sweepLo or floorAbs or pivSAbs) and close > shortEma and bullCandAbs)
 
-// 2. Smart Money Flow: Long-Unwinding (no fresh aggressive shorts) OR Put Blitz at Floor OR Positive Basis Expansion OR Uptrend CPR/34-EMA Absorption OR HTF Bottom Armed
-bool bearTrapFlow = (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (adjustedBasisSpread >= 5.0) or (intradayBasisDelta >= 5.0) or (isStrongUptrend and cprEmaAbs) or htfArmBot or htfScoutBot
+// 2. Smart Money Flow: Long-Unwinding OR Put Blitz at Floor OR Positive Basis Expansion OR Uptrend CPR/EMA Absorption
+bool bearTrapFlow = (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (intradayBasisDelta >= 5.0) or (isUptrendRegime and (cprEmaAbs or low <= prev4Lo)) or (isUptrendRegime and htfArmBot)
 
 // Anti-Whipsaw Cooldown
 var int lastTrapBar = -999
@@ -972,12 +983,16 @@ float bearTrapSL = math.min(low,  cur3Lo) - (swingSlAtr * nz(htfAtr, atr14))
 
 // Accurate, transparent tags for both Manual and Auto/Proxy modes
 string bullTrapTag = isManualOpt ? (isCallWritingBlitz ? "[Roof Call Blitz · ΔPCR ≤ 0.75]" : "[Options Manual Override]") :
+     (actRoof > 0 and high >= actRoof - 0.20 * atr14) ? "[Roof Call Wall Sweep Rejection]" :
+     pivRRej ? "[Pivot Resistance Rejection]" :
      futQuadrant == "SHORT_COVERING" ? "[Short-Covering Exhaustion · Fut OI -%]" :
      intradayBasisDelta <= -8.0 ? "[Futures Basis Breakdown]" : "[Liquidity Sweep Rejection]"
 
 string bearTrapTag = isManualOpt ? (isPutWritingBlitz ? "[Floor Put Blitz · ΔPCR ≥ 1.30]" : "[Options Manual Override]") :
-     futQuadrant == "LONG_UNWINDING" ? "[Long-Unwinding Absorption · Fut OI -%]" :
+     (actFloor > 0 and low <= actFloor + 0.20 * atr14) ? "[Floor Put Wall Support Absorption]" :
      cprEmaAbs ? "[CPR / 34-EMA Support Absorption]" :
+     pivSAbs ? "[Pivot Support Absorption]" :
+     futQuadrant == "LONG_UNWINDING" ? "[Long-Unwinding Absorption · Fut OI -%]" :
      intradayBasisDelta >= 5.0 ? "[Futures Basis Accumulation]" : "[Liquidity Sweep Absorption]"
 
 string fusionScenario = bullTrapSig ? "BULL_TRAP" :
