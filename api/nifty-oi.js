@@ -381,7 +381,7 @@ async function setRedisTimeline(dateKey, timelineArray) {
   if (!REDIS_URL || !REDIS_TOKEN || !Array.isArray(timelineArray) || timelineArray.length === 0) return false;
   try {
     const cleanKey = dateKey.replace(/\//g, "-");
-    const res = await fetch(`${REDIS_URL}/set/nifty_timeline_v2_${encodeURIComponent(cleanKey)}?ex=86400`, {
+    const res = await fetch(`${REDIS_URL}/set/nifty_timeline_v2_${encodeURIComponent(cleanKey)}?ex=1209600`, { // 14-day retention (preserves 7-day 1-min history easily)
       method: "POST",
       headers: {
         Authorization: `Bearer ${REDIS_TOKEN}`,
@@ -1703,21 +1703,21 @@ function getFallbackData() {
   const sessionInfo = getMarketSessionInfo();
 
   const strikesData = [
-    { strike: 25400, pDoi: -1500, cDoi: 12000, pOi: 8500, cOi: 92000 },
-    { strike: 25350, pDoi: -800, cDoi: 8500, pOi: 11200, cOi: 64000 },
-    { strike: 25300, pDoi: 1200, cDoi: 15400, pOi: 24500, cOi: 118000 },
-    { strike: 25250, pDoi: 3400, cDoi: 18200, pOi: 32000, cOi: 75000 },
-    { strike: 25200, pDoi: 14500, cDoi: 42000, pOi: 92000, cOi: 185000 }, // Roof
-    { strike: 25150, pDoi: 18200, cDoi: 19500, pOi: 65000, cOi: 62000 },
-    { strike: 25100, pDoi: 38500, cDoi: 21500, pOi: 128000, cOi: 95000 },
-    { strike: 25050, pDoi: 42000, cDoi: 14200, pOi: 84000, cOi: 42000 },
-    { strike: 25000, pDoi: 86500, cDoi: 18500, pOi: 245000, cOi: 112000 }, // Floor
-    { strike: 24950, pDoi: 34500, cDoi: -2500, pOi: 68000, cOi: 28000 },
-    { strike: 24900, pDoi: 45000, cDoi: -6200, pOi: 145000, cOi: 54000 },
-    { strike: 24850, pDoi: 22000, cDoi: -1800, pOi: 48000, cOi: 18000 },
-    { strike: 24800, pDoi: 28500, cDoi: -4200, pOi: 115000, cOi: 36000 },
-    { strike: 24750, pDoi: 12500, cDoi: -900, pOi: 34000, cOi: 12000 },
-    { strike: 24700, pDoi: 16000, cDoi: -1200, pOi: 78000, cOi: 24000 },
+    { strike: 25400, pDoi: -1500, cDoi: 12000, pOi: 12000, cOi: 92000 },
+    { strike: 25350, pDoi: -800, cDoi: 8500, pOi: 16000, cOi: 64000 },
+    { strike: 25300, pDoi: 1200, cDoi: 15400, pOi: 38000, cOi: 118000 },
+    { strike: 25250, pDoi: 3400, cDoi: 18200, pOi: 48000, cOi: 75000 },
+    { strike: 25200, pDoi: 14500, cDoi: 42000, pOi: 135000, cOi: 185000 }, // Roof
+    { strike: 25150, pDoi: 18200, cDoi: 19500, pOi: 92000, cOi: 62000 },
+    { strike: 25100, pDoi: 38500, cDoi: 21500, pOi: 182000, cOi: 95000 },
+    { strike: 25050, pDoi: 42000, cDoi: 14200, pOi: 118000, cOi: 42000 },
+    { strike: 25000, pDoi: 86500, cDoi: 18500, pOi: 345000, cOi: 112000 }, // Floor
+    { strike: 24950, pDoi: 34500, cDoi: -2500, pOi: 98000, cOi: 28000 },
+    { strike: 24900, pDoi: 45000, cDoi: -6200, pOi: 205000, cOi: 54000 },
+    { strike: 24850, pDoi: 22000, cDoi: -1800, pOi: 68000, cOi: 18000 },
+    { strike: 24800, pDoi: 28500, cDoi: -4200, pOi: 165000, cOi: 36000 },
+    { strike: 24750, pDoi: 12500, cDoi: -900, pOi: 48000, cOi: 12000 },
+    { strike: 24700, pDoi: 16000, cDoi: -1200, pOi: 90000, cOi: 7000 },
   ];
 
   const strikes = strikesData.map(r => ({
@@ -1766,7 +1766,7 @@ function getFallbackData() {
 
   const fallbackFusion = evaluateSmartMoneyFusion(fallbackFutMetrics, {
     deltaPcr: 1.58,
-    pcr: 1.22,
+    pcr: 1.66,
     totalPutWriting: 279500,
     totalCallWriting: 157500,
     roofCallWritingBlitz: false,
@@ -1779,7 +1779,7 @@ function getFallbackData() {
     roofStrike: 25200,
     totPutWriting: 279500,
     totCallWriting: 157500,
-    pcr: 1.22,
+    pcr: 1.66,
     deltaPcr: 1.58,
     timeline,
     dayOfWeek: 5, // Friday settled session
@@ -1812,10 +1812,10 @@ function getFallbackData() {
     totalCallWritingFormatted: "+1.6L",
     balanceStatus: "Support Heavier",
     recommendation: "Put writing dominates at 25,000 floor. Smart money defended 25,000. Favorable for stock CALLS on dips; strict SL: 24,950.",
-    pcr: 1.22,
-    nearPcr: 1.18,
+    pcr: 1.66,
+    nearPcr: 1.64,
     deltaPcr: 1.58,
-    totalPutOI: 1220000,
+    totalPutOI: 1660000,
     totalCallOI: 1000000,
     pcrWarning: eodDecision.pcrWarning,
     strikes,

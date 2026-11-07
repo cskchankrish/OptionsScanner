@@ -44,14 +44,14 @@ test("getCanonicalSettledTimeline provides verified closing window (14:15 to 15:
   const closingHourDelta = p1530.netDiff - p1415.netDiff;
   assert.equal(closingHourDelta, 100000, "Must reflect +1.0L lots institutional closing flow");
 
-  // Verify that calculateEODDecision on Saturday passes with full settled data
+  // Verify that calculateEODDecision on Saturday passes with verified settled data (PCR 1.66)
   const result = calculateEODDecision({
     spot: 25030.35,
     floorStrike: 25000,
     roofStrike: 25200,
     totPutWriting: 279500,
     totCallWriting: 157500,
-    pcr: 1.22,
+    pcr: 1.66,
     deltaPcr: 1.58,
     timeline,
     dayOfWeek: 6, // Saturday
@@ -63,4 +63,5 @@ test("getCanonicalSettledTimeline provides verified closing window (14:15 to 15:
   assert.ok(result.statusLabel.includes("WEEKEND CLOSED · PREVIOUS SESSION SETTLED"));
   assert.equal(result.verdict, "CARRY NIFTY CE (BTST)");
   assert.ok(result.audit.some(a => a.label.includes("Closing Hour Flow") && a.impact.includes("+3 pts")));
+  assert.ok(result.pcrWarning.includes("HISTORICAL PEAK OVERBOUGHT"));
 });
