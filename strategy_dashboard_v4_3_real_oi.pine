@@ -140,6 +140,11 @@ extFloorStrike= input.float(0.0,  "Manual Mode: Options Put Wall (Floor Strike, 
 showTrapLbl   = input.bool(true,  "Plot Real-Time 🚨 BULL TRAP / 🟢 BEAR TRAP Signals", group=GFU)
 whSendSynergy = input.bool(true,  "Fire Webhook on Smart Money BTST/STBT Synergy", group=GFU,
      tooltip="When enabled, fires SYNERGY_BULL / SYNERGY_BEAR JSON webhooks to your OptionsScanner bridge when High-Conviction Futures + Options Synergy triggers.")
+G_EXP = "🧪 Experimental HTF Toggles (Default OFF - Frozen for Nov 9 Baseline)"
+relax125mGate = input.bool(false, "Item 3: Relax 125m Confirmation (EMA5 Rising instead of EMA13)", group=G_EXP,
+     tooltip="A/B Experiment: When ON, relaxes 125m confirmation gate to match Daily (close > 5-EMA and 5-EMA rising). Default OFF to protect baseline.")
+useFutVolHtf  = input.bool(false, "Item 2: Query HTF Futures Volume for Spot Index Swings", group=G_EXP,
+     tooltip="A/B Experiment: When ON, queries 125m continuous futures volume (NSE:NIFTY1!) so volume climax functions on spot index charts. Default OFF.")
 
 G6 = "Range & Signal Settings"
 megaMinSigs    = input.int(6,   "Signals needed before watch",   minval=2, maxval=20, group=G6)
@@ -318,7 +323,7 @@ atr14 = ta.atr(14)
 //  ⑨ 2-STAGE STRUCTURAL BASE & TOP ENGINE (v3.5 — Validated on 125m & 1D)
 // ═══════════════════════════════════════════════════════════════════
 
-f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult, bool usePrevClosed) =>
+f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult, bool usePrevClosed, bool relaxGate, float extVol, float extVolSma) =>
     float hEma5  = ta.ema(close, 5)
     float hEma13 = ta.ema(close, 13)
     float hEma34 = ta.ema(close, 34)
@@ -383,8 +388,10 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
     float maxRsi4   = ta.highest(hRsi, 4)
     bool  rsiBotOk  = divBot or (minRsi4 <= 42.0 and hRsi > minRsi4 + 1.5)
     bool  rsiTopOk  = divTop or (maxRsi4 >= 58.0 and hRsi < maxRsi4 - 1.5)
-    bool  hasVol    = not na(volume) and volume > 0 and not na(vSma) and vSma > 0
-    bool  volClimax = useVol and hasVol and (volume >= vMult * vSma)
+    float effV      = extVol > 0 ? extVol : volume
+    float effVSma   = extVolSma > 0 ? extVolSma : vSma
+    bool  hasVol    = not na(effV) and effV > 0 and not na(effVSma) and effVSma > 0
+    bool  volClimax = useVol and hasVol and (effV >= vMult * effVSma)
 
     // ── Stage A: Arm Setup Zone (Stays valid for up to 4 HTF bars while waiting for Structural Break) ──
     var int   botSetupBar = -999
@@ -447,8 +454,8 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
     float flagHi2  = ta.highest(high, 2)[1]
     float flagLo2  = ta.lowest(low,   2)[1]
 
-    bool emaGateUp = isD ? (close > hEma5 and (close > hEma13 or hEma5 > hEma5[1])) : (close > hEma5 and close > hEma13)
-    bool emaGateDn = isD ? (close < hEma5 and (close < hEma13 or hEma5 < hEma5[1])) : (close < hEma5 and close < hEma13)
+    bool emaGateUp = isD ? (close > hEma5 and (close > hEma13 or hEma5 > hEma5[1])) : (relaxGate ? (close > hEma5 and (close > hEma13 or hEma5 > hEma5[1])) : (close > hEma5 and close > hEma13))
+    bool emaGateDn = isD ? (close < hEma5 and (close < hEma13 or hEma5 < hEma5[1])) : (relaxGate ? (close < hEma5 and (close < hEma13 or hEma5 < hEma5[1])) : (close < hEma5 and close < hEma13))
 
     bool revUp  = (bar_index - botSetupBar <= 4) and not na(botSetupLo) and emaGateUp and (close > structHi) and (close > open)
     bool revDn  = (bar_index - topSetupBar <= 4) and not na(topSetupHi) and emaGateDn and (close < structLo) and (close < open)
@@ -556,9 +563,13 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
 bool isNativeHtfChart = (timeframe.period == evalHtf) or isDailyChart
 bool useClosedPrevHtf = htfNoFlicker and not isNativeHtfChart
 
+[htfFutV_raw, htfFutVSma_raw] = request.security(futTicker, evalHtf, [volume, ta.sma(volume, 20)], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+float htfExtVol    = useFutVolHtf ? nz(htfFutV_raw, 0.0) : 0.0
+float htfExtVolSma = useFutVolHtf ? nz(htfFutVSma_raw, 0.0) : 0.0
+
 [htfState, htfBotLvl, htfTopLvl, htfFireBot, htfFireTop, htfArmBot, htfArmTop, htfAtr, htfTag, htfSc, htfBarIdx, htfScoutBot, htfScoutTop, htfCandLo, htfCandHi, htfScoutKind] = request.security(
      syminfo.tickerid, evalHtf,
-     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult, useClosedPrevHtf),
+     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult, useClosedPrevHtf, relax125mGate, htfExtVol, htfExtVolSma),
      lookahead=barmerge.lookahead_on)
 
 // ── Track Unique HTF Confirmations on Current Chart ──
@@ -614,14 +625,16 @@ f_swReasonText(int t) =>
 
 // Pinpoint Label Placement via yloc.belowbar / yloc.abovebar
 if showSwingLbl and confirmBottom
+    string swKindBotTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
     label.new(bar_index, low,
-         "🟢 SWING BOTTOM (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
+         "🟢 " + swKindBotTxt + " (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
          "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
          yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00c853, 0), textcolor=color.white, size=size.normal)
 
 if showSwingLbl and confirmTop
+    string swKindTopTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
     label.new(bar_index, high,
-         "🔴 SWING TOP (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
+         "🔴 " + swKindTopTxt + " (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
          "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
          yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#d50000, 0), textcolor=color.white, size=size.normal)
 
@@ -1776,19 +1789,65 @@ pHi = plot(cfShow and cfDrawZone and cfN >= cfMinLines ? cfHi : na, "Conf zone h
 fill(pLo, pHi, color=color.new(#00e5ff, 88), title="Conf zone")
 
 
+
+// ═══════════════════════════════════════════════════════════════════
+//  HOISTED RISK & TARGET SPECIFICATION (Shared by Alerts & Ledger)
+// ═══════════════════════════════════════════════════════════════════
+GL = "Engine levels on chart (SL + T1/T2/T3)"
+lvlShow = input.bool(true,  "Draw SL + T1/T2/T3 on entry alerts", group=GL)
+lvlBars = input.int(40,     "Extend lines this many bars", minval=5, group=GL)
+t1LPct  = input.float(0.50, "Long T1 %",  step=0.01, group=GL)
+t2LPct  = input.float(0.92, "Long T2 %",  step=0.01, group=GL)
+t3LPct  = input.float(1.79, "Long T3 %",  step=0.01, group=GL)
+t1SPct  = input.float(0.50, "Short T1 %", step=0.01, group=GL)
+t2SPct  = input.float(1.12, "Short T2 %", step=0.01, group=GL)
+t3SPct  = input.float(2.12, "Short T3 %", step=0.01, group=GL)
+
+useRFloor     = input.bool(true,  "Enforce Min 1.0R Target 1 & 2.0R Target 2 Floor (Fixes 125m/1D R:R)", group=GL,
+     tooltip="On 125m and 1D, a fixed 0.50% T1 is only 0.2R against a 200pt stop (forcing Req BE% to 73-81%). When ON, T1 is at least 1.0x Initial Stop (1R) and T2 is at least 2.0x Initial Stop (2R), and initial Stop is capped at maxStopAtr x ATR.")
+minT1R        = input.float(1.00, "Minimum T1 Risk-Reward Multiple (x 1R Stop)", minval=0.50, maxval=3.00, step=0.10, group=GL)
+minT2R        = input.float(2.00, "Minimum T2 Risk-Reward Multiple (x 1R Stop)", minval=1.00, maxval=5.00, step=0.25, group=GL)
+maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)", minval=0.80, maxval=4.00, step=0.10, group=GL,
+     tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
+
+f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
+    float safeAtr = nz(atr14, close * 0.006)
+    float rawDist = _isLong ? (close - nz(_rawSL, close - 1.2 * safeAtr)) : (nz(_rawSL, close + 1.2 * safeAtr) - close)
+    float minStop = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
+    float maxStop = math.max(minStop, maxStopAtr * safeAtr)
+    float riskPts = useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)
+    float effSL   = _isLong ? (close - riskPts) : (close + riskPts)
+    float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
+    float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
+    float t1Pts   = useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1
+    float t2Pts   = useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2
+    float t1Price = _isLong ? (close + t1Pts) : (close - t1Pts)
+    float t2Price = _isLong ? (close + t2Pts) : (close - t2Pts)
+    [riskPts, t1Pts, t2Pts, effSL, t1Price, t2Price]
+
 // ═══════════════════════════════════════════════════════════════════
 //  UNIFIED JSON ALERT (All Intraday & 125m/1D Swing Grades)
 // ═══════════════════════════════════════════════════════════════════
 
-f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
-    int  sc  = _dir == "LONG" ? bullScore : bearScore
-    bool blk = _grade == "MEGA" ? megaBlocked : ema200_blocked
+f_json(string _grade, string _dir, float _sl, int _sig, int _reType, string _swingKind, bool _isArmed) =>
+    bool  _isLong = _dir == "LONG"
+    [rPts, t1P, t2P, effSL, t1Prc, t2Prc] = f_calcRiskAndTargets(_isLong, _sl)
+    int   sc  = _isLong ? bullScore : bearScore
+    bool  blk = _grade == "MEGA" ? megaBlocked : ema200_blocked
     '{"secret":"' + webhookSecret + '","v":"4.3.0","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","swingTf":"' + evalHtfLabel + '","dir":"' + _dir + '","grade":"' + _grade +
      '","score":' + str.tostring(sc) +
      ',"sig":'    + str.tostring(_sig) +
      ',"reType":' + str.tostring(_reType) +
      ',"sl":'     + str.tostring(nz(_sl, 0), "0.00") +
+     ',"cappedSl":' + str.tostring(effSL, "0.00") +
+     ',"rDist":'  + str.tostring(rPts, "0.00") +
+     ',"t1Dist":' + str.tostring(t1P, "0.00") +
+     ',"t2Dist":' + str.tostring(t2P, "0.00") +
+     ',"t1":'     + str.tostring(t1Prc, "0.00") +
+     ',"t2":'     + str.tostring(t2Prc, "0.00") +
      ',"close":'  + str.tostring(close, "0.00") +
+     ',"swingKind":"' + _swingKind +
+     '","isArmed":'   + (_isArmed ? "true" : "false") +
      ',"rHigh":'  + str.tostring(nz(prevRHigh, 0), "#") +
      ',"rLow":'   + str.tostring(nz(prevRLow, 0),  "#") +
      ',"st":'     + str.tostring(stLine, "#") +
@@ -1821,52 +1880,47 @@ f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
      ',"confHi":'    + str.tostring(nz(cfHi, 0), "#") +
      ',"t":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm", "Asia/Kolkata") + '"}'
 
+string swKindLong  = activeSwingTag == 7 ? "CONTINUATION" : "REVERSAL"
+string swKindShort = activeSwingTag == 7 ? "CONTINUATION" : "REVERSAL"
+
 if isMegaBreakout
-    alert(f_json("MEGA", megaUp ? "LONG" : "SHORT", 0.0, megaSigNum, 0), alert.freq_once_per_bar_close)
+    alert(f_json("MEGA", megaUp ? "LONG" : "SHORT", 0.0, megaSigNum, 0, "INTRADAY", false), alert.freq_once_per_bar_close)
 else if newSig and not gapAbsorb
-    alert(f_json(isBreakoutWatch ? "WATCH" : "SIGNAL", buySignal ? "LONG" : "SHORT", 0.0, sigCount, 0), alert.freq_once_per_bar_close)
+    alert(f_json(isBreakoutWatch ? "WATCH" : "SIGNAL", buySignal ? "LONG" : "SHORT", 0.0, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar_close)
 else if vboBreakUp or vboBreakDn
-    alert(f_json("VBO_BREAK", vboBreakUp ? "LONG" : "SHORT", 0.0, sigCount, 0), alert.freq_once_per_bar_close)
+    alert(f_json("VBO_BREAK", vboBreakUp ? "LONG" : "SHORT", 0.0, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar_close)
 
 if reLong or reShort
-    alert(f_json("RE_ENTRY", reLong ? "LONG" : "SHORT", reSL, sigCount, reType), alert.freq_once_per_bar_close)
+    alert(f_json("RE_ENTRY", reLong ? "LONG" : "SHORT", reSL, sigCount, reType, "INTRADAY", false), alert.freq_once_per_bar_close)
 if tfLong or tfShort
-    alert(f_json("TREND_FLIP", tfLong ? "LONG" : "SHORT", tfSL, sigCount, 0), alert.freq_once_per_bar_close)
+    alert(f_json("TREND_FLIP", tfLong ? "LONG" : "SHORT", tfSL, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar_close)
 if gapT1Long or gapT1Short
-    alert(f_json("GAP_PULLBACK", gapT1Long ? "LONG" : "SHORT", gapSL, sigCount, 0), alert.freq_once_per_bar)
+    alert(f_json("GAP_PULLBACK", gapT1Long ? "LONG" : "SHORT", gapSL, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar)
 if gapT2Long or gapT2Short
-    alert(f_json("GAP_ADD", gapT2Long ? "LONG" : "SHORT", gapSL, sigCount, 0), alert.freq_once_per_bar)
+    alert(f_json("GAP_ADD", gapT2Long ? "LONG" : "SHORT", gapSL, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar)
 
 // Swing & Smart Money Trap Alerts
 float swBotSL = nz(activeSwingLvl, low)  - (swingSlAtr * nz(activeSwingAtr, atr14))
 float swTopSL = nz(activeSwingLvl, high) + (swingSlAtr * nz(activeSwingAtr, atr14))
 if confirmBottom
-    alert(f_json("SWING_BOTTOM", "LONG", swBotSL, sigCount, activeSwingTag), alert.freq_once_per_bar_close)
+    alert(f_json("SWING_BOTTOM", "LONG", swBotSL, sigCount, activeSwingTag, swKindLong, isBottomArmed), alert.freq_once_per_bar_close)
 if confirmTop
-    alert(f_json("SWING_TOP", "SHORT", swTopSL, sigCount, activeSwingTag), alert.freq_once_per_bar_close)
+    alert(f_json("SWING_TOP", "SHORT", swTopSL, sigCount, activeSwingTag, swKindShort, isTopArmed), alert.freq_once_per_bar_close)
 if bearTrapSig and not confirmBottom
-    alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8), alert.freq_once_per_bar_close)
+    alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8, "TRAP", isBottomArmed), alert.freq_once_per_bar_close)
 if bullTrapSig and not confirmTop
-    alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8), alert.freq_once_per_bar_close)
+    alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8, "TRAP", isTopArmed), alert.freq_once_per_bar_close)
 if whSendSynergy and isBullSynergy and not isBullSynergy[1]
-    alert(f_json("SYNERGY_BULL", "LONG", stLine, sigCount, 9), alert.freq_once_per_bar_close)
+    alert(f_json("SYNERGY_BULL", "LONG", stLine, sigCount, 9, "SYNERGY", isBottomArmed), alert.freq_once_per_bar_close)
 if whSendSynergy and isBearSynergy and not isBearSynergy[1]
-    alert(f_json("SYNERGY_BEAR", "SHORT", stLine, sigCount, 9), alert.freq_once_per_bar_close)
+    alert(f_json("SYNERGY_BEAR", "SHORT", stLine, sigCount, 9, "SYNERGY", isTopArmed), alert.freq_once_per_bar_close)
 
 
 // ═══════════════════════════════════════════════════════════════════
 //  ENGINE LEVELS ON CHART (SL + T1/T2/T3 — Including SWING & TREND_FLIP)
 // ═══════════════════════════════════════════════════════════════════
 
-GL = "Engine levels on chart (SL + T1/T2/T3)"
-lvlShow = input.bool(true,  "Draw SL + T1/T2/T3 on entry alerts", group=GL)
-lvlBars = input.int(40,     "Extend lines this many bars", minval=5, group=GL)
-t1LPct  = input.float(0.50, "Long T1 %",  step=0.01, group=GL)
-t2LPct  = input.float(0.92, "Long T2 %",  step=0.01, group=GL)
-t3LPct  = input.float(1.79, "Long T3 %",  step=0.01, group=GL)
-t1SPct  = input.float(0.50, "Short T1 %", step=0.01, group=GL)
-t2SPct  = input.float(1.12, "Short T2 %", step=0.01, group=GL)
-t3SPct  = input.float(2.12, "Short T3 %", step=0.01, group=GL)
+
 
 bool lvlLong = (isMegaBreakout and megaUp) or (newSig and not gapAbsorb and buySignal) or
      vboBreakUp or reLong or tfLong or gapT1Long or gapT2Long or confirmBottom or bearTrapSig
@@ -1940,12 +1994,7 @@ gateSwingsFlw = input.bool(false, "Also Require Orderflow Gate on 125m/1D Struct
 costPtsInput  = input.float(4.0,  "Unified Round-Trip Cost (Nifty Index Points)", minval=0.0, maxval=25.0, step=0.5, group=GBT_VER,
      tooltip="Matches the Strategy Tester's 40-tick (2.0pt/side = 4.0pt round-trip) slippage setting exactly.")
 scaleOutPct   = input.float(0.60, "T1 Scale-Out Fraction (0.60 = 3 of 5 Lots at T1, 2 Lots Runner)", minval=0.20, maxval=0.80, step=0.20, group=GBT_VER)
-useRFloor     = input.bool(true,  "Enforce Min 1.0R Target 1 & 2.0R Target 2 Floor (Fixes 125m/1D R:R)", group=GBT_VER,
-     tooltip="On 125m and 1D, a fixed 0.50% T1 is only 0.2R against a 200pt stop (forcing Req BE% to 73-81%). When ON, T1 is at least 1.0x Initial Stop (1R) and T2 is at least 2.0x Initial Stop (2R), and initial Stop is capped at maxStopAtr x ATR.")
-minT1R        = input.float(1.00, "Minimum T1 Risk-Reward Multiple (x 1R Stop)", minval=0.50, maxval=3.00, step=0.10, group=GBT_VER)
-minT2R        = input.float(2.00, "Minimum T2 Risk-Reward Multiple (x 1R Stop)", minval=1.00, maxval=5.00, step=0.25, group=GBT_VER)
-maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)", minval=0.80, maxval=4.00, step=0.10, group=GBT_VER,
-     tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
+// (useRFloor, minT1R, minT2R, maxStopAtr hoisted above for alert parity)
 maxHold15m    = input.int(20,     "Max Hold Bars on <=15m (Time-Stop, 20 = 5 Hrs)", minval=4, maxval=100, group=GBT_VER)
 maxHold125m   = input.int(15,     "Max Hold Bars on 125m/Hourly (Time-Stop, 15 = 5 Days)", minval=4, maxval=100, group=GBT_VER)
 maxHoldDaily  = input.int(12,     "Max Hold Bars on Daily (Time-Stop, 12 = 2.5 Weeks)", minval=3, maxval=60, group=GBT_VER)
@@ -2140,30 +2189,19 @@ bool swShortGated  = confirmTop    and (not gateSwingsFlw or bullTrapFlow)
 bool auditLongSig  = inAuditWindow and ((includeTraps and bearTrapSig) or (includeSwings and swLongGated))
 bool auditShortSig = inAuditWindow and ((includeTraps and bullTrapSig) or (includeSwings and swShortGated))
 
-// Helper to compute NaN-safe, ATR-capped 1R Stop Distance and R-Floored Targets (fixes inverted R:R on 125m & 1D!)
-f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
-    float safeAtr = nz(atr14, close * 0.006)
-    float rawDist = _isLong ? (close - nz(_rawSL, close - 1.2 * safeAtr)) : (nz(_rawSL, close + 1.2 * safeAtr) - close)
-    float minStop = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
-    float maxStop = math.max(minStop, maxStopAtr * safeAtr)
-    float riskPts = useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)
-    float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
-    float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
-    float t1Pts   = useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1
-    float t2Pts   = useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2
-    [riskPts, t1Pts, t2Pts]
+// (f_calcRiskAndTargets hoisted above for alert parity)
 
 if trDir == 0 and pendDir == 0 and barstate.isconfirmed and not na(atr14)
     if auditLongSig
         float rawSL = swLongGated ? swBotSL : bearTrapSL
-        [rPts, t1P, t2P] = f_calcRiskAndTargets(true, rawSL)
+        [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(true, rawSL)
         pendDir     := 1
         pendRiskPts := rPts
         pendT1Pts   := t1P
         pendT2Pts   := t2P
     else if auditShortSig
         float rawSL = swShortGated ? swTopSL : bullTrapSL
-        [rPts, t1P, t2P] = f_calcRiskAndTargets(false, rawSL)
+        [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(false, rawSL)
         pendDir     := -1
         pendRiskPts := rPts
         pendT1Pts   := t1P

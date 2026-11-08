@@ -106,7 +106,15 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
   const dir = String(tv.dir || "LONG").toUpperCase();
   const grade = String(tv.grade || "SIGNAL").toUpperCase();
   const close = Number(tv.close || 0);
-  const sl = Number(tv.sl || tv.st || 0);
+  const rawSl = Number(tv.sl || tv.st || 0);
+  const cappedSl = Number(tv.cappedSl || rawSl);
+  const rDist = Number(tv.rDist || (cappedSl > 0 ? Math.abs(close - cappedSl) : 0));
+  const t1Dist = Number(tv.t1Dist || 0);
+  const t2Dist = Number(tv.t2Dist || 0);
+  const t1Price = Number(tv.t1 || (t1Dist > 0 ? (dir === "LONG" ? close + t1Dist : close - t1Dist) : 0));
+  const t2Price = Number(tv.t2 || (t2Dist > 0 ? (dir === "LONG" ? close + t2Dist : close - t2Dist) : 0));
+  const swingKind = String(tv.swingKind || (tv.reType === 7 ? "CONTINUATION" : "REVERSAL")).toUpperCase();
+  const isArmed = Boolean(tv.isArmed);
 
   // Extract real-time Option Chain metrics supporting both corridor object and root properties
   const hasLiveOptions = Boolean(
@@ -290,8 +298,15 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     decision,
     recommendedLots,
     entryPrice: close,
-    stopLoss: sl,
-    riskPoints: sl > 0 ? Math.abs(Math.round((close - sl) * 100) / 100) : null,
+    stopLoss: cappedSl > 0 ? cappedSl : (rDist > 0 ? (dir === "LONG" ? close - rDist : close + rDist) : rawSl),
+    rawStopLoss: rawSl,
+    riskPoints: rDist > 0 ? Math.round(rDist * 100) / 100 : (rawSl > 0 ? Math.abs(Math.round((close - rawSl) * 100) / 100) : null),
+    target1Price: t1Price > 0 ? Math.round(t1Price * 100) / 100 : null,
+    target2Price: t2Price > 0 ? Math.round(t2Price * 100) / 100 : null,
+    target1Dist: t1Dist > 0 ? Math.round(t1Dist * 100) / 100 : null,
+    target2Dist: t2Dist > 0 ? Math.round(t2Dist * 100) / 100 : null,
+    swingKind,
+    isHtfArmed: isArmed,
     chartMetrics: {
       score: tv.score,
       futQuad: tv.futQuad,
@@ -331,15 +346,31 @@ export async function sendTelegramAlert(fused) {
       ? "🟢"
       : "🔴";
 
-  const msg = [
-    `${icon} *${fused.decision}* · \`${fused.grade}\` (${fused.direction})`,
+  const kindBadge =
+    fused.swingKind === "CONTINUATION"
+      ? " [TREND CONTINUATION]"
+      : fused.swingKind === "REVERSAL"
+      ? " [STRUCTURAL REVERSAL]"
+      : "";
+
+  const armedBadge = fused.isHtfArmed ? " ⚡ (HTF Armed)" : "";
+
+  const targetLine = fused.target1Price
+    ? `• *Targets:* T1: \`${fused.target1Price}\` (+${fused.target1Dist ?? "--"} pts / 1R) | T2: \`${fused.target2Price}\` (+${fused.target2Dist ?? "--"} pts / 2R)`
+    : null;
+
+  const lines = [
+    `${icon} *${fused.decision}* · \`${fused.grade}\`${kindBadge} (${fused.direction})${armedBadge}`,
     `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
-    `• *Entry / SL:* \`${fused.entryPrice}\`  |  *SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)`,
+    `• *Entry / SL:* \`${fused.entryPrice}\` | *SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)`,
+    targetLine,
     `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
     `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
     `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
     `• *Verdict:* ${fused.reasoning}`,
-  ].join("\n");
+  ].filter(Boolean);
+
+  const msg = lines.join("\n");
 
   try {
     await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
