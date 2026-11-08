@@ -1542,10 +1542,23 @@ export default async function handler(req, res) {
 
   const sessionInfo = getMarketSessionInfo();
   const force = req.query?.force === "true";
+  const isCronRequest = req.query?.cron === "true" ||
+                        req.query?.cron === "1" ||
+                        req.query?.compact === "true" ||
+                        /cron|uptime|ping|curl/i.test(req.headers?.["user-agent"] || "");
 
   // 1. Outside live market hours (Weekends, Evenings, Nights, Pre-market)
   // Serve the settled session state without querying NSE (which is closed)
   if (!sessionInfo.isLiveMarket && !force) {
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "MARKET_CLOSED_SETTLED",
+        timestamp: getISTTimeStr(),
+        nextOpen: sessionInfo.nextOpenDescription
+      });
+    }
     if (cache.data && (cache.data.isSettledSession || now - cache.timestamp < 3600000)) {
       return res.status(200).json({
         ...cache.data,
@@ -1577,6 +1590,15 @@ export default async function handler(req, res) {
   // 2. During Live Market Hours: serve memory cache if fresh (< 5 seconds)
   const cacheAge = now - cache.timestamp;
   if (!force && cache.data && cache.data.isLive && cacheAge < 5000) {
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "CACHED_FRESH",
+        timestamp: cache.data.timestamp,
+        spot: cache.data.spotPrice
+      });
+    }
     return res.status(200).json(cache.data);
   }
 
@@ -1868,9 +1890,28 @@ export default async function handler(req, res) {
     if (REDIS_URL) {
       saveRedisSessionPayload(payload).catch(() => {});
     }
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "LIVE_POLL_SUCCESS",
+        timestamp: payload.timestamp,
+        spot: payload.spotPrice,
+        pcr: payload.pcr,
+        ticks: intradayHistory.length
+      });
+    }
     return res.status(200).json(payload);
   } catch (err) {
     console.error("NSE Live fetch error, falling back to cached state:", err);
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "FALLBACK_CACHED",
+        spot: cache.data?.spotPrice || 25030.35
+      });
+    }
     if (cache.data) {
       return res.status(200).json({
         ...cache.data,
