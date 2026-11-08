@@ -425,6 +425,42 @@ export default async function handler(req, res) {
     }
 
     try {
+      const queryDate = req.query?.date || istDate;
+
+      // Master Historical Archive & CSV Export for reviewing 1-2 months later
+      if (req.query?.export === "csv") {
+        let allSignals = [];
+        if (redis) {
+          try {
+            const raw = await redis.lrange("nifty:tv:signals:master_archive", 0, 999);
+            allSignals = (raw || []).map(item => typeof item === "string" ? JSON.parse(item) : item);
+          } catch (e) {}
+        }
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader("Content-Disposition", `attachment; filename=nifty_signals_${istDate}.csv`);
+        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
+        const rows = allSignals.map(s => {
+          const cleanReason = (s.reasoning || "").replace(/"/g, '""');
+          return `"${s.timestamp}","${s.istTime}","${s.grade}","${s.direction}","${s.decision}",${s.recommendedLots},${s.entryPrice},${s.stopLoss},${s.riskPoints ?? ""},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
+        }).join("\n");
+        return res.status(200).send(header + rows);
+      }
+
+      if (req.query?.archive === "1" || req.query?.history === "1") {
+        let historyList = [];
+        if (redis) {
+          try {
+            const raw = await redis.lrange("nifty:tv:signals:master_archive", 0, 499);
+            historyList = (raw || []).map(item => typeof item === "string" ? JSON.parse(item) : item);
+          } catch (e) {}
+        }
+        return res.status(200).json({
+          success: true,
+          total: historyList.length,
+          signals: historyList,
+        });
+      }
+
       let latestSignal = null;
       let signals = [];
 
@@ -432,7 +468,7 @@ export default async function handler(req, res) {
         try {
           const [latest, list] = await Promise.all([
             redis.get("nifty:tv:latest_signal"),
-            redis.lrange(`nifty:tv:signals:${istDate}`, 0, 19),
+            redis.lrange(`nifty:tv:signals:${queryDate}`, 0, 49),
           ]);
           latestSignal = typeof latest === "string" ? JSON.parse(latest) : latest;
           signals = (list || []).map(item =>
@@ -449,7 +485,7 @@ export default async function handler(req, res) {
       return res.status(200).json({
         success: true,
         connected: Boolean(REDIS_URL),
-        istDate,
+        istDate: queryDate,
         latestSignal,
         signals,
       });
@@ -497,13 +533,16 @@ export default async function handler(req, res) {
     // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
     const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner);
 
-    // 4. Persist Fused Signal to Upstash Redis
+    // 4. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
     const signalKey = `nifty:tv:signals:${istDate}`;
+    const archiveKey = "nifty:tv:signals:master_archive";
     if (redis) {
       try {
         await Promise.all([
           redis.lpush(signalKey, JSON.stringify(fusedVerdict)),
           redis.ltrim(signalKey, 0, 99),
+          redis.lpush(archiveKey, JSON.stringify(fusedVerdict)),
+          redis.ltrim(archiveKey, 0, 999), // Keep up to 1,000 historical signals forever
           redis.set("nifty:tv:latest_signal", JSON.stringify(fusedVerdict), { ex: 86400 }),
         ]);
       } catch (e) {
