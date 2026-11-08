@@ -191,3 +191,51 @@ test("fuseChartWithOptionChain: Standard Intraday SIGNAL awards 2 Lots on Score 
   assert.equal(resMid.decision, "EXECUTE_INTRADAY");
   assert.equal(resMid.recommendedLots, 1);
 });
+
+test("fuseChartWithOptionChain: Non-trap signal with null/0 SL produces null stopLoss and targets (no fake stops)", () => {
+  const tv = {
+    dir: "LONG",
+    grade: "MEGA",
+    close: 25050,
+    sl: 0,
+    cappedSl: null,
+    rDist: null,
+    t1Dist: null,
+    t2Dist: null,
+    t1: null,
+    t2: null,
+  };
+
+  const res = fuseChartWithOptionChain(tv, null);
+  assert.equal(res.stopLoss, null);
+  assert.equal(res.riskPoints, null);
+  assert.equal(res.target1Price, null);
+  assert.equal(res.target2Price, null);
+  assert.equal(res.target1Dist, null);
+  assert.equal(res.target2Dist, null);
+});
+
+test("fuseChartWithOptionChain: BEAR_TRAP_BUY preserves exact cappedSl, rDist, and fill-relative targets", () => {
+  const tv = {
+    dir: "LONG",
+    grade: "BEAR_TRAP_BUY",
+    close: 25064,
+    sl: 24980,
+    cappedSl: 25000,
+    rDist: 64,
+    t1Dist: 64,
+    t2Dist: 128,
+    t1: 25128,
+    t2: 25192,
+  };
+
+  const res = fuseChartWithOptionChain(tv, null);
+  assert.equal(res.decision, "EXECUTE_TIER1_SCOUT");
+  assert.equal(res.entryPrice, 25064);
+  assert.equal(res.stopLoss, 25000);
+  assert.equal(res.riskPoints, 64);
+  assert.equal(res.target1Price, 25128);
+  assert.equal(res.target2Price, 25192);
+  assert.equal(res.target1Dist, 64);
+  assert.equal(res.target2Dist, 128);
+});

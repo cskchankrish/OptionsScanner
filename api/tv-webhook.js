@@ -20,8 +20,10 @@
  *       • DOWNGRADE_TO_SCALP  (1 Lot Intraday only if VETO_BTST/VETO_STBT is active)
  *       • VETO_SIGNAL         (0 Lots - Blocks trade when real 22-strike Option Chain
  *                              directly contradicts the chart signal)
+ *       • BLOCKED_BY_ACTIVE_TRADE (0 Lots - Enforces the tested Single-Position Rule)
+ *       • LOG_ONLY            (0 Lots - Informational logging for non-trap alerts)
  *  5. Logs the fused decision to Upstash Redis (`nifty:tv:signals:YYYY-MM-DD` and `nifty:tv:latest_signal`)
- *     for display in `NiftyFlowView.jsx` and optionally dispatches to Telegram.
+ *     and permanent master archive (`nifty:tv:signals:master_archive`) for 1-2 month review.
  */
 
 import { Redis } from "@upstash/redis";
@@ -106,13 +108,15 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
   const dir = String(tv.dir || "LONG").toUpperCase();
   const grade = String(tv.grade || "SIGNAL").toUpperCase();
   const close = Number(tv.close || 0);
-  const rawSl = Number(tv.sl || tv.st || 0);
-  const cappedSl = Number(tv.cappedSl || rawSl);
-  const rDist = Number(tv.rDist || (cappedSl > 0 ? Math.abs(close - cappedSl) : 0));
-  const t1Dist = Number(tv.t1Dist || 0);
-  const t2Dist = Number(tv.t2Dist || 0);
-  const t1Price = Number(tv.t1 || (t1Dist > 0 ? (dir === "LONG" ? close + t1Dist : close - t1Dist) : 0));
-  const t2Price = Number(tv.t2 || (t2Dist > 0 ? (dir === "LONG" ? close + t2Dist : close - t2Dist) : 0));
+
+  // Parse stops and distances safely (null/0 when non-existent, avoiding fake synthetic stops)
+  const rawSl = (tv.sl === null || tv.sl === undefined || tv.sl === "null" || Number(tv.sl) <= 0) ? null : Number(tv.sl);
+  const cappedSl = (tv.cappedSl === null || tv.cappedSl === undefined || tv.cappedSl === "null" || Number(tv.cappedSl) <= 0) ? null : Number(tv.cappedSl);
+  const rDist = (tv.rDist === null || tv.rDist === undefined || tv.rDist === "null" || Number(tv.rDist) <= 0) ? null : Number(tv.rDist);
+  const t1Dist = (tv.t1Dist === null || tv.t1Dist === undefined || tv.t1Dist === "null" || Number(tv.t1Dist) <= 0) ? null : Number(tv.t1Dist);
+  const t2Dist = (tv.t2Dist === null || tv.t2Dist === undefined || tv.t2Dist === "null" || Number(tv.t2Dist) <= 0) ? null : Number(tv.t2Dist);
+  const t1Price = (tv.t1 === null || tv.t1 === undefined || tv.t1 === "null" || Number(tv.t1) <= 0) ? null : Number(tv.t1);
+  const t2Price = (tv.t2 === null || tv.t2 === undefined || tv.t2 === "null" || Number(tv.t2) <= 0) ? null : Number(tv.t2);
   const swingKind = String(tv.swingKind || (tv.reType === 7 ? "CONTINUATION" : "REVERSAL")).toUpperCase();
   const isArmed = Boolean(tv.isArmed);
 
@@ -286,10 +290,35 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     }
   }
 
+  // Derive final Stop Loss & Targets
+  const finalSl = cappedSl !== null && cappedSl > 0
+    ? cappedSl
+    : (rawSl !== null && rawSl > 0 ? rawSl : null);
+
+  const finalRiskPts = rDist !== null && rDist > 0
+    ? Math.round(rDist * 100) / 100
+    : (finalSl !== null ? Math.abs(Math.round((close - finalSl) * 100) / 100) : null);
+
+  const finalT1Price = t1Price !== null && t1Price > 0
+    ? Math.round(t1Price * 100) / 100
+    : (finalRiskPts !== null && finalSl !== null ? Math.round((dir === "LONG" ? close + finalRiskPts : close - finalRiskPts) * 100) / 100 : null);
+
+  const finalT2Price = t2Price !== null && t2Price > 0
+    ? Math.round(t2Price * 100) / 100
+    : (finalRiskPts !== null && finalSl !== null ? Math.round((dir === "LONG" ? close + 2 * finalRiskPts : close - 2 * finalRiskPts) * 100) / 100 : null);
+
+  const finalT1Dist = t1Dist !== null && t1Dist > 0
+    ? Math.round(t1Dist * 100) / 100
+    : (finalRiskPts !== null ? finalRiskPts : null);
+
+  const finalT2Dist = t2Dist !== null && t2Dist > 0
+    ? Math.round(t2Dist * 100) / 100
+    : (finalRiskPts !== null ? Math.round(2 * finalRiskPts * 100) / 100 : null);
+
   return {
     timestamp: new Date().toISOString(),
     istTime: tv.t || new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }),
-    symbol: tv.sym || "NIFTY",
+    symbol: tv.sym || "NSE:NIFTY",
     timeframe: tv.tf || "15",
     swingTimeframe: tv.swingTf || "125m",
     direction: dir,
@@ -298,13 +327,13 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     decision,
     recommendedLots,
     entryPrice: close,
-    stopLoss: cappedSl > 0 ? cappedSl : (rDist > 0 ? (dir === "LONG" ? close - rDist : close + rDist) : rawSl),
+    stopLoss: finalSl,
     rawStopLoss: rawSl,
-    riskPoints: rDist > 0 ? Math.round(rDist * 100) / 100 : (rawSl > 0 ? Math.abs(Math.round((close - rawSl) * 100) / 100) : null),
-    target1Price: t1Price > 0 ? Math.round(t1Price * 100) / 100 : null,
-    target2Price: t2Price > 0 ? Math.round(t2Price * 100) / 100 : null,
-    target1Dist: t1Dist > 0 ? Math.round(t1Dist * 100) / 100 : null,
-    target2Dist: t2Dist > 0 ? Math.round(t2Dist * 100) / 100 : null,
+    riskPoints: finalRiskPts,
+    target1Price: finalT1Price,
+    target2Price: finalT2Price,
+    target1Dist: finalT1Dist,
+    target2Dist: finalT2Dist,
     swingKind,
     isHtfArmed: isArmed,
     chartMetrics: {
@@ -332,16 +361,19 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
 }
 
 /**
- * Optional Telegram Notification Helper
+ * Telegram Notification Helper
  */
 export async function sendTelegramAlert(fused) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId) return;
 
+  const isTrap = fused.grade === "BEAR_TRAP_BUY" || fused.grade === "BULL_TRAP_SELL";
   const icon =
-    fused.decision === "VETO_SIGNAL"
+    fused.decision === "VETO_SIGNAL" || fused.decision === "BLOCKED_BY_ACTIVE_TRADE"
       ? "🚫"
+      : fused.decision === "LOG_ONLY"
+      ? "ℹ️"
       : fused.direction === "LONG"
       ? "🟢"
       : "🔴";
@@ -355,20 +387,54 @@ export async function sendTelegramAlert(fused) {
 
   const armedBadge = fused.isHtfArmed ? " ⚡ (HTF Armed)" : "";
 
-  const targetLine = fused.target1Price
-    ? `• *Targets:* T1: \`${fused.target1Price}\` (+${fused.target1Dist ?? "--"} pts / 1R) | T2: \`${fused.target2Price}\` (+${fused.target2Dist ?? "--"} pts / 2R)`
-    : null;
+  let lines = [];
 
-  const lines = [
-    `${icon} *${fused.decision}* · \`${fused.grade}\`${kindBadge} (${fused.direction})${armedBadge}`,
-    `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
-    `• *Entry / SL:* \`${fused.entryPrice}\` | *SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)`,
-    targetLine,
-    `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
-    `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
-    `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
-    `• *Verdict:* ${fused.reasoning}`,
-  ].filter(Boolean);
+  if (fused.decision === "LOG_ONLY") {
+    lines = [
+      `${icon} *LOG_ONLY* · \`${fused.grade}\`${kindBadge} (${fused.direction})`,
+      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Signal Close:* \`${fused.entryPrice}\``,
+      fused.stopLoss ? `• *Reference SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)` : null,
+      `• *Status:* Informational alert logged for review. Forward paper trading strictly executes Traps Only (Bear/Bull Trap).`,
+    ].filter(Boolean);
+  } else if (fused.decision === "BLOCKED_BY_ACTIVE_TRADE") {
+    lines = [
+      `${icon} *BLOCKED_BY_ACTIVE_TRADE* · \`${fused.grade}\` (${fused.direction})`,
+      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m)`,
+      `• *Signal Close:* \`${fused.entryPrice}\``,
+      `• *Verdict:* ${fused.reasoning}`,
+      `• *Rule:* Strictly 1 position at a time (as backtested). Close existing trade before entering a new one.`,
+    ].filter(Boolean);
+  } else {
+    // Executable Trap
+    const targetLine = fused.target1Price
+      ? `• *Targets (Fill-Relative):* T1: \`${fused.target1Price}\` (+${fused.target1Dist ?? "--"} pts / 1.0R) | T2: \`${fused.target2Price}\` (+${fused.target2Dist ?? "--"} pts / 2.0R)`
+      : null;
+
+    lines = [
+      `${icon} *${fused.decision}* · \`${fused.grade}\`${kindBadge} (${fused.direction})${armedBadge}`,
+      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Entry (Signal Close):* \`${fused.entryPrice}\` *(Fill at next bar open)*`,
+      `• *Stop Loss:* \`${fused.stopLoss ?? "N/A"}\` (${fused.riskPoints ? fused.riskPoints + " pts, ATR-Capped" : "N/A"})`,
+      targetLine,
+      `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
+      `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
+      `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
+      `• *Verdict:* ${fused.reasoning}`,
+    ].filter(Boolean);
+
+    if (isTrap && fused.decision === "EXECUTE_TIER1_SCOUT") {
+      lines.push(
+        `\n📋 *EXECUTION & EXIT PROTOCOL (Frozen Baseline):*`,
+        `1. *Fill:* At market open next bar. Levels are fill-relative:`,
+        `   • Stop Loss: Entry ${fused.direction === "LONG" ? "-" : "+"} \`${fused.riskPoints}\` pts`,
+        `   • Target 1: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target1Dist}\` pts -> *Scale out 60% & Move SL to Breakeven*`,
+        `   • Target 2: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target2Dist}\` pts -> *Exit remaining 40%*`,
+        `2. *Time-Stop:* Max 20 bars (5 Hours on 15m). Exit at market if open after 20 bars (closed 53% of backtest trades).`,
+        `3. *Single-Position Rule:* Strictly one trade at a time.`
+      );
+    }
+  }
 
   const msg = lines.join("\n");
 
@@ -388,10 +454,40 @@ export async function sendTelegramAlert(fused) {
 }
 
 /**
+ * Telegram Exit Notification Helper
+ */
+export async function sendTelegramExitAlert(exitRecord) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId || !exitRecord?.trade) return;
+
+  const t = exitRecord.trade;
+  const lines = [
+    `🏁 *TRADE EXITED / CLOSED* · \`${t.grade}\` (${t.direction})`,
+    `• *Exit Reason:* \`${exitRecord.exitReason}\``,
+    `• *Entry Price:* \`${t.entryPrice}\` | *SL:* \`${t.stopLoss}\``,
+    `• *Targets:* T1: \`${t.target1Price}\` | T2: \`${t.target2Price}\``,
+    `• *Time in Trade / Logged:* ${exitRecord.istTime}`,
+    `• *Status:* Single-position lock released. Bridge ready for next setup.`,
+  ];
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: lines.join("\n"),
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Telegram exit alert error:", err.message);
+  }
+}
+
+/**
  * Main Vercel / Express Serverless Handler
- * Supported Methods:
- *  - POST: Ingests alert() webhook from TradingView v4.3
- *  - GET:  Fetches recent fused signals & latest status for NiftyFlowView.jsx
  */
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -405,8 +501,40 @@ export default async function handler(req, res) {
   const istDate = getIstDateString();
   const redis = getRedisClient();
 
-  // ── GET: Return recent fused signals or test telegram ──
+  // ── GET: Query Signals, Archive, Export CSV, or Close Active Trade ──
   if (req.method === "GET") {
+    // 1. Close Active Trade manually or via exit trigger
+    if (req.query?.close_trade === "1" || req.query?.action === "close_trade") {
+      const exitReason = req.query?.reason || "MANUAL_CLOSE";
+      let activeTrade = null;
+      if (redis) {
+        try {
+          const raw = await redis.get("nifty:tv:active_trade");
+          activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+          await redis.del("nifty:tv:active_trade");
+        } catch (e) {}
+      }
+      if (activeTrade) {
+        const exitRecord = {
+          type: "TRADE_EXIT",
+          timestamp: new Date().toISOString(),
+          istTime: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }),
+          exitReason,
+          trade: activeTrade,
+        };
+        if (redis) {
+          try {
+            await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord));
+          } catch (e) {}
+        }
+        await sendTelegramExitAlert(exitRecord);
+        return res.status(200).json({ success: true, message: `Trade closed (${exitReason})`, exitRecord });
+      } else {
+        return res.status(200).json({ success: true, message: "No active trade was open." });
+      }
+    }
+
+    // 2. Test Telegram dispatch
     if (req.query?.test === "telegram") {
       const botToken = process.env.TELEGRAM_BOT_TOKEN;
       const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -431,7 +559,11 @@ export default async function handler(req, res) {
         entryPrice: 25030.35,
         stopLoss: 24965,
         riskPoints: 65.35,
-        recommendedLots: 2,
+        target1Price: 25095.7,
+        target2Price: 25161.05,
+        target1Dist: 65.35,
+        target2Dist: 130.7,
+        recommendedLots: 1,
         tier: "TIER_1_SCOUT",
         chartMetrics: {
           futQuad: "LONG_UNWINDING",
@@ -458,7 +590,7 @@ export default async function handler(req, res) {
     try {
       const queryDate = req.query?.date || istDate;
 
-      // Master Historical Archive & CSV Export for reviewing 1-2 months later
+      // 3. Master Historical Archive & CSV Export for reviewing 1-2 months later
       if (req.query?.export === "csv") {
         let allSignals = [];
         if (redis) {
@@ -469,14 +601,15 @@ export default async function handler(req, res) {
         }
         res.setHeader("Content-Type", "text/csv");
         res.setHeader("Content-Disposition", `attachment; filename=nifty_signals_${istDate}.csv`);
-        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
+        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,T1,T2,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
         const rows = allSignals.map(s => {
-          const cleanReason = (s.reasoning || "").replace(/"/g, '""');
-          return `"${s.timestamp}","${s.istTime}","${s.grade}","${s.direction}","${s.decision}",${s.recommendedLots},${s.entryPrice},${s.stopLoss},${s.riskPoints ?? ""},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
+          const cleanReason = (s.reasoning || s.exitReason || "").replace(/"/g, '""');
+          return `"${s.timestamp}","${s.istTime}","${s.grade || s.trade?.grade || "EXIT"}","${s.direction || s.trade?.direction || ""}","${s.decision || s.type || ""}",${s.recommendedLots ?? 0},${s.entryPrice || s.trade?.entryPrice || ""},${s.stopLoss || s.trade?.stopLoss || ""},${s.riskPoints || s.trade?.riskPoints || ""},${s.target1Price || s.trade?.target1Price || ""},${s.target2Price || s.trade?.target2Price || ""},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
         }).join("\n");
         return res.status(200).send(header + rows);
       }
 
+      // 4. Archive JSON Query
       if (req.query?.archive === "1" || req.query?.history === "1") {
         let historyList = [];
         if (redis) {
@@ -493,20 +626,22 @@ export default async function handler(req, res) {
       }
 
       let latestSignal = null;
+      let activeTrade = null;
       let signals = [];
 
       if (redis) {
         try {
-          const [latest, list] = await Promise.all([
+          const [latest, list, active] = await Promise.all([
             redis.get("nifty:tv:latest_signal"),
             redis.lrange(`nifty:tv:signals:${queryDate}`, 0, 49),
+            redis.get("nifty:tv:active_trade"),
           ]);
           latestSignal = typeof latest === "string" ? JSON.parse(latest) : latest;
+          activeTrade = typeof active === "string" ? JSON.parse(active) : active;
           signals = (list || []).map(item =>
             typeof item === "string" ? JSON.parse(item) : item
           );
         } catch (e) {
-          // fallback to rest
           latestSignal = await redisRestGet("nifty:tv:latest_signal");
         }
       } else {
@@ -517,6 +652,7 @@ export default async function handler(req, res) {
         success: true,
         connected: Boolean(REDIS_URL),
         istDate: queryDate,
+        activeTrade,
         latestSignal,
         signals,
       });
@@ -564,7 +700,53 @@ export default async function handler(req, res) {
     // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
     const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner);
 
-    // 4. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
+    // 4. Enforce Baseline Paper Trading Policy (Traps Only & Single-Position Rule)
+    const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
+
+    if (!isTrap) {
+      // Non-trap signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
+      fusedVerdict.decision = "LOG_ONLY";
+      fusedVerdict.recommendedLots = 0;
+      fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward baseline paper trading acts on Traps Only (Bear/Bull Trap).`;
+    } else {
+      // Check Single-Position Rule for Traps
+      let activeTrade = null;
+      if (redis) {
+        try {
+          const raw = await redis.get("nifty:tv:active_trade");
+          activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+        } catch (e) {}
+      }
+
+      if (activeTrade && activeTrade.active) {
+        fusedVerdict.decision = "BLOCKED_BY_ACTIVE_TRADE";
+        fusedVerdict.recommendedLots = 0;
+        fusedVerdict.reasoning = `BLOCKED: Active trade already open (${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice}). The tested 15m system strictly enforces one position at a time.`;
+      } else if (fusedVerdict.decision === "EXECUTE_TIER1_SCOUT") {
+        // Record active trade with 6-hour TTL (24 bars on 15m)
+        const activeData = {
+          active: true,
+          grade: fusedVerdict.grade,
+          direction: fusedVerdict.direction,
+          entryPrice: fusedVerdict.entryPrice,
+          stopLoss: fusedVerdict.stopLoss,
+          riskPoints: fusedVerdict.riskPoints,
+          target1Price: fusedVerdict.target1Price,
+          target2Price: fusedVerdict.target2Price,
+          target1Dist: fusedVerdict.target1Dist,
+          target2Dist: fusedVerdict.target2Dist,
+          timestamp: fusedVerdict.timestamp,
+          istTime: fusedVerdict.istTime,
+        };
+        if (redis) {
+          try {
+            await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { ex: 21600 });
+          } catch (e) {}
+        }
+      }
+    }
+
+    // 5. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
     const signalKey = `nifty:tv:signals:${istDate}`;
     const archiveKey = "nifty:tv:signals:master_archive";
     if (redis) {
@@ -583,7 +765,7 @@ export default async function handler(req, res) {
       await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
     }
 
-    // 5. Fire Telegram Notification if configured and not vetoed
+    // 6. Fire Telegram Notification
     await sendTelegramAlert(fusedVerdict);
 
     return res.status(200).json({

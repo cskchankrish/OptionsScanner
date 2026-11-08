@@ -570,7 +570,7 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
 bool isNativeHtfChart = (timeframe.period == evalHtf) or isDailyChart
 bool useClosedPrevHtf = htfNoFlicker and not isNativeHtfChart
 
-[htfFutV_raw, htfFutVSma_raw] = request.security(futTicker, evalHtf, [volume, ta.sma(volume, 20)], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[htfFutV_raw, htfFutVSma_raw] = request.security(futTicker, evalHtf, [volume[1], ta.sma(volume, 20)[1]], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
 float htfExtVol    = useFutVolHtf ? nz(htfFutV_raw, 0.0) : 0.0
 float htfExtVolSma = useFutVolHtf ? nz(htfFutVSma_raw, 0.0) : 0.0
 
@@ -1818,18 +1818,19 @@ maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)
      tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
 
 f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
+    bool  hasSL   = not na(_rawSL) and _rawSL > 0.0
     float safeAtr = nz(atr14, close * 0.006)
-    float rawDist = _isLong ? (close - nz(_rawSL, close - 1.2 * safeAtr)) : (nz(_rawSL, close + 1.2 * safeAtr) - close)
+    float rawDist = hasSL ? (_isLong ? (close - _rawSL) : (_rawSL - close)) : 0.0
     float minStop = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
     float maxStop = math.max(minStop, maxStopAtr * safeAtr)
-    float riskPts = useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)
-    float effSL   = _isLong ? (close - riskPts) : (close + riskPts)
+    float riskPts = hasSL ? (useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)) : 0.0
+    float effSL   = hasSL ? (_isLong ? (close - riskPts) : (close + riskPts)) : 0.0
     float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
     float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
-    float t1Pts   = useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1
-    float t2Pts   = useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2
-    float t1Price = _isLong ? (close + t1Pts) : (close - t1Pts)
-    float t2Price = _isLong ? (close + t2Pts) : (close - t2Pts)
+    float t1Pts   = hasSL ? (useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1) : 0.0
+    float t2Pts   = hasSL ? (useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2) : 0.0
+    float t1Price = hasSL ? (_isLong ? (close + t1Pts) : (close - t1Pts)) : 0.0
+    float t2Price = hasSL ? (_isLong ? (close + t2Pts) : (close - t2Pts)) : 0.0
     [riskPts, t1Pts, t2Pts, effSL, t1Price, t2Price]
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1838,20 +1839,28 @@ f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
 
 f_json(string _grade, string _dir, float _sl, int _sig, int _reType, string _swingKind, bool _isArmed) =>
     bool  _isLong = _dir == "LONG"
+    bool  _hasSL  = not na(_sl) and _sl > 0.0
     [rPts, t1P, t2P, effSL, t1Prc, t2Prc] = f_calcRiskAndTargets(_isLong, _sl)
     int   sc  = _isLong ? bullScore : bearScore
     bool  blk = _grade == "MEGA" ? megaBlocked : ema200_blocked
+    string slStr       = _hasSL ? str.tostring(_sl, "0.00") : "null"
+    string cappedSlStr = _hasSL ? str.tostring(effSL, "0.00") : "null"
+    string rDistStr    = _hasSL ? str.tostring(rPts, "0.00") : "null"
+    string t1DistStr   = _hasSL ? str.tostring(t1P, "0.00") : "null"
+    string t2DistStr   = _hasSL ? str.tostring(t2P, "0.00") : "null"
+    string t1Str       = _hasSL ? str.tostring(t1Prc, "0.00") : "null"
+    string t2Str       = _hasSL ? str.tostring(t2Prc, "0.00") : "null"
     '{"secret":"' + webhookSecret + '","v":"4.3.0","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","swingTf":"' + evalHtfLabel + '","dir":"' + _dir + '","grade":"' + _grade +
      '","score":' + str.tostring(sc) +
      ',"sig":'    + str.tostring(_sig) +
      ',"reType":' + str.tostring(_reType) +
-     ',"sl":'     + str.tostring(nz(_sl, 0), "0.00") +
-     ',"cappedSl":' + str.tostring(effSL, "0.00") +
-     ',"rDist":'  + str.tostring(rPts, "0.00") +
-     ',"t1Dist":' + str.tostring(t1P, "0.00") +
-     ',"t2Dist":' + str.tostring(t2P, "0.00") +
-     ',"t1":'     + str.tostring(t1Prc, "0.00") +
-     ',"t2":'     + str.tostring(t2Prc, "0.00") +
+     ',"sl":'     + slStr +
+     ',"cappedSl":' + cappedSlStr +
+     ',"rDist":'  + rDistStr +
+     ',"t1Dist":' + t1DistStr +
+     ',"t2Dist":' + t2DistStr +
+     ',"t1":'     + t1Str +
+     ',"t2":'     + t2Str +
      ',"close":'  + str.tostring(close, "0.00") +
      ',"swingKind":"' + _swingKind +
      '","isArmed":'   + (_isArmed ? "true" : "false") +
@@ -1913,9 +1922,9 @@ if confirmBottom
     alert(f_json("SWING_BOTTOM", "LONG", swBotSL, sigCount, activeSwingTag, swKindLong, isBottomArmed), alert.freq_once_per_bar_close)
 if confirmTop
     alert(f_json("SWING_TOP", "SHORT", swTopSL, sigCount, activeSwingTag, swKindShort, isTopArmed), alert.freq_once_per_bar_close)
-if bearTrapSig and not confirmBottom
+if bearTrapSig
     alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8, "TRAP", isBottomArmed), alert.freq_once_per_bar_close)
-if bullTrapSig and not confirmTop
+if bullTrapSig
     alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8, "TRAP", isTopArmed), alert.freq_once_per_bar_close)
 if whSendSynergy and isBullSynergy and not isBullSynergy[1]
     alert(f_json("SYNERGY_BULL", "LONG", stLine, sigCount, 9, "SYNERGY", isBottomArmed), alert.freq_once_per_bar_close)
@@ -1994,7 +2003,7 @@ verifWindow   = input.string("Modern Real-OI Era (2021-01-01 to 2026-11-08)", "E
           "Forward Paper/Live OOS Only (From 2026-11-09 Onward)"
      ], group=GBT_VER,
      tooltip="Because rules were refined after viewing 2020-2026 regimes and Aug-Nov 2026 dates, all history through Nov 8, 2026 is In-Sample. True Out-of-Sample validation requires Forward Paper Trading from Nov 9, 2026 onward.")
-verifMode     = input.string("Traps + Structural Swings", "Signals to Audit in Ledger",
+verifMode     = input.string("Traps Only (Bull/Bear Trap)", "Signals to Audit in Ledger",
      options=["Traps Only (Bull/Bear Trap)", "Structural Swings Only (125m/1D)", "Traps + Structural Swings"], group=GBT_VER)
 gateSwingsFlw = input.bool(false, "Also Require Orderflow Gate on 125m/1D Structural Swings", group=GBT_VER,
      tooltip="Toggle ON vs OFF on 125m/1D charts to test whether requiring bullTrapFlow/bearTrapFlow improves or starves 125m/1D structural swing signals.")
@@ -2200,14 +2209,14 @@ bool auditShortSig = inAuditWindow and ((includeTraps and bullTrapSig) or (inclu
 
 if trDir == 0 and pendDir == 0 and barstate.isconfirmed and not na(atr14)
     if auditLongSig
-        float rawSL = swLongGated ? swBotSL : bearTrapSL
+        float rawSL = (includeSwings and swLongGated) ? swBotSL : bearTrapSL
         [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(true, rawSL)
         pendDir     := 1
         pendRiskPts := rPts
         pendT1Pts   := t1P
         pendT2Pts   := t2P
     else if auditShortSig
-        float rawSL = swShortGated ? swTopSL : bullTrapSL
+        float rawSL = (includeSwings and swShortGated) ? swTopSL : bullTrapSL
         [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(false, rawSL)
         pendDir     := -1
         pendRiskPts := rPts
@@ -2343,8 +2352,8 @@ else
 // Queue entry AND first-bar protective exits simultaneously on confirmed signal bar close
 if stFlat and barstate.isconfirmed and not na(atr14)
     if auditLongSig
-        float rawSL   = swLongGated ? swBotSL : bearTrapSL
-        [rPts, t1P, t2P] = f_calcRiskAndTargets(true, rawSL)
+        float rawSL   = (includeSwings and swLongGated) ? swBotSL : bearTrapSL
+        [rPts, t1P, t2P, effSL_stL, t1Price_stL, t2Price_stL] = f_calcRiskAndTargets(true, rawSL)
         stRiskPts    := rPts
         stT1Pts      := t1P
         stT2Pts      := t2P
@@ -2355,8 +2364,8 @@ if stFlat and barstate.isconfirmed and not na(atr14)
         strategy.exit("L_T1_60%", from_entry="LONG", qty=3, profit=t1Ticks, loss=slTicks, comment_profit="T1_60%", comment_loss="SL_INIT")
         strategy.exit("L_T2_40%", from_entry="LONG", qty=2, profit=t2Ticks, loss=slTicks, comment_profit="T2_40%", comment_loss="SL_INIT")
     else if auditShortSig
-        float rawSL   = swShortGated ? swTopSL : bullTrapSL
-        [rPts, t1P, t2P] = f_calcRiskAndTargets(false, rawSL)
+        float rawSL   = (includeSwings and swShortGated) ? swTopSL : bullTrapSL
+        [rPts, t1P, t2P, effSL_stS, t1Price_stS, t2Price_stS] = f_calcRiskAndTargets(false, rawSL)
         stRiskPts    := rPts
         stT1Pts      := t1P
         stT2Pts      := t2P
