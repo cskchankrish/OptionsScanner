@@ -541,8 +541,10 @@ export function getSessionTimelineByDate(isoDate, seed) {
 async function syncRedisHistory(today) {
   const sessionInfo = getMarketSessionInfo();
   const isSunday = sessionInfo.isSunday;
+  const openMins = isSunday ? 840 : 555;
   const closeMins = isSunday ? 960 : 940;
   const closeTimeStr = isSunday ? "16:00" : "15:40";
+  const nowMins = getISTMinutes();
 
   // Only reset session for a brand new trading day once live market trading actually begins
   if (sessionInfo.isLiveMarket && sessionDate && sessionDate !== today) {
@@ -560,7 +562,16 @@ async function syncRedisHistory(today) {
     const remote = await getRedisTimeline(sessionDate || today);
     if (Array.isArray(remote) && remote.length > (intradayHistory ? intradayHistory.length : 0)) {
       intradayHistory = remote
-        .filter(pt => pt && (pt.minutes || 0) <= closeMins && (pt.time || "") <= closeTimeStr)
+        .filter(pt => {
+          if (!pt) return false;
+          const m = pt.minutes || 0;
+          // During live market: strictly only include ticks that belong to today's active session!
+          // Cannot be earlier than market open, and CANNOT be in the future (greater than current minute)!
+          if (sessionInfo.isLiveMarket) {
+            return m >= openMins && m <= nowMins;
+          }
+          return m <= closeMins && (pt.time || "") <= closeTimeStr;
+        })
         .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
     }
   }
@@ -636,6 +647,13 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
   } else if (!sessionDate) {
     sessionDate = today;
   }
+
+  // Crucial: During live market, strip ANY legacy ticks from a prior session or future ticks!
+  intradayHistory = intradayHistory.filter(pt => {
+    if (!pt) return false;
+    const m = pt.minutes || 0;
+    return m >= openMins && m <= nowMins;
+  });
 
   // 2. Post-Market Evening Review Window (closeMins to 23:00 IST)
   // Market is closed. Today's minute-by-minute data must be preserved until 23:00 IST.
@@ -1445,17 +1463,32 @@ export default async function handler(req, res) {
       }
       const incoming = body?.timeline;
       if (Array.isArray(incoming) && incoming.length > 0) {
+        const sessionInfo = getMarketSessionInfo();
+        const isSunday = sessionInfo.isSunday;
+        const openMins = isSunday ? 840 : 555;
+        const closeMins = isSunday ? 960 : 940;
+        const nowMins = getISTMinutes();
+
+        const filterFn = pt => {
+          if (!pt) return false;
+          const m = pt.minutes || 0;
+          if (sessionInfo.isLiveMarket) {
+            return m >= openMins && m <= nowMins;
+          }
+          return m <= closeMins;
+        };
+
         if (body?.replaceTimeline) {
           intradayHistory = incoming
-            .filter(pt => pt && pt.minutes <= 960 && pt.time <= "16:00")
+            .filter(filterFn)
             .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         } else {
           const map = new Map();
           for (const pt of intradayHistory) {
-            if (pt && pt.time && pt.minutes <= 960 && pt.time <= "16:00") map.set(pt.time, pt);
+            if (filterFn(pt)) map.set(pt.time, pt);
           }
           for (const pt of incoming) {
-            if (pt && pt.time && pt.minutes <= 960 && pt.time <= "16:00") map.set(pt.time, pt);
+            if (filterFn(pt)) map.set(pt.time, pt);
           }
           intradayHistory = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
         }

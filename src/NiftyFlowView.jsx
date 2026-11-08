@@ -1345,13 +1345,27 @@ function getTodayDateKey() {
 
 function mergeTimelineArrays(localArr = [], serverArr = []) {
   const map = new Map();
+  const sessionStatus = getMarketSessionStatus();
+  const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const nowMins = nowIst.getHours() * 60 + nowIst.getMinutes();
+  const isSunday = nowIst.getDay() === 0;
+  const openMins = isSunday ? 840 : 555;
+  const closeMins = isSunday ? 960 : 940;
+  const isLive = sessionStatus.isAutoActive;
+
   for (const item of (Array.isArray(localArr) ? localArr : [])) {
-    if (item && item.time && (item.minutes || 0) <= 960 && item.time <= "16:00") {
+    if (item && item.time) {
+      const m = item.minutes || 0;
+      if (isLive && (m < openMins || m > nowMins)) continue;
+      if (!isLive && m > closeMins) continue;
       map.set(item.time, item);
     }
   }
   for (const item of (Array.isArray(serverArr) ? serverArr : [])) {
-    if (item && item.time && (item.minutes || 0) <= 960 && item.time <= "16:00") {
+    if (item && item.time) {
+      const m = item.minutes || 0;
+      if (isLive && (m < openMins || m > nowMins)) continue;
+      if (!isLive && m > closeMins) continue;
       map.set(item.time, item);
     }
   }
@@ -1359,13 +1373,15 @@ function mergeTimelineArrays(localArr = [], serverArr = []) {
   const raw = Array.from(map.values()).sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
   if (raw.length <= 1) return raw;
 
-  // Bridge any intraday gaps (e.g. if phone slept or browser backgrounded between 15:11 and 15:40)
+  // Bridge any intraday gaps, but NEVER bridge into the future!
+  const maxBridgeMins = isLive ? nowMins : closeMins;
   const bridged = [];
   for (let i = 0; i < raw.length; i++) {
     const cur = raw[i];
+    if (cur.minutes > maxBridgeMins) continue;
     bridged.push(cur);
     const next = raw[i + 1];
-    if (next && next.minutes - cur.minutes > 2 && next.minutes <= 960) {
+    if (next && next.minutes - cur.minutes > 2 && next.minutes <= maxBridgeMins) {
       const gapSteps = next.minutes - cur.minutes;
       for (let m = cur.minutes + 1; m < next.minutes; m++) {
         const fraction = (m - cur.minutes) / gapSteps;
@@ -1501,6 +1517,11 @@ export function NiftyFlowView({ t, isDark }) {
       if (res.ok) {
         const data = await res.json();
         const todayKey = getTodayDateKey();
+        const sessionStatus = getMarketSessionStatus();
+        const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+        const nowMins = nowIst.getHours() * 60 + nowIst.getMinutes();
+        const isSunday = nowIst.getDay() === 0;
+        const openMins = isSunday ? 840 : 555;
         let finalTimeline = data.intradayTimeline || [];
 
         // Check local storage to merge past points collected during the day
@@ -1512,13 +1533,16 @@ export function NiftyFlowView({ t, isDark }) {
               const prevLen = finalTimeline.length;
               finalTimeline = mergeTimelineArrays(localArr, finalTimeline);
 
-              // If client has more points than server (e.g. serverless cold start), sync back to server
-              if (localArr.length > prevLen + 5) {
-                fetch("/api/nifty-oi", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ timeline: finalTimeline })
-                }).catch(() => {});
+              // If client has more points than server (e.g. serverless cold start), sync back to server ONLY during active market and never with future ticks
+              if (sessionStatus.isAutoActive && localArr.length > prevLen + 5) {
+                const livePayload = finalTimeline.filter(pt => pt && pt.minutes >= openMins && pt.minutes <= nowMins);
+                if (livePayload.length > 0) {
+                  fetch("/api/nifty-oi", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ timeline: livePayload })
+                  }).catch(() => {});
+                }
               }
             }
           }
