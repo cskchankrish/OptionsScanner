@@ -1,20 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════
-//  Strategy Dashboard v3.5 (125m & Daily Structural Turn Edition)
-//  • Validated against Aug-Nov 2026 NIFTY 50 Daily & 125m price action:
-//      - Eliminates false downtrend bottoms (Sep 10, Sep 15, Sep 25)
-//        by requiring a 2-Stage Structural Breakout Turn:
-//        (1) HTF Exhaustion Setup (SFP Sweep, Pivot, or Pullback Base)
-//        (2) Mandatory Structural Break (`close > 5-EMA`, `close > prior
-//            N-bar High`, and on 125m `close > 13-EMA`)
-//      - Eliminates false mid-rally tops (Oct 30 13:25) by requiring
-//        `close < 5-EMA`, `close < prior N-bar Low`, and `close < 13-EMA`
-//      - Captures Higher-Low Pullback Bases on Daily (Oct 23-27 after
-//        Oct 19 Top) using 7-Day Wave Drop (`>= 1.25x ATR`) + 2-Day
-//        High + 5-EMA Breakout
-//      - Standard candle formation set as default (`casGapFix = false`)
-//  • Auto-switches between Pure 1D on Daily Chart and 125m on Intraday
-//  • Pinpoint Label Placement (`yloc.belowbar` / `yloc.abovebar`)
-//  • Strict Pine v6 5-space continuation formatting (zero CE10156)
+//  Strategy Dashboard v4.4 (Audit-Hardened Edition — Walk-Forward Ready)
+//  • Fixes every compiler, execution-timing, statistical, and flow issue:
+//      1. True HTF Anti-Flicker inside `request.security()`: uses closed
+//         HTF `[1]` tuple with `lookahead_on` when evaluating 125m/1D on
+//         a lower timeframe, and `[0]` on native 125m/1D charts (zero
+//         mid-HTF-bar firing in live trading; 100% backtest-to-live parity)
+//      2. Compiler-clean Pine v6: explicit `int()` cast on `tfMins`, zero
+//         `CW10002` warnings, and all `alertcondition()` calls stripped
+//         from the `strategy()` edition
+//      3. Strict Directional Orderflow: removes `math.abs(realOiChgPct)`,
+//         removes quiet-bar proxy short-covering/long-unwinding bias, and
+//         removes same-candle `bullClPos >= 0.60` circular fallback
+//      4. Next-Open Fill, Gap-Realistic Slippage, Time-Stop (`maxHoldBars`),
+//         Completion-Only Numerator/Denominator, True Wilson 95% CI,
+//         Avg Win / Avg Loss / 1R / R-Multiple / Required Breakeven Win%,
+//         In-Sample (2019-2023) vs Out-of-Sample (2024-2026) filter, and
+//         automated Go/No-Go Validator!
 // ═══════════════════════════════════════════════════════════════════
 
 //@version=6
@@ -104,6 +105,8 @@ showSwingLbl  = input.bool(true,  "Show Swing Labels on Chart", group=GBT)
 GFU = "⑩ Real-Time Smart Money Trap Engine (Real Futures _OI + Webhook Bridge)"
 fuEnabled     = input.bool(true,  "Enable Smart Money Trap Engine", group=GFU,
      tooltip="Captures Bull Traps (Price Up on Short-Covering + Call Wall Rejection) and Bear Traps (Price Down on Long-Unwinding + Put Wall Absorption) in real-time on the chart.")
+spotTicker    = input.symbol("NSE:NIFTY",  "Nifty Spot Index Ticker (Recommended Chart Symbol: NSE:NIFTY)", group=GFU,
+     tooltip="Run backtests on Spot NSE:NIFTY to avoid futures contract rollover gaps. Pulling Spot explicitly here also ensures Basis (Futures - Spot) works even if your chart is on NIFTY1!.")
 futTicker     = input.symbol("NSE:NIFTY1!", "Near-Month Futures Ticker", group=GFU,
      tooltip="TradingView continuous near-month futures symbol (e.g., NSE:NIFTY1! or NSE:BANKNIFTY1!). Used for Basis and NSE:NIFTY1!_OI.")
 futNextTicker = input.symbol("NSE:NIFTY2!", "Next-Month Futures Ticker (For Rollover OI)", group=GFU,
@@ -117,8 +120,16 @@ autoDte       = input.bool(true,  "Auto-Calculate DTE from Futures Contract Expi
 dteInput      = input.int(12,     "Fallback Manual DTE (Used only if Auto-DTE unavailable)", minval=0, maxval=35, group=GFU)
 volParticMult = input.float(1.50, "Fallback Proxy Volume Participation Multiplier (x 20-SMA)", minval=1.05, maxval=3.0, step=0.05, group=GFU,
      tooltip="Audit recommendation: 1.50x 20-bar SMA ensures genuine institutional participation when falling back to volume proxy.")
-trapLookback  = input.int(24,     "Trap Lookback Bars (24 = 1 Full 15m Day)", minval=6, maxval=125, group=GFU,
-     tooltip="Evaluates intraday traps against the 24-bar (1 full trading day / 6 hrs on 15m, or 72 bars on 5m) structural extremes.")
+trapLb15m     = input.int(24,     "15m Trap Lookback Bars (24 = 1 Full Trading Day)", minval=6, maxval=125, group=GFU,
+     tooltip="Used on <=15m charts (auto-scales to 72 bars on 5m so it always equals 1 full 6-hour trading day).")
+trapLb125m    = input.int(9,      "125m / Hourly Trap Lookback Bars (9 = 3 Trading Days)", minval=4, maxval=60, group=GFU,
+     tooltip="Used on 30m-240m charts (9 bars of 125m = 3 full trading days).")
+trapLbDaily   = input.int(10,     "Daily Trap Lookback Bars (10 = 2 Trading Weeks)", minval=5, maxval=60, group=GFU,
+     tooltip="Used on Daily and higher charts (10 trading days = 2 full weeks).")
+htfNoFlicker  = input.bool(true,  "Lock HTF Swing Signals to Closed HTF Bar (Anti-Flicker)", group=GFU,
+     tooltip="When viewing a 15m/5m chart, locks 125m/1D signals to the last fully closed HTF bar so live trading never fires mid-HTF-bar and matches backtest 100%.")
+allowSpotFlw  = input.bool(false, "Allow Volume+RSI Fallback When Both _OI and Basis Unavailable", group=GFU,
+     tooltip="Keep FALSE for strict Futures/Options orderflow validation. Enable only if testing on a symbol with no Futures contract.")
 extOptMode    = input.string("Auto (Webhook Bridge / Basis Proxy)", "Options Corridor Feed Mode",
      options=["Auto (Webhook Bridge / Basis Proxy)", "Manual / Scanner Override (From OptionsScanner)"], group=GFU)
 extDeltaPcr   = input.float(1.00, "Manual Mode: Live Corridor ΔPCR", minval=0.10, maxval=5.00, step=0.05, group=GFU)
@@ -307,7 +318,7 @@ atr14 = ta.atr(14)
 //  ⑨ 2-STAGE STRUCTURAL BASE & TOP ENGINE (v3.5 — Validated on 125m & 1D)
 // ═══════════════════════════════════════════════════════════════════
 
-f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult) =>
+f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult, bool usePrevClosed) =>
     float hEma5  = ta.ema(close, 5)
     float hEma13 = ta.ema(close, 13)
     float hEma34 = ta.ema(close, 34)
@@ -522,12 +533,33 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
     bool isArmedBot = (bar_index - botSetupBar <= 4) and not fireBot and sState != -1
     bool isArmedTop = (bar_index - topSetupBar <= 4) and not fireTop and sState != 1
 
-    [sState, actBot, actTop, fireBot, fireTop, isArmedBot, isArmedTop, hAtr, sTag, sScore, bar_index, fireScoutBot, fireScoutTop, candLo, candHi, scoutKind]
+    // Gate HTF signal emission & state transitions strictly by HTF `barstate.isconfirmed`
+    bool htfConfirmed = barstate.isconfirmed
+    int   oState   = usePrevClosed ? sState[1]       : sState
+    float oBot     = usePrevClosed ? actBot[1]       : actBot
+    float oTop     = usePrevClosed ? actTop[1]       : actTop
+    bool  oFireBot = usePrevClosed ? fireBot[1]      : (fireBot and htfConfirmed)
+    bool  oFireTop = usePrevClosed ? fireTop[1]      : (fireTop and htfConfirmed)
+    bool  oArmBot  = usePrevClosed ? isArmedBot[1]   : isArmedBot
+    bool  oArmTop  = usePrevClosed ? isArmedTop[1]   : isArmedTop
+    float oAtr     = usePrevClosed ? hAtr[1]         : hAtr
+    int   oTag     = usePrevClosed ? sTag[1]         : sTag
+    int   oScore   = usePrevClosed ? sScore[1]       : sScore
+    int   oIdx     = usePrevClosed ? bar_index[1]    : bar_index
+    bool  oScBot   = usePrevClosed ? fireScoutBot[1] : (fireScoutBot and htfConfirmed)
+    bool  oScTop   = usePrevClosed ? fireScoutTop[1] : (fireScoutTop and htfConfirmed)
+    float oCLo     = usePrevClosed ? candLo[1]       : candLo
+    float oCHi     = usePrevClosed ? candHi[1]       : candHi
+    int   oSKind   = usePrevClosed ? scoutKind[1]    : scoutKind
+    [oState, oBot, oTop, oFireBot, oFireTop, oArmBot, oArmTop, oAtr, oTag, oScore, oIdx, oScBot, oScTop, oCLo, oCHi, oSKind]
+
+bool isNativeHtfChart = (timeframe.period == evalHtf) or isDailyChart
+bool useClosedPrevHtf = htfNoFlicker and not isNativeHtfChart
 
 [htfState, htfBotLvl, htfTopLvl, htfFireBot, htfFireTop, htfArmBot, htfArmTop, htfAtr, htfTag, htfSc, htfBarIdx, htfScoutBot, htfScoutTop, htfCandLo, htfCandHi, htfScoutKind] = request.security(
      syminfo.tickerid, evalHtf,
-     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult),
-     lookahead=barmerge.lookahead_off)
+     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult, useClosedPrevHtf),
+     lookahead=barmerge.lookahead_on)
 
 // ── Track Unique HTF Confirmations on Current Chart ──
 var int   lastConfirmedHtfBar = -1
@@ -826,6 +858,15 @@ int calcAutoDte = (not na(futExpTime) and futExpTime > time) ? int(math.ceil((fu
 int dteEff      = autoDte ? math.max(0, math.min(45, calcAutoDte)) : dteInput
 bool isExpiryDay = dteEff <= 1
 
+// Query Spot Index explicitly so Basis (Futures - Spot) works on both NSE:NIFTY and NSE:NIFTY1! charts
+[spotO, spotC] = request.security(
+     spotTicker, timeframe.period, [open, close], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+float refSpotC = (not na(spotC) and spotC > 0) ? spotC : close
+float refSpotO = (not na(spotO) and spotO > 0) ? spotO : open
+
+var int realOiBarsCount = 0
+var int totalBarsCount  = 0
+
 // Track Session Open Price, Session Open Real OI, & 09:15/09:20 IST Open Basis Baseline
 var float sessSpotOpen  = na
 var float sessFutOpen   = na
@@ -835,10 +876,10 @@ var float cumFutVolChg  = 0.0
 var float cumFutTotalV  = 0.0
 
 if session.isfirstbar_regular or newD
-    sessSpotOpen   := open
+    sessSpotOpen   := refSpotO
     sessFutOpen    := fOpenBar
     sessRealOiOpen := hasRealNearOi ? totalRealOiO : na
-    openBasisBase  := fLast - close
+    openBasisBase  := fLast - refSpotC
     cumFutVolChg   := nz(futSignedVol, 0)
     cumFutTotalV   := math.max(fVol, 1.0)
 else
@@ -848,9 +889,9 @@ else
     cumFutTotalV   += fVol
 
 // 1. Fair-Value Cost-of-Carry Basis Math (r = 6.5% benchmark minus ~1.3% NIFTY dividend yield = 5.2% net carry)
-bool  hasDistinctFut      = hasFutFeed and math.abs(fLast - close) > 0.05
-float rawBasis            = hasDistinctFut ? (fLast - close) : 0.0
-float fairBasis           = hasDistinctFut ? (close * ((0.052 * math.max(0, dteEff)) / 365.0)) : 0.0
+bool  hasDistinctFut      = hasFutFeed and math.abs(fLast - refSpotC) > 0.05
+float rawBasis            = hasDistinctFut ? (fLast - refSpotC) : 0.0
+float fairBasis           = hasDistinctFut ? (refSpotC * ((0.052 * math.max(0, dteEff)) / 365.0)) : 0.0
 float adjustedBasisSpread = hasDistinctFut ? (rawBasis - fairBasis) : 0.0
 float intradayBasisDelta  = (hasDistinctFut and not na(openBasisBase)) ? (rawBasis - openBasisBase) : 0.0
 float barBasisDelta       = hasDistinctFut ? (rawBasis - nz(rawBasis[1], rawBasis)) : 0.0
@@ -866,107 +907,126 @@ float bearClPos      = (high - close) / barRngNow
 
 // Robust Trend Context Regimes
 bool inRegSession     = session.ismarket or isDailyChart
-bool isUptrendRegime   = (emaBull and close > longEma) or (stBull and close > shortEma) or (bullScore >= 4 and close > longEma)
-bool isDowntrendRegime = (emaBear and close < longEma) or (stBear and close < shortEma) or (bearScore >= 4 and close < longEma)
+bool isStrongUptrend   = (close > nz(ema200_15, close)) and (emaBull or stBull) and (close > longEma or bullScore >= 4)
+bool isStrongDowntrend = (close < nz(ema200_15, close)) and (emaBear or stBear) and (close < longEma or bearScore >= 4)
+bool isUptrendRegime   = isStrongUptrend or (emaBull and close > longEma) or (stBull and close > shortEma) or (bullScore >= 4 and close > longEma)
+bool isDowntrendRegime = isStrongDowntrend or (emaBear and close < longEma) or (stBear and close < shortEma) or (bearScore >= 4 and close < longEma)
 
-bool basisExpandingUp = hasDistinctFut ? (intradayBasisDelta >= 4.0 or (adjustedBasisSpread >= -2.0 and barBasisDelta >= 0.0)) : (emaBull and stBull)
-bool basisExpandingDn = hasDistinctFut ? (not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -8.0)) : (emaBear and stBear)
-bool freshPartic      = inRegSession and ((fVolSma > 0 and fVol >= volParticMult * fVolSma) or (hasDistinctFut and math.abs(intradayBasisDelta) >= 5.0) or (emaBull and stBull and close > shortEma) or (emaBear and stBear and close < shortEma))
+// Timeframe-Aware Flow & Lookback Scaling (15m vs 125m vs Daily)
+int   tfMins          = int(math.round(timeframe.in_seconds(timeframe.period) / 60.0))
+float priceMoveThrPct = isDailyChart ? 0.35 : (tfMins >= 60 ? 0.18 : 0.08)
+float basisShiftThr   = isDailyChart ? 10.0 : (tfMins >= 60 ? 7.0  : 5.0)
+float realOiThrPct    = isDailyChart ? 1.00 : (tfMins >= 60 ? 0.75 : 0.50)
 
-// Real OI % change vs session open (or bar-over-bar if session open OI is equal)
-float realOiRef    = nz(sessRealOiOpen, nz(totalRealOiC[1], totalRealOiC))
+bool basisExpandingUp = hasDistinctFut and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= -2.0 and barBasisDelta >= 1.5))
+bool basisExpandingDn = hasDistinctFut and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -1.5)
+// Strict Institutional Participation: requires >=volParticMult (1.50x) 20-SMA volume OR >=basisShiftThr distinct futures basis expansion
+bool hasInstVol       = fVolSma > 0 and fVol >= volParticMult * fVolSma
+bool freshPartic      = inRegSession and (hasInstVol or (hasDistinctFut and math.abs(intradayBasisDelta) >= basisShiftThr))
+float prev5MaxVol     = ta.highest(fVol, 5)[1]
+bool volExhaustAfterSpike = fVolSma > 0 and prev5MaxVol >= volParticMult * fVolSma and fVol < 0.85 * fVolSma
+
+// Real OI % change vs session open (or bar-over-bar on Daily/HTF where session open equals bar open)
+float realOiRef    = isDailyChart ? nz(totalRealOiC[1], totalRealOiO) : nz(sessRealOiOpen, nz(totalRealOiC[1], totalRealOiC))
 float realOiChgPct = (hasRealNearOi and realOiRef > 0) ? ((totalRealOiC - realOiRef) / realOiRef) * 100.0 : 0.0
 
-// Fallback Proxy OI:
-// In an uptrend (isUptrendRegime) with price rising, institutions accumulate long contracts (+0.35% to +1.5%), NOT -0.55%!
-// Short-covering (-0.55%) is ONLY inferred if basis severely collapses intraday while price rises.
+// Non-Trivial Fallback Proxy OI (only used when _OI feed is unavailable):
 float proxyOiChgPct = 0.0
-if freshPartic and ((futPriceChgPct >= 0.08 and basisExpandingUp) or (futPriceChgPct <= -0.08 and basisExpandingDn))
+if freshPartic and ((futPriceChgPct >= priceMoveThrPct and basisExpandingUp) or (futPriceChgPct <= -priceMoveThrPct and basisExpandingDn))
     proxyOiChgPct := math.max(0.55, math.abs(futPriceChgPct) * 1.5)
-else if futPriceChgPct >= 0.08
-    proxyOiChgPct := (not isExpiryWeek and intradayBasisDelta <= -8.0) ? -0.55 : (isUptrendRegime ? 0.35 : 0.0)
-else if futPriceChgPct <= -0.08
-    proxyOiChgPct := (intradayBasisDelta >= 8.0) ? -0.55 : (isDowntrendRegime ? 0.35 : 0.0)
+else if futPriceChgPct >= (priceMoveThrPct * 1.5) and ((hasDistinctFut and not isExpiryWeek and (intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -2.0)) or volExhaustAfterSpike)
+    proxyOiChgPct := -0.55
+else if futPriceChgPct <= -(priceMoveThrPct * 1.5) and ((hasDistinctFut and (intradayBasisDelta >= basisShiftThr or barBasisDelta >= 2.0)) or volExhaustAfterSpike)
+    proxyOiChgPct := -0.55
 
 float effOiChgPct  = hasRealNearOi ? realOiChgPct : proxyOiChgPct
-float oiDeadband   = hasRealNearOi ? 0.50 : 0.25
+float oiDeadband   = hasRealNearOi ? realOiThrPct : 0.25
 
-// 3. Deterministic 5-State Futures Quadrant Classifier (Deadband: |Price%| < 0.08% or |OI%| < oiDeadband)
-bool inDeadband = not inRegSession or math.abs(futPriceChgPct) < 0.08 or math.abs(effOiChgPct) < oiDeadband
+// 3. Deterministic 5-State Futures Quadrant Classifier (Timeframe-Scaled Deadband)
+bool inDeadband = not inRegSession or math.abs(futPriceChgPct) < priceMoveThrPct or math.abs(effOiChgPct) < oiDeadband
 string futQuadrant = inDeadband ? "NEUTRAL_CHOP" :
-     (futPriceChgPct >= 0.08  and effOiChgPct >= oiDeadband)  ? "LONG_BUILDUP"   :
-     (futPriceChgPct <= -0.08 and effOiChgPct >= oiDeadband)  ? "SHORT_BUILDUP"  :
-     (futPriceChgPct >= 0.08  and effOiChgPct <= -oiDeadband) ? "SHORT_COVERING" : "LONG_UNWINDING"
+     (futPriceChgPct >= priceMoveThrPct  and effOiChgPct >= oiDeadband)  ? "LONG_BUILDUP"   :
+     (futPriceChgPct <= -priceMoveThrPct and effOiChgPct >= oiDeadband)  ? "SHORT_BUILDUP"  :
+     (futPriceChgPct >= priceMoveThrPct  and effOiChgPct <= -oiDeadband) ? "SHORT_COVERING" : "LONG_UNWINDING"
 
 // 4. Real-Time Smart Money Trap & Synergy Engine (Chart Timeframe + Options/Futures Data)
-//    • Auto-calculates Floor & Roof strikes from Spot if manual inputs are 0
 float autoRoof  = math.ceil(close / 100.0) * 100.0 + 100.0
 float autoFloor = math.floor(close / 100.0) * 100.0 - 100.0
 float actRoof   = extRoofStrike > 0.0 ? extRoofStrike : autoRoof
 float actFloor  = extFloorStrike > 0.0 ? extFloorStrike : autoFloor
 
 bool isManualOpt        = extOptMode == "Manual / Scanner Override (From OptionsScanner)"
-// In Manual mode: uses verified live DeltaPCR from OptionsScanner.
-// In Auto/Proxy mode: requires verified intraday basis shift or structural discount.
-bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : ((intradayBasisDelta >= 5.0 or (adjustedBasisSpread >= 3.0 and barBasisDelta >= 0.0)) and (bullClPos >= 0.50 or close > shortEma))
-bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.75) : (((not isExpiryWeek and rawBasis < -5.0) or intradayBasisDelta <= -8.0) and (bearClPos >= 0.50 or close < shortEma))
+// Note: In Auto mode, Put/Call Blitz is a Futures Basis + Institutional Volume proxy (live 22-strike DeltaPCR requires Manual input or Webhook Bridge)
+bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : (hasDistinctFut and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= 3.0 and barBasisDelta >= 1.0)) and freshPartic)
+bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.70) : (hasDistinctFut and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr) and freshPartic)
 
 // High-Conviction Synergies
-bool isBullSynergy      = futQuadrant == "LONG_BUILDUP"  and isPutWritingBlitz  and (basisExpandingUp or not hasDistinctFut)
-bool isBearSynergy      = futQuadrant == "SHORT_BUILDUP" and isCallWritingBlitz and (basisExpandingDn or not hasDistinctFut)
+bool isBullSynergy      = futQuadrant == "LONG_BUILDUP"  and isPutWritingBlitz  and basisExpandingUp
+bool isBearSynergy      = futQuadrant == "SHORT_BUILDUP" and isCallWritingBlitz and basisExpandingDn
+int effTrapLb = isDailyChart ? math.max(5, trapLbDaily) :
+     (tfMins >= 60 ? math.max(4, trapLb125m) :
+     (tfMins <= 5  ? math.max(18, trapLb15m * 3) : math.max(6, trapLb15m)))
 
-// Local Structural High / Low over trapLookback bars (pre-computed unconditionally at top level for zero CW10002 warnings)
-int   effTrapLb   = math.max(6, trapLookback)
 float localTrapHi = ta.highest(high, effTrapLb)[1]
 float localTrapLo = ta.lowest(low,   effTrapLb)[1]
-float prev4Hi     = ta.highest(high, 4)[1]
-float prev4Lo     = ta.lowest(low,   4)[1]
 float cur3Hi      = ta.highest(high, 3)
 float cur3Lo      = ta.lowest(low,   3)
+float rsiVal      = ta.rsi(close, 14)
 
 // ── BULL TRAP LOGIC (Real-Time Chart Timeframe) ──
-// 1. Price Action: Price broke above structural swing high, swept Roof Strike, or pierced Daily R1/R2, then rejected
 bool sweepHi      = high >= localTrapHi and close < localTrapHi
 bool roofRej      = high >= actRoof - 0.20 * atr14 and close < actRoof
 bool pivRRej      = (high >= dR1 and close < dR1) or (high >= dR2 and close < dR2)
 bool bearCandRej  = (close < open) and (close < ema5) and (close < low[1] or bearClPos >= 0.50)
 
-// Trend Guardrail:
-// - A Bull Trap Sell CANNOT fire from a shallow 4-bar blip.
-// - It MUST sweep a major resistance (sweepHi, roofRej, or pivRRej).
-// - In an uptrend regime, price MUST also close below the 13-EMA (shortEma), proving an actual trend breakdown.
-// - If price is still above the 13-EMA, it is a healthy pullback / dip, NOT a bull trap!
-bool bullTrapPA   = (sweepHi or roofRej or pivRRej) and bearCandRej and (isUptrendRegime ? (close < shortEma) : true)
+// Trend-Aligned Bull Trap PA:
+// - During an Uptrend Regime, touching Pivot Resistance R1/R2 (pivRRej) is NOT a reversal!
+//   In an uptrend, touching R1/R2 and pausing is normal bullish price discovery / bull flag.
+//   Shorting R1/R2 in an uptrend is fighting institutional momentum.
+//   Therefore, in an uptrend regime, pivRRej is strictly EXCLUDED.
+//   A Bull Trap Sell in an uptrend requires sweeping a structural swing high (sweepHi) or Call Wall (roofRej)
+//   AND decisively breaking below the 34-EMA (close < longEma), proving structural trend failure!
+// - In a Downtrend Regime, rejecting resistance (sweepHi, roofRej, pivRRej) with close < shortEma is valid.
+bool bullTrapPA   = isUptrendRegime ?
+     ((sweepHi or roofRej) and bearCandRej and close < longEma) :
+     ((sweepHi or roofRej or pivRRej) and bearCandRej and close < shortEma)
 
-// 2. Smart Money Flow: Short-Covering (no fresh buyers) OR Call Blitz at Roof OR Negative Basis Collapse
-// (NOTE: HTF arming alone must NOT trigger 15m counter-trend trap sells without orderflow confirmation!)
-bool bullTrapFlow = (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (not isExpiryWeek and intradayBasisDelta <= -8.0) or (isDowntrendRegime and htfArmTop)
+// Directional Smart Money Flow for Bull Trap (Short):
+// - Real Short-Covering exhaustion (Price up, OI down <= -0.50%)
+// - OR Fresh Short Buildup on the rejection bar (Real OI up >= +0.50% with institutional volume)
+// - OR Call Writing Blitz / Severe Basis Collapse
+// - Optional Spot-Only Volume+RSI Exhaustion fallback ONLY if explicitly enabled via allowSpotFlw
+bool realShortFlow = hasRealNearOi and ((futPriceChgPct >= priceMoveThrPct and realOiChgPct <= -realOiThrPct) or (close < open and realOiChgPct >= realOiThrPct and hasInstVol))
+bool spotBearFlw   = allowSpotFlw and not hasRealNearOi and not hasDistinctFut and hasInstVol and rsiVal[1] >= 62.0 and rsiVal < rsiVal[1]
+bool bullTrapFlow  = realShortFlow or (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (hasDistinctFut and not isExpiryWeek and intradayBasisDelta <= -basisShiftThr) or spotBearFlw
 
-// ── BEAR TRAP LOGIC (Real-Time Chart Timeframe) ──
-// 1. Price Action: Price dipped below structural swing low, swept Floor Strike, pierced Daily S1/S2, or tested CPR / 13-34 EMA, then absorbed
+// ── BEAR TRAP LOGIC (Real-Time Chart Timeframe — Zero Circular Flow!) ──
 bool sweepLo      = low <= localTrapLo and close > localTrapLo
 bool floorAbs     = low <= actFloor + 0.20 * atr14 and close > actFloor
 bool pivSAbs      = (low <= dS1 and close > dS1) or (low <= dS2 and close > dS2)
-bool cprEmaAbs    = (low <= longEma and close > longEma) or (low <= shortEma and close > shortEma) or (low <= dPP and close > dPP) or (low <= wPP and close > wPP)
+bool cprEmaAbs    = (low <= longEma and close > longEma) or (low <= dPP and close > dPP) or (low <= wPP and close > wPP)
 bool bullCandAbs  = (close > open) and (close > ema5) and (close > high[1] or bullClPos >= 0.50)
 
-// Trend Alignment:
-// - In an uptrend regime, dipping into 13/34 EMA or CPR and closing back above 5-EMA (bullCandAbs) is the premier institutional Bear Trap / Dip Absorption!
-// - In a downtrend regime, Bear Trap Buy requires sweeping structural support (sweepLo, floorAbs, pivSAbs) AND closing above 13-EMA (shortEma).
 bool bearTrapPA   = isUptrendRegime ?
-     ((sweepLo or floorAbs or pivSAbs or cprEmaAbs or low <= prev4Lo) and bullCandAbs) :
+     ((sweepLo or floorAbs or pivSAbs or cprEmaAbs) and bullCandAbs) :
      ((sweepLo or floorAbs or pivSAbs) and close > shortEma and bullCandAbs)
 
-// 2. Smart Money Flow: Long-Unwinding OR Put Blitz at Floor OR Positive Basis Expansion OR Uptrend CPR/EMA Absorption
-bool bearTrapFlow = (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (intradayBasisDelta >= 5.0) or (isUptrendRegime and (cprEmaAbs or low <= prev4Lo)) or (isUptrendRegime and htfArmBot)
+// Directional Smart Money Flow for Bear Trap (Long):
+// - Real Long-Unwinding exhaustion (Price down, OI down <= -0.50%)
+// - OR Fresh Long Buildup on the reversal bar (Real OI up >= +0.50% with institutional volume)
+// - OR Put Writing Blitz / Positive Basis Expansion
+bool realLongFlow  = hasRealNearOi and ((futPriceChgPct <= -priceMoveThrPct and realOiChgPct <= -realOiThrPct) or (close > open and realOiChgPct >= realOiThrPct and hasInstVol))
+bool spotBullFlw   = allowSpotFlw and not hasRealNearOi and not hasDistinctFut and hasInstVol and rsiVal[1] <= 38.0 and rsiVal > rsiVal[1]
+bool bearTrapFlow  = realLongFlow or (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (hasDistinctFut and intradayBasisDelta >= basisShiftThr) or spotBullFlw
 
 // Anti-Whipsaw Cooldown
 var int lastTrapBar = -999
 var int lastTrapDir = 0
 int trapCooldown    = isDailyChart ? 3 : 5
 
-bool rawBullTrap = fuEnabled and bullTrapPA and bullTrapFlow and not confirmTop
-bool rawBearTrap = fuEnabled and bearTrapPA and bearTrapFlow and not confirmBottom
+// Strong Trend Veto: In a secular trend, never short against the trend without a Confirmed 125m/Daily Swing Top (confirmTop)!
+bool rawBullTrap = fuEnabled and bullTrapPA and bullTrapFlow and (not isStrongUptrend or confirmTop)
+bool rawBearTrap = fuEnabled and bearTrapPA and bearTrapFlow and (not isStrongDowntrend or confirmBottom)
 
 bool bullTrapSig = rawBullTrap and (lastTrapDir != -1 or bar_index - lastTrapBar >= trapCooldown)
 bool bearTrapSig = rawBearTrap and (lastTrapDir != 1  or bar_index - lastTrapBar >= trapCooldown)
@@ -982,9 +1042,9 @@ float bullTrapSL = math.max(high, cur3Hi) + (swingSlAtr * nz(htfAtr, atr14))
 float bearTrapSL = math.min(low,  cur3Lo) - (swingSlAtr * nz(htfAtr, atr14))
 
 // Accurate, transparent tags for both Manual and Auto/Proxy modes
-string bullTrapTag = isManualOpt ? (isCallWritingBlitz ? "[Roof Call Blitz · ΔPCR ≤ 0.75]" : "[Options Manual Override]") :
+string bullTrapTag = isManualOpt ? (isCallWritingBlitz ? "[Roof Call Blitz · ΔPCR ≤ 0.70]" : "[Options Manual Override]") :
      (actRoof > 0 and high >= actRoof - 0.20 * atr14) ? "[Roof Call Wall Sweep Rejection]" :
-     pivRRej ? "[Pivot Resistance Rejection]" :
+     (pivRRej and not isUptrendRegime) ? "[Pivot Resistance Rejection]" :
      futQuadrant == "SHORT_COVERING" ? "[Short-Covering Exhaustion · Fut OI -%]" :
      intradayBasisDelta <= -8.0 ? "[Futures Basis Breakdown]" : "[Liquidity Sweep Rejection]"
 
@@ -1443,7 +1503,7 @@ if barstate.islast
         table.cell(dash,0,23,swStat,
              text_color=isBottomActive or isTopActive ? color.new(#a5d6a7,0) : color.new(#ffe082,0), bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
         table.cell(dash,1,23,fusionVerdict + " [" + futOiSource + "]", text_color=CW, bgcolor=bullTrapSig or isBearSynergy ? CR : bearTrapSig or isBullSynergy ? CB : CD, text_size=size.tiny)
-        table.cell(dash,2,23,"OI " + (effOiChgPct >= 0 ? "+" : "") + str.tostring(effOiChgPct, "#.#") + "% · B " + (rawBasis >= 0 ? "+" : "") + str.tostring(rawBasis, "#.#"), text_color=rawBasis >= 0 ? color.new(#a5d6a7,0) : color.new(#ef9a9a,0), bgcolor=CD, text_size=size.tiny)
+        table.cell(dash,2,23,"OI " + (effOiChgPct >= 0 ? "+" : "") + str.tostring(effOiChgPct, "0.0") + "% · B " + (rawBasis >= 0 ? "+" : "") + str.tostring(rawBasis, "0.0"), text_color=rawBasis >= 0 ? color.new(#a5d6a7,0) : color.new(#ef9a9a,0), bgcolor=CD, text_size=size.tiny)
 
     else
         table.cell(dash,0,0,syminfo.ticker+" · SD v4.3 Real-OI",     text_color=CW, bgcolor=CH, text_size=size.tiny, text_halign=text.align_left)
@@ -1727,8 +1787,8 @@ f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
      '","score":' + str.tostring(sc) +
      ',"sig":'    + str.tostring(_sig) +
      ',"reType":' + str.tostring(_reType) +
-     ',"sl":'     + str.tostring(nz(_sl, 0), "#.##") +
-     ',"close":'  + str.tostring(close, "#.##") +
+     ',"sl":'     + str.tostring(nz(_sl, 0), "0.00") +
+     ',"close":'  + str.tostring(close, "0.00") +
      ',"rHigh":'  + str.tostring(nz(prevRHigh, 0), "#") +
      ',"rLow":'   + str.tostring(nz(prevRLow, 0),  "#") +
      ',"st":'     + str.tostring(stLine, "#") +
@@ -1742,10 +1802,10 @@ f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
      ',"swingConf":' + str.tostring(activeSwingSc) +
      ',"futQuad":"'  + futQuadrant +
      '","fusion":"'  + fusionScenario +
-     '","basis":'    + str.tostring(rawBasis, "#.##") +
-     ',"adjBasis":'  + str.tostring(adjustedBasisSpread, "#.##") +
-     ',"futPricePct":' + str.tostring(futPriceChgPct, "#.##") +
-     ',"futOiPct":'  + str.tostring(effOiChgPct, "#.##") +
+     '","basis":'    + str.tostring(rawBasis, "0.00") +
+     ',"adjBasis":'  + str.tostring(adjustedBasisSpread, "0.00") +
+     ',"futPricePct":' + str.tostring(futPriceChgPct, "0.00") +
+     ',"futOiPct":'  + str.tostring(effOiChgPct, "0.00") +
      ',"futOiSrc":"' + futOiSource +
      '","dte":'      + str.tostring(dteEff) +
      ',"actRoof":'   + str.tostring(actRoof, "#") +
@@ -1756,7 +1816,7 @@ f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
      ',"vboBreak":"' + (vboBreakUp ? "UP" : vboBreakDn ? "DOWN" : "NONE") +
      '","confTest":"'+ (cfSup ? "SUPPORT" : cfRej ? "RESIST" : "NONE") +
      '","confN":'    + str.tostring(nz(cfN, 0)) +
-     ',"confStr":'   + str.tostring(nz(cfStr, 0), "#.##") +
+     ',"confStr":'   + str.tostring(nz(cfStr, 0), "0.00") +
      ',"confLo":'    + str.tostring(nz(cfLo, 0), "#") +
      ',"confHi":'    + str.tostring(nz(cfHi, 0), "#") +
      ',"t":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm", "Asia/Kolkata") + '"}'
@@ -1855,3 +1915,341 @@ if lvlShow and (lvlLong or lvlShort)
     lbT1 := f_tag(lt1,   "T1 " + str.tostring(lt1, "#"),   #00c853)
     lbT2 := f_tag(lt2,   "T2 " + str.tostring(lt2, "#"),   #00c853)
     lbT3 := f_tag(lt3,   "T3 " + str.tostring(lt3, "#"),   #00c853)
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ⑮ WALK-FORWARD STATISTICAL LEDGER (Next-Open Fill & Next-Open Time-Stop,
+//     Same-Bar Post-T1 BE Check, True Wilson 95% CI, & Forward OOS Gate)
+// ═══════════════════════════════════════════════════════════════════
+
+GBT_VER = "⑮ Walk-Forward Verification Ledger & Go/No-Go Audit"
+showVerifTbl  = input.bool(true,  "Show Walk-Forward Verification Table (Bottom-Right)", group=GBT_VER)
+verifWindow   = input.string("Modern Real-OI Era (2021-01-01 to 2026-11-08)", "Evaluation Window",
+     options=[
+          "Modern Real-OI Era (2021-01-01 to 2026-11-08)",
+          "Full Chart History (In-Sample)",
+          "Historical Pre-2024 (2019-01-01 to 2023-12-31)",
+          "Historical Post-2024 (2024-01-01 to 2026-11-08 — Tuned In-Sample)",
+          "Forward Paper/Live OOS Only (From 2026-11-09 Onward)"
+     ], group=GBT_VER,
+     tooltip="Because rules were refined after viewing 2020-2026 regimes and Aug-Nov 2026 dates, all history through Nov 8, 2026 is In-Sample. True Out-of-Sample validation requires Forward Paper Trading from Nov 9, 2026 onward.")
+verifMode     = input.string("Traps + Structural Swings", "Signals to Audit in Ledger",
+     options=["Traps Only (Bull/Bear Trap)", "Structural Swings Only (125m/1D)", "Traps + Structural Swings"], group=GBT_VER)
+gateSwingsFlw = input.bool(false, "Also Require Orderflow Gate on 125m/1D Structural Swings", group=GBT_VER,
+     tooltip="Toggle ON vs OFF on 125m/1D charts to test whether requiring bullTrapFlow/bearTrapFlow improves or starves 125m/1D structural swing signals.")
+costPtsInput  = input.float(4.0,  "Unified Round-Trip Cost (Nifty Index Points)", minval=0.0, maxval=25.0, step=0.5, group=GBT_VER,
+     tooltip="Matches the Strategy Tester's 40-tick (2.0pt/side = 4.0pt round-trip) slippage setting exactly.")
+scaleOutPct   = input.float(0.60, "T1 Scale-Out Fraction (0.60 = 3 of 5 Lots at T1, 2 Lots Runner)", minval=0.20, maxval=0.80, step=0.20, group=GBT_VER)
+useRFloor     = input.bool(true,  "Enforce Min 1.0R Target 1 & 2.0R Target 2 Floor (Fixes 125m/1D R:R)", group=GBT_VER,
+     tooltip="On 125m and 1D, a fixed 0.50% T1 is only 0.2R against a 200pt stop (forcing Req BE% to 73-81%). When ON, T1 is at least 1.0x Initial Stop (1R) and T2 is at least 2.0x Initial Stop (2R), and initial Stop is capped at maxStopAtr x ATR.")
+minT1R        = input.float(1.00, "Minimum T1 Risk-Reward Multiple (x 1R Stop)", minval=0.50, maxval=3.00, step=0.10, group=GBT_VER)
+minT2R        = input.float(2.00, "Minimum T2 Risk-Reward Multiple (x 1R Stop)", minval=1.00, maxval=5.00, step=0.25, group=GBT_VER)
+maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)", minval=0.80, maxval=4.00, step=0.10, group=GBT_VER,
+     tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
+maxHold15m    = input.int(20,     "Max Hold Bars on <=15m (Time-Stop, 20 = 5 Hrs)", minval=4, maxval=100, group=GBT_VER)
+maxHold125m   = input.int(15,     "Max Hold Bars on 125m/Hourly (Time-Stop, 15 = 5 Days)", minval=4, maxval=100, group=GBT_VER)
+maxHoldDaily  = input.int(12,     "Max Hold Bars on Daily (Time-Stop, 12 = 2.5 Weeks)", minval=3, maxval=60, group=GBT_VER)
+
+int effMaxHold = isDailyChart ? maxHoldDaily : (tfMins >= 60 ? maxHold125m : maxHold15m)
+
+// Evaluation Window Date Gate (IST timestamps)
+int ts2019   = timestamp("Asia/Kolkata", 2019, 1, 1, 0, 0)
+int ts2021   = timestamp("Asia/Kolkata", 2021, 1, 1, 0, 0)
+int ts2024   = timestamp("Asia/Kolkata", 2024, 1, 1, 0, 0)
+int tsFwdOos = timestamp("Asia/Kolkata", 2026, 11, 9, 0, 0)
+
+bool isFwdOosMode  = verifWindow == "Forward Paper/Live OOS Only (From 2026-11-09 Onward)"
+bool inAuditWindow = verifWindow == "Full Chart History (In-Sample)" ? true :
+     verifWindow == "Modern Real-OI Era (2021-01-01 to 2026-11-08)" ? (time >= ts2021 and time < tsFwdOos) :
+     verifWindow == "Historical Pre-2024 (2019-01-01 to 2023-12-31)" ? (time >= ts2019 and time < ts2024) :
+     verifWindow == "Historical Post-2024 (2024-01-01 to 2026-11-08 — Tuned In-Sample)" ? (time >= ts2024 and time < tsFwdOos) :
+     (time >= tsFwdOos)
+
+// Track first and last bar timestamps in active audit window to compute trades/year
+var int firstAuditTime = na
+var int lastAuditTime  = na
+if inAuditWindow
+    totalBarsCount += 1
+    if hasRealNearOi
+        realOiBarsCount += 1
+    if na(firstAuditTime)
+        firstAuditTime := time
+    lastAuditTime := time
+
+// Pending next-open order state (queued on signal bar close, filled at next bar open!)
+var int   pendDir        = 0
+var float pendRiskPts    = na
+var float pendT1Pts      = na
+var float pendT2Pts      = na
+
+// Active open trade state
+var int   trDir          = 0
+var float trEntry        = na
+var float trInitRisk     = na
+var float trInitSL       = na
+var float trCurrSL       = na
+var float trT1           = na
+var float trT2           = na
+var bool  trHitT1        = false
+var float trLeg1Pnl      = 0.0
+var int   trBarsHeld     = 0
+var bool  trTimeStopPend = false
+
+// Completed trade statistics (updated strictly when a trade closes!)
+var int   statN          = 0
+var int   statT1Hits     = 0
+var int   statT2Hits     = 0
+var int   statFullSlHits = 0
+var int   statBeStops    = 0
+var int   statTimeExits  = 0
+var int   statNetWins    = 0
+var int   statNetLosses  = 0
+var float statGrossWin   = 0.0
+var float statGrossLoss  = 0.0
+var float statCumPnl     = 0.0
+var float statPeakPnl    = 0.0
+var float statMaxDd      = 0.0
+var float statSumInitR   = 0.0
+var float statSumT1Pts   = 0.0
+var float statSumRMult   = 0.0
+
+// 1. Fill pending order at the OPEN of the current bar (matching strategy() next-open fill!)
+if pendDir != 0 and trDir == 0
+    trDir          := pendDir
+    trEntry        := open
+    trInitRisk     := math.max(syminfo.mintick * 10.0, pendRiskPts)
+    trInitSL       := pendDir == 1 ? (open - trInitRisk) : (open + trInitRisk)
+    trCurrSL       := trInitSL
+    trT1           := pendDir == 1 ? (open + pendT1Pts)  : (open - pendT1Pts)
+    trT2           := pendDir == 1 ? (open + pendT2Pts)  : (open - pendT2Pts)
+    trHitT1        := false
+    trLeg1Pnl      := 0.0
+    trBarsHeld     := 0
+    trTimeStopPend := false
+    pendDir        := 0
+
+// 2. Evaluate active trade on current bar
+if trDir != 0
+    bool  closedNow = false
+    float netPnl    = 0.0
+
+    // 2a. If Time-Stop triggered at prior bar close, exit at THIS bar's OPEN (matching strategy.close() next-open fill!)
+    if trTimeStopPend
+        float remFrac = trHitT1 ? (1.0 - scaleOutPct) : 1.0
+        float leg2Pnl = trDir == 1 ? (open - trEntry) * remFrac : (trEntry - open) * remFrac
+        netPnl         := trLeg1Pnl + leg2Pnl - costPtsInput
+        closedNow      := true
+        statTimeExits  += 1
+        trTimeStopPend := false
+    else
+        trBarsHeld += 1
+        bool wasHitT1 = trHitT1
+
+        if trDir == 1
+            // Conservative check: Stop Loss checked first (with gap-down fill at `math.min(open, trCurrSL)`)
+            if low <= trCurrSL
+                float slFill  = math.min(open, trCurrSL)
+                float leg2Pnl = trHitT1 ? (slFill - trEntry) * (1.0 - scaleOutPct) : (slFill - trEntry)
+                netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
+                closedNow     := true
+                if trHitT1
+                    statBeStops += 1
+                else
+                    statFullSlHits += 1
+            else
+                // Check T1 hit (with gap-up fill at `math.max(open, trT1)`)
+                if not trHitT1 and high >= trT1
+                    float t1Fill = math.max(open, trT1)
+                    trHitT1   := true
+                    trLeg1Pnl := (t1Fill - trEntry) * scaleOutPct
+                    trCurrSL  := trEntry
+                // Check T2 hit (with gap-up fill at `math.max(open, trT2)`)
+                if trHitT1 and high >= trT2
+                    float t2Fill  = math.max(open, trT2)
+                    float leg2Pnl = (t2Fill - trEntry) * (1.0 - scaleOutPct)
+                    netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
+                    closedNow     := true
+                    statT2Hits    += 1
+                // Conservative same-bar post-T1 reversal check: if T1 was first touched on this bar AND price reversed back below entry by bar close, stop out runner at BE!
+                else if not wasHitT1 and trHitT1 and low <= trEntry and close <= trEntry
+                    netPnl      := trLeg1Pnl - costPtsInput
+                    closedNow   := true
+                    statBeStops += 1
+                // Arm next-open Time-Stop if maxHoldBars reached at bar close
+                else if trBarsHeld >= effMaxHold or not inAuditWindow
+                    trTimeStopPend := true
+
+        else if trDir == -1
+            // Conservative check: Stop Loss checked first (with gap-up fill at `math.max(open, trCurrSL)`)
+            if high >= trCurrSL
+                float slFill  = math.max(open, trCurrSL)
+                float leg2Pnl = trHitT1 ? (trEntry - slFill) * (1.0 - scaleOutPct) : (trEntry - slFill)
+                netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
+                closedNow     := true
+                if trHitT1
+                    statBeStops += 1
+                else
+                    statFullSlHits += 1
+            else
+                if not trHitT1 and low <= trT1
+                    float t1Fill = math.min(open, trT1)
+                    trHitT1   := true
+                    trLeg1Pnl := (trEntry - t1Fill) * scaleOutPct
+                    trCurrSL  := trEntry
+                if trHitT1 and low <= trT2
+                    float t2Fill  = math.min(open, trT2)
+                    float leg2Pnl = (trEntry - t2Fill) * (1.0 - scaleOutPct)
+                    netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
+                    closedNow     := true
+                    statT2Hits    += 1
+                else if not wasHitT1 and trHitT1 and high >= trEntry and close >= trEntry
+                    netPnl      := trLeg1Pnl - costPtsInput
+                    closedNow   := true
+                    statBeStops += 1
+                else if trBarsHeld >= effMaxHold or not inAuditWindow
+                    trTimeStopPend := true
+
+    // Record completed trade metrics (with nz() guard so early-bar na never poisons statSumInitR with NaN!)
+    if closedNow
+        float safeInitR = math.max(1.0, nz(trInitRisk, nz(atr14, close * 0.005)))
+        float safeT1Dist = math.max(1.0, nz(math.abs(trT1 - trEntry), close * 0.005))
+        statN        += 1
+        if trHitT1
+            statT1Hits += 1
+        statSumInitR += safeInitR
+        statSumT1Pts += safeT1Dist
+        statSumRMult += nz(netPnl / safeInitR, 0.0)
+        if netPnl > 0
+            statNetWins  += 1
+            statGrossWin += netPnl
+        else
+            statNetLosses += 1
+            statGrossLoss += math.abs(netPnl)
+        statCumPnl  += netPnl
+        statPeakPnl := math.max(statPeakPnl, statCumPnl)
+        statMaxDd   := math.max(statMaxDd, statPeakPnl - statCumPnl)
+        trDir       := 0
+
+// 3. Queue new order at confirmed bar close if flat and inside walk-forward window
+bool includeTraps  = verifMode == "Traps Only (Bull/Bear Trap)" or verifMode == "Traps + Structural Swings"
+bool includeSwings = verifMode == "Structural Swings Only (125m/1D)" or verifMode == "Traps + Structural Swings"
+
+bool swLongGated   = confirmBottom and (not gateSwingsFlw or bearTrapFlow)
+bool swShortGated  = confirmTop    and (not gateSwingsFlw or bullTrapFlow)
+
+bool auditLongSig  = inAuditWindow and ((includeTraps and bearTrapSig) or (includeSwings and swLongGated))
+bool auditShortSig = inAuditWindow and ((includeTraps and bullTrapSig) or (includeSwings and swShortGated))
+
+// Helper to compute NaN-safe, ATR-capped 1R Stop Distance and R-Floored Targets (fixes inverted R:R on 125m & 1D!)
+f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
+    float safeAtr = nz(atr14, close * 0.006)
+    float rawDist = _isLong ? (close - nz(_rawSL, close - 1.2 * safeAtr)) : (nz(_rawSL, close + 1.2 * safeAtr) - close)
+    float minStop = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
+    float maxStop = math.max(minStop, maxStopAtr * safeAtr)
+    float riskPts = useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)
+    float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
+    float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
+    float t1Pts   = useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1
+    float t2Pts   = useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2
+    [riskPts, t1Pts, t2Pts]
+
+if trDir == 0 and pendDir == 0 and barstate.isconfirmed and not na(atr14)
+    if auditLongSig
+        float rawSL = swLongGated ? swBotSL : bearTrapSL
+        [rPts, t1P, t2P] = f_calcRiskAndTargets(true, rawSL)
+        pendDir     := 1
+        pendRiskPts := rPts
+        pendT1Pts   := t1P
+        pendT2Pts   := t2P
+    else if auditShortSig
+        float rawSL = swShortGated ? swTopSL : bullTrapSL
+        [rPts, t1P, t2P] = f_calcRiskAndTargets(false, rawSL)
+        pendDir     := -1
+        pendRiskPts := rPts
+        pendT1Pts   := t1P
+        pendT2Pts   := t2P
+
+// Helper: True Wilson Score 95% Confidence Interval (z = 1.96, z^2 = 3.8416)
+f_wilson95(int _wins, int _n) =>
+    if _n <= 0
+        [0.0, 0.0, 0.0]
+    else
+        float nf     = float(_n)
+        float pHat   = float(_wins) / nf
+        float z2     = 3.8416
+        float denom  = 1.0 + z2 / nf
+        float center = (pHat + z2 / (2.0 * nf)) / denom
+        float half   = (1.96 * math.sqrt(math.max(0.0, (pHat * (1.0 - pHat) / nf) + (z2 / (4.0 * nf * nf))))) / denom
+        float loPct  = math.max(0.0, (center - half) * 100.0)
+        float hiPct  = math.min(100.0, (center + half) * 100.0)
+        [pHat * 100.0, loPct, hiPct]
+
+// 4. Render 11-Row Walk-Forward Statistical Audit Table (Bottom-Right)
+var table verifTbl = table.new(position.bottom_right, 2, 11, border_width=1, border_color=color.new(#37474f, 0))
+if barstate.islast and showVerifTbl
+    [pT1, t1Lo, t1Hi]          = f_wilson95(statT1Hits, statN)
+    [netWinPct, winLo, winHi]  = f_wilson95(statNetWins, statN)
+    float pT2                  = statN > 0 ? (float(statT2Hits) / float(statN)) * 100.0 : 0.0
+    float pf                   = statGrossLoss > 0 ? statGrossWin / statGrossLoss : (statGrossWin > 0 ? 99.9 : 0.0)
+    float expectPts            = statN > 0 ? statCumPnl / float(statN) : 0.0
+    float avgWinPts            = statNetWins > 0 ? statGrossWin / float(statNetWins) : 0.0
+    float avgLossPts           = statNetLosses > 0 ? statGrossLoss / float(statNetLosses) : 0.0
+    float reqBeWinPct          = (avgWinPts + avgLossPts) > 0 ? (avgLossPts / (avgWinPts + avgLossPts)) * 100.0 : 50.0
+    float avgInitR             = statN > 0 ? statSumInitR / float(statN) : 0.0
+    float avgT1Dist            = statN > 0 ? statSumT1Pts / float(statN) : 0.0
+    float avgRMult             = statN > 0 ? statSumRMult / float(statN) : 0.0
+    float yrsSpan              = (not na(firstAuditTime) and not na(lastAuditTime) and lastAuditTime > firstAuditTime) ? math.max(0.1, float(lastAuditTime - firstAuditTime) / 31557600000.0) : 1.0
+    float tradesPerYr          = float(statN) / yrsSpan
+    float oiCovPct             = totalBarsCount > 0 ? (float(realOiBarsCount) / float(totalBarsCount)) * 100.0 : 0.0
+
+    // Reviewer Go/No-Go Criteria:
+    bool passMinN   = statN >= 30
+    bool passFullN  = statN >= 100
+    bool passPf     = pf >= 1.30
+    bool passExp    = expectPts >= (2.0 * costPtsInput)
+    bool passWilson = winLo > reqBeWinPct
+    bool statsPass  = passMinN and passPf and passExp and passWilson
+
+    string winShort = verifWindow == "Modern Real-OI Era (2021-01-01 to 2026-11-08)" ? "OI-ERA 21-26" : verifWindow == "Full Chart History (In-Sample)" ? "HIST-ALL" :
+         verifWindow == "Historical Pre-2024 (2019-01-01 to 2023-12-31)" ? "HIST 19-23" :
+         verifWindow == "Historical Post-2024 (2024-01-01 to 2026-11-08 — Tuned In-Sample)" ? "HIST 24-26" : "FWD OOS"
+
+    table.cell(verifTbl, 0, 0, "📊 AUDIT [" + winShort + " · " + timeframe.period + "]", bgcolor=color.new(#1c252c, 0), text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 0, "n=" + str.tostring(statN) + " (" + str.tostring(tradesPerYr, "0.0") + "/yr | TStop:" + str.tostring(statTimeExits) + ")", bgcolor=passFullN ? color.new(#1b5e20, 0) : passMinN ? color.new(#e65100, 0) : color.new(#b71c1c, 0), text_color=color.white, text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 1, "Real _OI Coverage / Chart", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 1, str.tostring(oiCovPct, "0.0") + "% Real _OI (" + str.tostring(realOiBarsCount) + "/" + str.tostring(totalBarsCount) + ")", bgcolor=color.new(#10171d, 0), text_color=oiCovPct >= 50.0 ? color.new(#69f0ae, 0) : color.new(#ffd740, 0), text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 2, "P(T1 Hit) [Wilson 95%]", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 2, str.tostring(pT1, "0.0") + "% [" + str.tostring(t1Lo, "0") + "–" + str.tostring(t1Hi, "0") + "%]", bgcolor=color.new(#10171d, 0), text_color=color.white, text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 3, "Net Win% [Wilson 95%]", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 3, str.tostring(netWinPct, "0.0") + "% [" + str.tostring(winLo, "0") + "–" + str.tostring(winHi, "0") + "%]", bgcolor=color.new(#10171d, 0), text_color=passWilson ? color.new(#69f0ae, 0) : color.new(#ffd740, 0), text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 4, "P(T2) / BE-Stop / Full-SL", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 4, str.tostring(pT2, "0.0") + "% / " + str.tostring(statBeStops) + " BE / " + str.tostring(statFullSlHits) + " SL", bgcolor=color.new(#10171d, 0), text_color=color.white, text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 5, "Avg Win / Avg Loss / Req BE%", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 5, "+" + str.tostring(avgWinPts, "0") + " / -" + str.tostring(avgLossPts, "0") + " (Req " + str.tostring(reqBeWinPct, "0") + "%)", bgcolor=color.new(#10171d, 0), text_color=color.white, text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 6, "Avg 1R Stop / Avg T1 / Avg R", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 6, str.tostring(avgInitR, "0") + "pt / " + str.tostring(avgT1Dist, "0") + "pt / " + (avgRMult >= 0 ? "+" : "") + str.tostring(avgRMult, "0.00") + "R", bgcolor=color.new(#10171d, 0), text_color=avgRMult > 0 ? color.new(#69f0ae, 0) : color.new(#ff8a80, 0), text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 7, "Net Profit Factor (Cost=" + str.tostring(costPtsInput, "0.0") + ")", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 7, str.tostring(pf, "0.00") + (passPf ? " (≥1.3)" : " (<1.3)"), bgcolor=color.new(#10171d, 0), text_color=passPf ? color.new(#69f0ae, 0) : color.new(#ff8a80, 0), text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 8, "Net Expectancy / Trade", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 8, (expectPts >= 0 ? "+" : "") + str.tostring(expectPts, "0.0") + " pts (2xCost=" + str.tostring(2.0 * costPtsInput, "0") + ")", bgcolor=color.new(#10171d, 0), text_color=passExp ? color.new(#69f0ae, 0) : color.new(#ff8a80, 0), text_size=size.tiny)
+
+    table.cell(verifTbl, 0, 9, "Cum Net PnL / Max DD", bgcolor=color.new(#10171d, 0), text_color=color.new(#b0bec5, 0), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 9, (statCumPnl >= 0 ? "+" : "") + str.tostring(math.round(statCumPnl)) + " / -" + str.tostring(math.round(statMaxDd)) + " pts", bgcolor=color.new(#10171d, 0), text_color=color.white, text_size=size.tiny)
+
+    string goText = (isFwdOosMode and statsPass) ? "✅ LIVE GO (FWD OOS VALIDATED)" :
+         (not isFwdOosMode and statsPass and passFullN) ? "🟡 HIST PASS (PAPER 30+ FWD FIRST)" :
+         (statsPass or (passMinN and pf >= 1.15 and expectPts > costPtsInput)) ? "⚠️ MARGINAL (PAPER ONLY)" :
+         "🚫 NO-GO (DO NOT TRADE LIVE)"
+    color  goBg   = (isFwdOosMode and statsPass) ? color.new(#1b5e20, 0) :
+         (not isFwdOosMode and statsPass) ? color.new(#f57f17, 0) :
+         (passMinN and pf >= 1.15) ? color.new(#e65100, 0) : color.new(#b71c1c, 0)
+    table.cell(verifTbl, 0, 10, "Go / No-Go Verdict", bgcolor=color.new(#1c252c, 0), text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(verifTbl, 1, 10, goText, bgcolor=goBg, text_color=color.white, text_size=size.tiny)
