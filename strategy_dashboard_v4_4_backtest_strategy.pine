@@ -1445,17 +1445,18 @@ if barstate.islast
              text_color=CW, bgcolor=dirBg, text_size=size.small)
 
         // Row 1: Structural HTF Swing (125m Bot / Top)
-        swStat = isBottomActive ? "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")" :
-             isTopActive    ? "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+        bool isDistMacro = not na(activeSwingLvl) and math.abs(close - activeSwingLvl) > 400.0
+        swStat = isBottomActive ? (isDistMacro ? "🟢 " + evalHtfLabel + " BULL TREND" : "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")") :
+             isTopActive    ? (isDistMacro ? "🔴 " + evalHtfLabel + " BEAR TREND" : "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")") :
              isBottomArmed  ? "⏳ " + evalHtfLabel + " BOT SETUP" :
              isTopArmed     ? "⏳ " + evalHtfLabel + " TOP SETUP" :
              "✓ " + evalHtfLabel + " Structural Engine"
         swStatusColor = isBottomActive or isTopActive ? (isBottomActive ? CB : CR) : (isBottomArmed or isTopArmed ? CY : CD)
         table.cell(dash, 0, 1, swStat, 
              text_color=CW, bgcolor=swStatusColor, text_size=size.small, text_halign=text.align_left)
-        table.cell(dash, 1, 1, isBottomActive ? "BOT CONFIRMED" : isTopActive ? "TOP CONFIRMED" : isBottomArmed or isTopArmed ? "WAIT BREAK" : "NEUTRAL", 
+        table.cell(dash, 1, 1, isBottomActive ? (isDistMacro ? "MACRO UPTREND" : "BOT CONFIRMED") : isTopActive ? (isDistMacro ? "MACRO DOWNTREND" : "TOP CONFIRMED") : isBottomArmed or isTopArmed ? "WAIT BREAK" : "NEUTRAL", 
              text_color=CW, bgcolor=CD, text_size=size.tiny)
-        table.cell(dash, 2, 1, activeSwingLvl > 0 ? ("Lvl " + str.tostring(math.round(activeSwingLvl))) : ("SL " + str.tostring(math.round(stLine))), 
+        table.cell(dash, 2, 1, isDistMacro ? ("ST " + str.tostring(math.round(stLine))) : (activeSwingLvl > 0 ? ("Lvl " + str.tostring(math.round(activeSwingLvl))) : ("ST " + str.tostring(math.round(stLine)))), 
              text_color=CGr, bgcolor=CD, text_size=size.tiny)
 
         // Row 2: Smart Money Flow / OI Fusion & Basis
@@ -1563,8 +1564,9 @@ if barstate.islast
         table.cell(dash,1,22,mPPbull?"▲  ABOVE":"▼  BELOW",    text_color=CW, bgcolor=mCPRbg, text_size=size.small)
         table.cell(dash,2,22,mCPRval,                           text_color=CGr, bgcolor=CD, text_size=size.tiny)
 
-        swStat = isBottomActive ? "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")" :
-             isTopActive    ? "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+        bool isDistMacro = not na(activeSwingLvl) and math.abs(close - activeSwingLvl) > 400.0
+        swStat = isBottomActive ? (isDistMacro ? "🟢 " + evalHtfLabel + " BULL TREND" : "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")") :
+             isTopActive    ? (isDistMacro ? "🔴 " + evalHtfLabel + " BEAR TREND" : "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")") :
              isBottomArmed  ? "⏳ " + evalHtfLabel + " BOT SETUP (Wait Break)" :
              isTopArmed     ? "⏳ " + evalHtfLabel + " TOP SETUP (Wait Break)" :
              "✓ " + evalHtfLabel + " Structural Engine"
