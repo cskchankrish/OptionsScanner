@@ -537,26 +537,36 @@ export async function sendTelegramExitAlert(exitRecord) {
 }
 
 /**
- * Telegram EOD 15:15 Decision Helper
+ * Telegram EOD 15:15 Decision Helper & 15-Minute Radar Updates (14:00 - 15:30 IST)
  */
-export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike) {
+export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr = "15:15") {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId || !eodDecision) return;
 
+  const isFinalDirective = (slotTimeStr === "15:15");
   const isBTST = eodDecision.verdict?.includes("BTST") || eodDecision.bias === "BULLISH";
   const isSTBT = eodDecision.verdict?.includes("STBT") || eodDecision.bias === "BEARISH";
 
-  const header = isBTST
-    ? "🟢 *OFFICIAL EOD CARRY DIRECTIVE · BTST (BUY CE)*"
-    : isSTBT
-    ? "🔴 *OFFICIAL EOD CARRY DIRECTIVE · STBT (BUY PE)*"
-    : "⚪ *OFFICIAL EOD CARRY DIRECTIVE · CASH ONLY (DO NOT CARRY)*";
+  let header = "";
+  if (isFinalDirective) {
+    header = isBTST
+      ? "🟢 *OFFICIAL EOD CARRY DIRECTIVE · BTST (BUY CE)*"
+      : isSTBT
+      ? "🔴 *OFFICIAL EOD CARRY DIRECTIVE · STBT (BUY PE)*"
+      : "⚪ *OFFICIAL EOD CARRY DIRECTIVE · CASH ONLY (DO NOT CARRY)*";
+  } else {
+    header = isBTST
+      ? `📡 *EOD CARRY RADAR (${slotTimeStr} IST UPDATE) · BTST CE BIAS*`
+      : isSTBT
+      ? `📡 *EOD CARRY RADAR (${slotTimeStr} IST UPDATE) · STBT PE BIAS*`
+      : `📡 *EOD CARRY RADAR (${slotTimeStr} IST UPDATE) · NEUTRAL / CASH BIAS*`;
+  }
 
   const lines = [
     header,
-    `• *Verdict:* \`${eodDecision.verdict}\``,
-    `• *Bias & Conviction:* ${eodDecision.bias} (${eodDecision.conviction}%)`,
+    `• *${isFinalDirective ? "Official Verdict" : "Interim Verdict"}:* \`${eodDecision.verdict}\``,
+    `• *Bias & Conviction:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Conviction: \`${eodDecision.conviction}%\`)`,
     `• *Recommended Sizing:* \`${eodDecision.sizing}\``,
     `• *Spot Index:* \`₹${Math.round(spot)}\` | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
   ];
@@ -578,6 +588,10 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
     eodDecision.audit.slice(0, 4).forEach(a => {
       lines.push(`  - ${a.label}: \`${a.status}\` (${a.impact})`);
     });
+  }
+
+  if (!isFinalDirective) {
+    lines.push(`• *Notice:* ⏳ *Evolving 15-min pulse. Final carry directive finalized at 15:15 IST.*`);
   }
 
   lines.push(`• *Time Finalized:* ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST`);

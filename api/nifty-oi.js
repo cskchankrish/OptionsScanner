@@ -2005,24 +2005,30 @@ export default async function handler(req, res) {
       await evaluateActiveTradeLifecycle(spot);
     } catch (e) {}
 
-    // Automatic 15:15 IST EOD Carry Alert Dispatcher
+    // Automatic 15-Minute BTST / STBT Carry Radar & Final EOD Dispatcher (14:00 to 15:30 IST)
     const istMinutes = getISTMinutes();
     const istDateStr = getISTIsoDateStr();
     const isEodTest = req.query?.test === "eod_alert";
-    if ((istMinutes >= 915 && istMinutes <= 930) || isEodTest) {
+    if ((istMinutes >= 855 && istMinutes <= 930) || isEodTest) {
       if (REDIS_URL || isEodTest) {
         try {
-          const dispatchedKey = `nifty:eod_alert_dispatched:${istDateStr}`;
+          // Identify current 15-minute slot (14:15, 14:30, 14:45, 15:00, 15:15, 15:30)
+          const slotMins = isEodTest ? 915 : Math.floor(istMinutes / 15) * 15;
+          const slotHour = String(Math.floor(slotMins / 60)).padStart(2, "0");
+          const slotMinute = String(slotMins % 60).padStart(2, "0");
+          const slotTimeStr = `${slotHour}:${slotMinute}`;
+
+          const dispatchedKey = `nifty:eod_slot_dispatched:${istDateStr}:${slotTimeStr}`;
           const alreadySent = isEodTest ? null : await redisRestGet(dispatchedKey);
           if (!alreadySent) {
             const { sendTelegramEODAlert } = await import("./tv-webhook.js");
-            await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike);
+            await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
             if (!isEodTest) {
               await redisRestSet(dispatchedKey, { sentAt: new Date().toISOString() }, 86400);
             }
           }
         } catch (err) {
-          console.error("Error dispatching 15:15 EOD alert:", err);
+          console.error("Error dispatching 15-minute EOD radar alert:", err);
         }
       }
     }
