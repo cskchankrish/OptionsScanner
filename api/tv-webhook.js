@@ -597,18 +597,36 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
   lines.push(`• *Time Finalized:* ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST`);
   lines.push(`• *Live OptionsScanner:* https://niftyninjaa.vercel.app`);
 
+  const rawText = lines.join("\n");
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text: lines.join("\n"),
+        text: rawText,
         parse_mode: "Markdown",
       }),
     });
+    if (res.ok) {
+      return true;
+    }
+    const errText = await res.text();
+    console.error("Telegram Markdown Send Error:", res.status, errText);
+    // Robust fallback: strip markdown markup and send clean plain text
+    const plainText = rawText.replace(/[*`_]/g, "");
+    const retryRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: plainText,
+      }),
+    });
+    return retryRes.ok;
   } catch (err) {
     console.error("Telegram EOD alert error:", err.message);
+    return false;
   }
 }
 

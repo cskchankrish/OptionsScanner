@@ -2027,8 +2027,8 @@ export default async function handler(req, res) {
           const alreadySent = isEodTest ? null : await redisRestGet(dispatchedKey);
           if (!alreadySent) {
             const { sendTelegramEODAlert } = await import("./tv-webhook.js");
-            await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
-            if (!isEodTest) {
+            const sent = await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
+            if (sent && !isEodTest) {
               await redisRestSet(dispatchedKey, { sentAt: new Date().toISOString() }, 86400);
             }
           }
