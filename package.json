@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test"
+    "test": "node --test test/convictionMetrics.test.js test/eodDecision.test.js test/eodTrackRecord.test.js test/sessionPersistence.test.js test/smartMoneyFusion.test.js test/sourceHealth.test.js test/stockSort.test.js test/tvWebhook.test.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.41.0",

@@ -16,7 +16,13 @@ export const OI_DEADBAND_PCT = 0.25;           // 0.25% OI fluctuation threshold
  * Filters for Instrument: FUTIDX / Symbol: NIFTY and sorts by expiryDate ascending.
  * Rollover Guard: Aggregates Near Month (futRows[0]) and Next Month (futRows[1]).
  */
-export function parseNseFuturesPayload(rawJson, spotPriceFallback = 0, openBasisBaseline = null) {
+export function parseNseFuturesPayload(
+  rawJson,
+  spotPriceFallback = 0,
+  openBasisBaseline = null,
+  openOiBaseline = null,
+  openPriceBaseline = null
+) {
   const rows = Array.isArray(rawJson?.data) ? rawJson.data : [];
   const niftyFutRows = rows
     .filter((r) => {
@@ -35,18 +41,36 @@ export function parseNseFuturesPayload(rawJson, spotPriceFallback = 0, openBasis
 
   const lastPrice = Number(near.lastPrice ?? near.ltp ?? 0);
   const spotPrice = Number(near.underlyingValue ?? spotPriceFallback ?? 0);
-  const priceChange = Number(near.change ?? near.ptsChange ?? 0);
-  const priceChangePct = Number(near.pChange ?? (spotPrice > 0 ? (priceChange / spotPrice) * 100 : 0));
+  let priceChange = Number(near.change ?? near.ptsChange ?? 0);
+  let priceChangePct = Number(near.pChange ?? (spotPrice > 0 ? (priceChange / spotPrice) * 100 : 0));
+
+  // If opening price baseline is available and intraday session moved while NSE change relative to prev close is flat
+  if (openPriceBaseline !== null && Number.isFinite(Number(openPriceBaseline)) && Number(openPriceBaseline) > 0) {
+    const sessionPts = Number((lastPrice - Number(openPriceBaseline)).toFixed(2));
+    const sessionPct = Number(((sessionPts / Number(openPriceBaseline)) * 100).toFixed(2));
+    if (Math.abs(sessionPts) > Math.abs(priceChange) || Math.abs(priceChange) < 5) {
+      priceChange = sessionPts;
+      priceChangePct = sessionPct;
+    }
+  }
 
   // Rollover-safe Combined OI (Near + Next Month)
   const nearOI = Number(near.openInterest ?? 0);
-  const nearChgOI = Number(near.changeinOpenInterest ?? 0);
+  let nearChgOI = Number(near.changeinOpenInterest ?? 0);
   const nextOI = Number(next?.openInterest ?? 0);
-  const nextChgOI = Number(next?.changeinOpenInterest ?? 0);
+  let nextChgOI = Number(next?.changeinOpenInterest ?? 0);
 
   const combinedOI = nearOI + nextOI;
-  const combinedChgOI = nearChgOI + nextChgOI;
-  const baseCombinedOI = Math.max(1, combinedOI - combinedChgOI);
+  let combinedChgOI = nearChgOI + nextChgOI;
+
+  // NSE live derivatives endpoint omits 'changeinOpenInterest'.
+  // If combinedChgOI is 0 and we have a session opening baseline, compute true intraday delta:
+  if (combinedChgOI === 0 && openOiBaseline !== null && Number.isFinite(Number(openOiBaseline)) && Number(openOiBaseline) > 0) {
+    combinedChgOI = combinedOI - Number(openOiBaseline);
+    nearChgOI = combinedChgOI; // allocate net intraday flow
+  }
+
+  const baseCombinedOI = Math.max(1, (openOiBaseline && Number(openOiBaseline) > 0) ? Number(openOiBaseline) : (combinedOI - combinedChgOI));
   const combinedOiChangePct = Number(((combinedChgOI / baseCombinedOI) * 100).toFixed(2));
 
   // Days to Expiry (DTE) & Fair-Value Basis Calculation

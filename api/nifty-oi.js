@@ -347,6 +347,40 @@ export async function saveRedisFuturesSnapshot(futuresData) {
   }
 }
 
+export async function getRedisFuturesBaseline(dateStr) {
+  if (!REDIS_URL || !REDIS_TOKEN || !dateStr) return null;
+  try {
+    const res = await fetch(`${REDIS_URL}/get/nifty_fut_base_${encodeURIComponent(dateStr)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.result) return null;
+    return typeof json.result === "string" ? JSON.parse(json.result) : json.result;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function saveRedisFuturesBaseline(dateStr, baselineData) {
+  if (!REDIS_URL || !REDIS_TOKEN || !dateStr || !baselineData) return false;
+  try {
+    await fetch(`${REDIS_URL}/set/nifty_fut_base_${encodeURIComponent(dateStr)}?ex=1209600`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "text/plain",
+      },
+      body: JSON.stringify(baselineData),
+      signal: AbortSignal.timeout(2000),
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 export function calculateDeltaPcr(totPutWriting, totCallWriting) {
   const pWriting = Number(totPutWriting) || 0;
   const cWriting = Number(totCallWriting) || 0;
@@ -1816,12 +1850,40 @@ export default async function handler(req, res) {
 
     // Parse Nifty Futures with Rollover Protection & Graceful Degradation
     let futuresMetrics = null;
+    const openTick = Array.isArray(intradayHistory) && intradayHistory.length > 0 ? intradayHistory[0] : null;
+    let openOiBaseline = openTick?.futCombinedOI || null;
+    let openBasisBaseline = openTick?.futBasis || null;
+    let openPriceBaseline = openTick?.futPrice || null;
+
+    if (!openOiBaseline && REDIS_URL) {
+      const cachedBase = await getRedisFuturesBaseline(today);
+      if (cachedBase) {
+        openOiBaseline = cachedBase.openOI;
+        openBasisBaseline = cachedBase.openBasis;
+        openPriceBaseline = cachedBase.openPrice;
+      }
+    }
+
     if (futSettled.status === "fulfilled" && futSettled.value.ok) {
       try {
         const rawFutJson = await futSettled.value.json();
-        futuresMetrics = parseNseFuturesPayload(rawFutJson, spot);
+        futuresMetrics = parseNseFuturesPayload(
+          rawFutJson,
+          spot,
+          openBasisBaseline,
+          openOiBaseline,
+          openPriceBaseline
+        );
         if (futuresMetrics && REDIS_URL) {
           saveRedisFuturesSnapshot(futuresMetrics).catch(() => {});
+          if (!openOiBaseline && futuresMetrics.combinedOI > 0) {
+            saveRedisFuturesBaseline(today, {
+              openOI: futuresMetrics.combinedOI,
+              openBasis: futuresMetrics.rawBasis,
+              openPrice: futuresMetrics.lastPrice,
+              timestamp: Date.now(),
+            }).catch(() => {});
+          }
         }
       } catch (e) {
         console.warn("Futures parse error:", e.message);
@@ -1832,6 +1894,30 @@ export default async function handler(req, res) {
       const cachedFut = await getRedisFuturesSnapshot();
       if (cachedFut) {
         futuresMetrics = { ...cachedFut, isStale: true };
+      }
+    }
+
+    // Baseline fallback patch: Ensure combinedChgOI is computed even if cached snapshot had 0 delta
+    if (futuresMetrics && (!futuresMetrics.combinedChgOI || futuresMetrics.combinedChgOI === 0)) {
+      const baseOI = openOiBaseline || openTick?.futCombinedOI;
+      if (baseOI && futuresMetrics.combinedOI > 0) {
+        const delta = futuresMetrics.combinedOI - Number(baseOI);
+        const deltaPct = Number(((delta / Number(baseOI)) * 100).toFixed(2));
+        futuresMetrics.combinedChgOI = delta;
+        futuresMetrics.combinedOiChangePct = deltaPct;
+        futuresMetrics.nearChgOI = delta;
+        const basePrice = openPriceBaseline || openTick?.futPrice;
+        if (basePrice && futuresMetrics.lastPrice) {
+          const sessionPts = Number((futuresMetrics.lastPrice - Number(basePrice)).toFixed(2));
+          const sessionPct = Number(((sessionPts / Number(basePrice)) * 100).toFixed(2));
+          if (Math.abs(sessionPts) > Math.abs(futuresMetrics.priceChange || 0) || Math.abs(futuresMetrics.priceChange || 0) < 5) {
+            futuresMetrics.priceChange = sessionPts;
+            futuresMetrics.priceChangePct = sessionPct;
+          }
+        }
+        if (REDIS_URL) {
+          saveRedisFuturesSnapshot(futuresMetrics).catch(() => {});
+        }
       }
     }
 
