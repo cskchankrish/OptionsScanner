@@ -1511,9 +1511,13 @@ export function NiftyFlowView({ t, isDark }) {
     setCountdown(sec);
   };
 
-  const fetchNiftyOi = async () => {
+  const [selectedExpiryTab, setSelectedExpiryTab] = useState("auto");
+
+  const fetchNiftyOi = async (overrideExpiry = null) => {
     try {
-      const res = await fetch("/api/nifty-oi");
+      const activeTab = overrideExpiry !== null ? overrideExpiry : selectedExpiryTab;
+      const q = (activeTab && activeTab !== "auto") ? `?expiry=${encodeURIComponent(activeTab)}` : "";
+      const res = await fetch(`/api/nifty-oi${q}`);
       if (res.ok) {
         const data = await res.json();
         const todayKey = getTodayDateKey();
@@ -3149,15 +3153,104 @@ export function NiftyFlowView({ t, isDark }) {
             padding: isMobile ? "12px 8px" : "18px 16px",
             overflowX: "auto"
           }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, padding: "0 6px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, padding: "0 6px", flexWrap: "wrap", gap: 8 }}>
               <div>
-                <div style={{ fontSize: isMobile ? 13 : isTablet ? 15 : 16, fontWeight: 900, color: t.text }}>
-                  NIFTY OI CHANGE TODAY (CONTRACTS) · EXPIRY {oiData?.expiryDate || "CURRENT"}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: isMobile ? 13 : isTablet ? 15 : 16, fontWeight: 900, color: t.text }}>
+                    NIFTY OI CHANGE TODAY (CONTRACTS) · EXPIRY {oiData?.expiryDate || "CURRENT"}
+                  </span>
+                  {oiData?.rollover?.isAfternoonRollover && oiData?.expiryDate === oiData?.rollover?.nextExpiry && (
+                    <span style={{
+                      fontSize: 10,
+                      fontWeight: 800,
+                      padding: "2px 8px",
+                      borderRadius: 6,
+                      background: "rgba(16, 185, 129, 0.15)",
+                      color: "#10b981",
+                      border: "1px solid rgba(16, 185, 129, 0.3)",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 4
+                    }}>
+                      🔄 AUTO-ROLLED TO NEXT WEEK
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontSize: isMobile ? 10 : 11.5, color: t.textMuted }}>
                   Live institutional strike additions and unwinding
                 </div>
               </div>
+
+              {/* Expiry Selector Pills */}
+              {oiData?.rollover?.nearExpiry && (
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => {
+                      setSelectedExpiryTab("near");
+                      fetchNiftyOi("near");
+                    }}
+                    style={{
+                      padding: "4px 8px",
+                      borderRadius: 6,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                      border: "1px solid",
+                      borderColor: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "#3b82f6" : t.border,
+                      background: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "rgba(59, 130, 246, 0.2)" : "transparent",
+                      color: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "#3b82f6" : t.textMuted,
+                    }}
+                    title="View expiring contracts (0DTE)"
+                  >
+                    ⚡ {oiData.rollover.nearExpiry} (Today)
+                  </button>
+                  {oiData.rollover.nextExpiry && (
+                    <button
+                      onClick={() => {
+                        setSelectedExpiryTab("next");
+                        fetchNiftyOi("next");
+                      }}
+                      style={{
+                        padding: "4px 8px",
+                        borderRadius: 6,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        cursor: "pointer",
+                        border: "1px solid",
+                        borderColor: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "#10b981" : t.border,
+                        background: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "rgba(16, 185, 129, 0.2)" : "transparent",
+                        color: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "#10b981" : t.textMuted,
+                      }}
+                      title="View next week contracts for forward/overnight positioning"
+                    >
+                      🔄 {oiData.rollover.nextExpiry} (Next Week)
+                    </button>
+                  )}
+                  {oiData.rollover.monthlyExpiry && (
+                    <button
+                      onClick={() => {
+                        setSelectedExpiryTab("monthly");
+                        fetchNiftyOi("monthly");
+                      }}
+                      style={{
+                        padding: "4px 8px",
+                        borderRadius: 6,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        cursor: "pointer",
+                        border: "1px solid",
+                        borderColor: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.border,
+                        background: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "rgba(139, 92, 246, 0.2)" : "transparent",
+                        color: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.textMuted,
+                      }}
+                      title="View active month-end swing contracts"
+                    >
+                      📅 {oiData.rollover.monthlyExpiry} (Monthly)
+                    </button>
+                  )}
+                </div>
+              )}
+
               <span style={{ fontSize: isMobile ? 10 : 12, color: t.textMuted, fontFamily: "monospace" }}>{oiData?.timestamp}</span>
             </div>
 

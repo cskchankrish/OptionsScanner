@@ -1754,14 +1754,21 @@ export default async function handler(req, res) {
     const nextExpiry = expiryDates[1] || "";
     const monthlyExpiry = getActiveMonthlyExpiry(expiryDates);
     const isExpiryDay = isTodayExpiryDate(nearExpiry);
+    const currentMinutes = getISTMinutes();
+    const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || req.query?.rollover === "true"));
 
     let targetExpiry = nearExpiry;
     if (req.query?.expiry === "next" && nextExpiry) {
       targetExpiry = nextExpiry;
+    } else if (req.query?.expiry === "today" || req.query?.expiry === "near") {
+      targetExpiry = nearExpiry;
     } else if (req.query?.expiry === "monthly" && monthlyExpiry) {
       targetExpiry = monthlyExpiry;
     } else if (req.query?.expiry && expiryDates.includes(req.query.expiry)) {
       targetExpiry = req.query.expiry;
+    } else if (isAfternoonRollover && nextExpiry) {
+      // Default to next week's expiry on expiry day afternoon (after 14:00 IST)
+      targetExpiry = nextExpiry;
     }
 
     // 3. Fetch v3 option chain AND Nifty Futures concurrently via Promise.allSettled
@@ -1773,11 +1780,8 @@ export default async function handler(req, res) {
       fetch(futUrl, { headers: sessionHeaders, signal: AbortSignal.timeout(4500) }),
     ];
 
-    const currentMinutes = getISTMinutes();
-    const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || req.query?.rollover === "true"));
-    const shouldFetchNextChain = (isAfternoonRollover || req.query?.expiry === "both") && (targetExpiry !== nextExpiry);
-
-    if (shouldFetchNextChain) {
+    const shouldFetchSecondaryChain = isAfternoonRollover && targetExpiry === nearExpiry && nextExpiry;
+    if (shouldFetchSecondaryChain) {
       const nextV3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(nextExpiry)}`;
       fetchPromises.push(fetch(nextV3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }));
     }
@@ -1785,7 +1789,7 @@ export default async function handler(req, res) {
     const settledResults = await Promise.allSettled(fetchPromises);
     const v3Settled = settledResults[0];
     const futSettled = settledResults[1];
-    const nextSettled = shouldFetchNextChain ? settledResults[2] : null;
+    const nextSettled = shouldFetchSecondaryChain ? settledResults[2] : null;
 
     if (v3Settled.status !== "fulfilled" || !v3Settled.value.ok) {
       throw new Error(`v3 option chain failed: status ${v3Settled.status === "fulfilled" ? v3Settled.value.status : v3Settled.reason?.message}`);
@@ -1973,21 +1977,22 @@ export default async function handler(req, res) {
       intradayHistory: timeline,
     });
 
-    const isEvaluatingNextExpiry = Boolean(isAfternoonRollover && nextMetrics);
+    const isTargetRollover = Boolean(isExpiryDay && targetExpiry === nextExpiry);
+    const isEvaluatingNextExpiry = Boolean(isTargetRollover || (isAfternoonRollover && nextMetrics));
     const eodDecision = calculateEODDecision({
       spot,
-      floorStrike: isEvaluatingNextExpiry ? nextMetrics.floorStrike : floorStrike,
-      roofStrike: isEvaluatingNextExpiry ? nextMetrics.roofStrike : roofStrike,
-      totPutWriting: isEvaluatingNextExpiry ? nextMetrics.totPutWriting : totPutWriting,
-      totCallWriting: isEvaluatingNextExpiry ? nextMetrics.totCallWriting : totCallWriting,
-      pcr: isEvaluatingNextExpiry ? nextMetrics.pcr : pcr,
-      deltaPcr: isEvaluatingNextExpiry ? nextMetrics.deltaPcr : deltaPcr,
+      floorStrike: (isAfternoonRollover && nextMetrics) ? nextMetrics.floorStrike : floorStrike,
+      roofStrike: (isAfternoonRollover && nextMetrics) ? nextMetrics.roofStrike : roofStrike,
+      totPutWriting: (isAfternoonRollover && nextMetrics) ? nextMetrics.totPutWriting : totPutWriting,
+      totCallWriting: (isAfternoonRollover && nextMetrics) ? nextMetrics.totCallWriting : totCallWriting,
+      pcr: (isAfternoonRollover && nextMetrics) ? nextMetrics.pcr : pcr,
+      deltaPcr: (isAfternoonRollover && nextMetrics) ? nextMetrics.deltaPcr : deltaPcr,
       timeline,
       dayOfWeek: getISTDayOfWeek(),
       nowMins: getISTMinutes(),
       fusion,
-      targetContract: isEvaluatingNextExpiry ? nextExpiry : targetExpiry,
-      isRollover: isEvaluatingNextExpiry,
+      targetContract: targetExpiry,
+      isRollover: Boolean(isTargetRollover || isAfternoonRollover),
     });
 
     smartMoney.eodDecision = eodDecision;
