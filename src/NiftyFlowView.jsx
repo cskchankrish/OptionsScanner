@@ -301,7 +301,17 @@ function findBestSessionIndex(sessions, serverDayName, todaySession) {
   return 0;
 }
 
-function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, hasRedis, eodHistory = [] }) {
+function NiftyIntradayLineChart({
+  timeline = [],
+  spot = 22696.65,
+  isDark,
+  t,
+  hasRedis,
+  eodHistory = [],
+  rollover = null,
+  activeExpiry = null,
+  onSelectExpiry = null,
+}) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
   const [mode, setMode] = useState("diff"); // "diff" (Net Put - Call) or "dual" (Put vs Call)
   const [hoverIdx, setHoverIdx] = useState(null);
@@ -1058,8 +1068,42 @@ function NiftyIntradayLineChart({ timeline = [], spot = 22696.65, isDark, t, has
             </div>
           </div>
 
-          {/* CONTROLS BAR: MODE + THRESHOLD + ZOOM */}
+          {/* CONTROLS BAR: EXPIRY + MODE + THRESHOLD + ZOOM */}
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {/* EXPIRY SWITCHER (Especially on Expiry Days) */}
+            {rollover?.nearExpiry && (
+              <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
+                <button
+                  onClick={() => onSelectExpiry && onSelectExpiry("near")}
+                  style={{
+                    background: (activeExpiry === rollover.nearExpiry) ? "#3b82f6" : "transparent",
+                    color: (activeExpiry === rollover.nearExpiry) ? "#fff" : t.textMuted,
+                    border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
+                    fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
+                    WebkitTapHighlightColor: "transparent"
+                  }}
+                  title="Chart This Week (0DTE Expiring)"
+                >
+                  ⚡ {rollover.nearExpiry}
+                </button>
+                {rollover.nextExpiry && (
+                  <button
+                    onClick={() => onSelectExpiry && onSelectExpiry("next")}
+                    style={{
+                      background: (activeExpiry === rollover.nextExpiry) ? "#10b981" : "transparent",
+                      color: (activeExpiry === rollover.nextExpiry) ? "#fff" : t.textMuted,
+                      border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
+                      fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
+                      WebkitTapHighlightColor: "transparent"
+                    }}
+                    title="Chart Next Week Expiry"
+                  >
+                    🔄 {rollover.nextExpiry}
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* MODE TOGGLE */}
             <div style={{ display: "flex", background: isDark ? "#0f172a" : "#f1f5f9", borderRadius: 8, padding: 2, border: `1px solid ${t.border}` }}>
               <button
@@ -3068,6 +3112,12 @@ export function NiftyFlowView({ t, isDark }) {
         t={t}
         hasRedis={oiData?.hasRedis}
         eodHistory={oiData?.eodHistory}
+        rollover={oiData?.rollover}
+        activeExpiry={oiData?.expiryDate}
+        onSelectExpiry={(exp) => {
+          setSelectedExpiryTab(exp);
+          fetchNiftyOi(exp);
+        }}
       />
 
       {/* MOBILE SEGMENT SELECTOR (Strike Profile vs Argon Prediction) */}
