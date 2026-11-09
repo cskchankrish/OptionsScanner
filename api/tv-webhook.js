@@ -892,6 +892,37 @@ export default async function handler(req, res) {
       });
     }
 
+    // 2b. Test or Trigger EOD Official Directive Dispatch
+    if (req.query?.test === "eod" || req.query?.send_eod === "1") {
+      let livePayload = null;
+      try {
+        const oiRes = await fetch("https://niftyninjaa.vercel.app/api/nifty-oi");
+        if (oiRes.ok) livePayload = await oiRes.json();
+      } catch (e) {}
+
+      const decision = livePayload?.eodDecision || {
+        verdict: "EXIT TO CASH / DO NOT CARRY",
+        bias: "NEUTRAL",
+        conviction: 50,
+        sizing: "0% (Cash Only)",
+        action: "Balanced flow without directional edge.",
+        targetContract: "17-Nov-2026",
+        isRollover: true,
+        score: 0,
+      };
+
+      const spotVal = livePayload?.spotPrice || 25000;
+      const floorVal = livePayload?.floor || 24900;
+      const roofVal = livePayload?.roof || 25500;
+
+      const sent = await sendTelegramEODAlert(decision, spotVal, floorVal, roofVal, "15:15");
+      return res.status(200).json({
+        ok: true,
+        dispatched: sent,
+        decision,
+      });
+    }
+
     try {
       const queryDate = req.query?.date || istDate;
 
