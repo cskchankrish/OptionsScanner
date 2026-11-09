@@ -537,6 +537,63 @@ export async function sendTelegramExitAlert(exitRecord) {
 }
 
 /**
+ * Telegram EOD 15:15 Decision Helper
+ */
+export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId || !eodDecision) return;
+
+  const isBTST = eodDecision.verdict?.includes("BTST") || eodDecision.bias === "BULLISH";
+  const isSTBT = eodDecision.verdict?.includes("STBT") || eodDecision.bias === "BEARISH";
+
+  const header = isBTST
+    ? "🟢 *OFFICIAL EOD CARRY DIRECTIVE · BTST (BUY CE)*"
+    : isSTBT
+    ? "🔴 *OFFICIAL EOD CARRY DIRECTIVE · STBT (BUY PE)*"
+    : "⚪ *OFFICIAL EOD CARRY DIRECTIVE · CASH ONLY (DO NOT CARRY)*";
+
+  const lines = [
+    header,
+    `• *Verdict:* \`${eodDecision.verdict}\``,
+    `• *Bias & Conviction:* ${eodDecision.bias} (${eodDecision.conviction}%)`,
+    `• *Recommended Sizing:* \`${eodDecision.sizing}\``,
+    `• *Spot Index:* \`₹${Math.round(spot)}\` | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
+  ];
+
+  if (isBTST || isSTBT) {
+    if (eodDecision.target) lines.push(`• *Target:* \`₹${eodDecision.target}\``);
+    if (eodDecision.stopLoss) lines.push(`• *Strict SL:* \`₹${eodDecision.stopLoss}\``);
+  }
+
+  lines.push(`• *Action Guidance:* ${eodDecision.action}`);
+
+  if (eodDecision.audit && eodDecision.audit.length > 0) {
+    lines.push(`• *Institutional Evidence:*`);
+    eodDecision.audit.slice(0, 4).forEach(a => {
+      lines.push(`  - ${a.label}: \`${a.status}\` (${a.impact})`);
+    });
+  }
+
+  lines.push(`• *Time Finalized:* ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST`);
+  lines.push(`• *Live OptionsScanner:* https://niftyninjaa.vercel.app`);
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: lines.join("\n"),
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Telegram EOD alert error:", err.message);
+  }
+}
+
+/**
  * Automatically evaluates the active trade in Redis against live price action (T1, T2, Cost, SL, Time-Stop)
  */
 export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low = null, redisClient = null) {

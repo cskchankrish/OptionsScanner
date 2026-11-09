@@ -1849,6 +1849,28 @@ export default async function handler(req, res) {
       await evaluateActiveTradeLifecycle(spot);
     } catch (e) {}
 
+    // Automatic 15:15 IST EOD Carry Alert Dispatcher
+    const istMinutes = getISTMinutes();
+    const istDateStr = getISTIsoDateStr();
+    const isEodTest = req.query?.test === "eod_alert";
+    if ((istMinutes >= 915 && istMinutes <= 930) || isEodTest) {
+      if (REDIS_URL || isEodTest) {
+        try {
+          const dispatchedKey = `nifty:eod_alert_dispatched:${istDateStr}`;
+          const alreadySent = isEodTest ? null : await redisRestGet(dispatchedKey);
+          if (!alreadySent) {
+            const { sendTelegramEODAlert } = await import("./tv-webhook.js");
+            await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike);
+            if (!isEodTest) {
+              await redisRestSet(dispatchedKey, { sentAt: new Date().toISOString() }, 86400);
+            }
+          }
+        } catch (err) {
+          console.error("Error dispatching 15:15 EOD alert:", err);
+        }
+      }
+    }
+
     const payload = {
       success: true,
       isLive: true,
