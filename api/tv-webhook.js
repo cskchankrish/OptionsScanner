@@ -527,13 +527,18 @@ export async function sendTelegramAlert(fused) {
     ].filter(Boolean);
 
     if ((isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
+      const isHtf = fused.timeframe === "125" || fused.timeframe === "D" || Number(fused.timeframe) >= 60;
+      const holdProtocol = isHtf
+        ? "Max 15 bars (3-5 Days Swing / Positional Hold on 125m/Daily)"
+        : "Max 20 bars (5 Hours Intraday on 15m)";
+
       lines.push(
         `\n📋 *${isSynergy ? "SYNERGY" : "TRAP"} EXECUTION & EXIT PROTOCOL:*`,
         `1. *Fill:* At market open next bar. Levels are fill-relative:`,
         `   • Stop Loss: Entry ${fused.direction === "LONG" ? "-" : "+"} \`${fused.riskPoints}\` pts`,
         `   • Target 1: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target1Dist}\` pts -> *Scale out 60% & Move SL to Breakeven*`,
         `   • Target 2: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target2Dist}\` pts -> *Exit remaining 40%*`,
-        `2. *Time-Stop:* Max 20 bars (5 Hours on 15m) / 15 bars (on 125m). Exit at market if open after max bars.`,
+        `2. *Time-Stop:* ${holdProtocol}. Exit at market if open after max bars.`,
         `3. *Single-Position Rule:* Strictly one trade at a time.`
       );
     }
@@ -766,8 +771,11 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
       activeTrade.stopLoss = entry; // Move SL to Cost
       activeTrade.slAtCost = true;
 
+      const isHtf = activeTrade.timeframe === "125" || activeTrade.timeframe === "D" || Number(activeTrade.timeframe) >= 60 || activeTrade.grade?.includes("SYNERGY");
+      const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
+
       try {
-        await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: 21600 });
+        await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: activeTtl });
       } catch (e) {}
 
       const t1Record = {
@@ -1154,8 +1162,10 @@ export default async function handler(req, res) {
           activeTrade.t1HitPrice = fillPrice;
           activeTrade.stopLoss = activeTrade.entryPrice; // Cost
           activeTrade.slAtCost = true;
+          const isHtf = activeTrade.timeframe === "125" || activeTrade.timeframe === "D" || Number(activeTrade.timeframe) >= 60 || activeTrade.grade?.includes("SYNERGY");
+          const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
           if (redis) {
-            await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: 21600 });
+            await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: activeTtl });
           }
         }
         const t1Record = {
@@ -1270,11 +1280,14 @@ export default async function handler(req, res) {
         fusedVerdict.recommendedLots = 0;
         fusedVerdict.reasoning = `BLOCKED: Active trade already open (${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice}). The tested system strictly enforces one position at a time.`;
       } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
-        // Record active trade with 6-hour TTL (24 bars on 15m)
+        const isHtf = fusedVerdict.timeframe === "125" || fusedVerdict.timeframe === "D" || Number(fusedVerdict.timeframe) >= 60 || fusedVerdict.grade?.includes("SYNERGY");
+        const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
         const activeData = {
           active: true,
           grade: fusedVerdict.grade,
           direction: fusedVerdict.direction,
+          timeframe: fusedVerdict.timeframe,
+          swingTimeframe: fusedVerdict.swingTimeframe,
           entryPrice: fusedVerdict.entryPrice,
           stopLoss: fusedVerdict.stopLoss,
           riskPoints: fusedVerdict.riskPoints,
@@ -1287,7 +1300,7 @@ export default async function handler(req, res) {
         };
         if (redis) {
           try {
-            await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { ex: 21600 });
+            await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { ex: activeTtl });
           } catch (e) {}
         }
       }
