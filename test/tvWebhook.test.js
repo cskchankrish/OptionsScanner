@@ -260,6 +260,116 @@ test("fuseChartWithOptionChain: Guards against inverted Stop Loss for SHORT trad
   assert.equal(res.target2Price, 24817.48); // 24932.6 - 115.12
 });
 
+test("fuseChartWithOptionChain: SYNERGY_BEAR verified with High Conviction (2 Lots) when Call Blitz aligns", () => {
+  const tv = {
+    dir: "SHORT",
+    grade: "SYNERGY_BEAR",
+    close: 25150,
+    sl: 25215,
+    cappedSl: 25215,
+    rDist: 65,
+    actRoof: 25200,
+    actFloor: 25000,
+  };
+
+  const liveScanner = {
+    corridor: {
+      deltaPCR: 0.62,
+      floorStrike: 25000,
+      roofStrike: 25200,
+    },
+    smartMoneyFusion: { primaryScenario: "HIGH_CONVICTION_BEARISH_SYNERGY" },
+    futures: { quadrant: "SHORT_BUILDUP" },
+  };
+
+  const res = fuseChartWithOptionChain(tv, liveScanner);
+  assert.equal(res.decision, "EXECUTE_HIGH_CONVICTION_SYNERGY");
+  assert.equal(res.recommendedLots, 2);
+  assert.equal(res.tier, "HIGH_CONVICTION_SYNERGY");
+  assert.match(res.reasoning, /HIGH CONVICTION BEAR SYNERGY VERIFIED/);
+});
+
+test("fuseChartWithOptionChain: SYNERGY_BEAR VETOED (0 Lots) when real Option Chain shows Put Writing / Floor Defense (Nov 9 Scenario)", () => {
+  const tv = {
+    dir: "SHORT",
+    grade: "SYNERGY_BEAR",
+    close: 25035, // Near floor 25000
+    sl: 25100,
+    cappedSl: 25100,
+    rDist: 65,
+    actFloor: 25000,
+  };
+
+  // Exactly Nov 9 market state: ΔPCR=1.07, defending 25000 floor
+  const liveScanner = {
+    corridor: {
+      deltaPCR: 1.07,
+      floorStrike: 25000,
+      roofStrike: 25200,
+    },
+    futures: { quadrant: "LONG_UNWINDING" },
+  };
+
+  const res = fuseChartWithOptionChain(tv, liveScanner);
+  assert.equal(res.decision, "VETO_DIVERGENT_SYNERGY");
+  assert.equal(res.recommendedLots, 0);
+  assert.match(res.reasoning, /VETOED.*Floor defense near 25000/);
+});
+
+test("fuseChartWithOptionChain: SYNERGY_BULL verified with High Conviction (2 Lots) when Put Blitz aligns", () => {
+  const tv = {
+    dir: "LONG",
+    grade: "SYNERGY_BULL",
+    close: 25060,
+    sl: 24995,
+    cappedSl: 24995,
+    rDist: 65,
+    actRoof: 25300,
+    actFloor: 25000,
+  };
+
+  const liveScanner = {
+    corridor: {
+      deltaPCR: 1.42,
+      floorStrike: 25000,
+      roofStrike: 25300,
+    },
+    smartMoneyFusion: { primaryScenario: "HIGH_CONVICTION_BULLISH_SYNERGY" },
+    futures: { quadrant: "LONG_BUILDUP" },
+  };
+
+  const res = fuseChartWithOptionChain(tv, liveScanner);
+  assert.equal(res.decision, "EXECUTE_HIGH_CONVICTION_SYNERGY");
+  assert.equal(res.recommendedLots, 2);
+  assert.equal(res.tier, "HIGH_CONVICTION_SYNERGY");
+  assert.match(res.reasoning, /HIGH CONVICTION BULL SYNERGY VERIFIED/);
+});
+
+test("fuseChartWithOptionChain: SYNERGY_BULL VETOED (0 Lots) when real Option Chain shows Call Writing resistance", () => {
+  const tv = {
+    dir: "LONG",
+    grade: "SYNERGY_BULL",
+    close: 25120,
+    sl: 25055,
+    cappedSl: 25055,
+    rDist: 65,
+  };
+
+  const liveScanner = {
+    corridor: {
+      deltaPCR: 0.65, // Real Call Blitz, not Put Blitz!
+      floorStrike: 25000,
+      roofStrike: 25200,
+    },
+    futures: { quadrant: "SHORT_BUILDUP" },
+  };
+
+  const res = fuseChartWithOptionChain(tv, liveScanner);
+  assert.equal(res.decision, "VETO_DIVERGENT_SYNERGY");
+  assert.equal(res.recommendedLots, 0);
+  assert.match(res.reasoning, /VETOED.*Call Writing resistance/);
+});
+
 test("evaluateActiveTradeLifecycle: Long trade triggers T1, moves SL to cost", async () => {
   const trade = {
     active: true,

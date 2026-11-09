@@ -94,8 +94,8 @@ breakBars1D   = input.int(2,      "Daily Structural Break Bars (2-Day High/Low)"
      tooltip="On the Daily chart, a bottom/top only confirms when a Daily candle closes beyond the prior 2-Day High/Low AND the Daily 5-EMA.")
 strictBaseFilter = input.bool(true, "Strict Base Filter: Block Weak [Base Breakout · 3/5] Bear Flags", group=GBT,
      tooltip="Validated across 2020-2026: When ON, a pullback base without an SFP Sweep MUST have either RSI Divergence OR reclaim the 34-EMA with a confirmed Pivot, eliminating 3/5 bear-flag bull traps in downtrends.")
-eliminateBaseBreakout = input.bool(true, "Eliminate Naked Base Breakout (Require SFP, RSI Div, or Pivot)", group=GBT,
-     tooltip="Completely eliminates naked 'Base Breakout' signals (Tag 5) that lack SFP sweeps or RSI divergence, which frequently fail or reverse.")
+eliminateBaseBreakout = input.bool(false, "Eliminate Naked Base Breakout (Require SFP, RSI Div, or Pivot)", group=GBT,
+     tooltip="When ON, eliminates naked 'Base Breakout' signals (Tag 5) that lack SFP sweeps or RSI divergence. Default OFF to preserve frozen baseline.")
 invertFlagCont   = input.bool(true, "Invert Weak 3/5 Counter-Trend Setups into Trend Continuation Flags", group=GBT,
      tooltip="Converts a weak 3/5 counter-trend bounce in a downtrend into a 'Bear Flag Cont ★' TOP when price rolls over below the 2-bar low & 5/13/34 EMAs (and converts a weak 3/5 pullback in an uptrend into a 'Bull Flag Cont ★' BOTTOM when price breaks above the 2-bar high & 5/13/34 EMAs).")
 useVolFilter  = input.bool(true,  "Include Volume Climax Boost (Futures / Stocks)", group=GBT)
@@ -1083,11 +1083,60 @@ string fusionVerdict = bullTrapSig ? "🚨 BULL TRAP (Scout Short)" :
      futQuadrant == "SHORT_COVERING" ? "🚀 SHORT COVERING" :
      futQuadrant == "LONG_UNWINDING" ? "⚠ LONG UNWINDING" : "⚪ NEUTRAL / CHOP"
 
+// ═══════════════════════════════════════════════════════════════════
+//  HOISTED RISK & TARGET SPECIFICATION (Shared by Labels, Alerts & Ledger)
+// ═══════════════════════════════════════════════════════════════════
+GL = "Engine levels on chart (SL + T1/T2/T3)"
+lvlShow = input.bool(true,  "Draw SL + T1/T2/T3 on entry alerts", group=GL)
+lvlBars = input.int(40,     "Extend lines this many bars", minval=5, group=GL)
+t1LPct  = input.float(0.50, "Long T1 %",  step=0.01, group=GL)
+t2LPct  = input.float(0.92, "Long T2 %",  step=0.01, group=GL)
+t3LPct  = input.float(1.79, "Long T3 %",  step=0.01, group=GL)
+t1SPct  = input.float(0.50, "Short T1 %", step=0.01, group=GL)
+t2SPct  = input.float(1.12, "Short T2 %", step=0.01, group=GL)
+t3SPct  = input.float(2.12, "Short T3 %", step=0.01, group=GL)
+
+useRFloor     = input.bool(true,  "Enforce Min 1.0R Target 1 & 2.0R Target 2 Floor (Fixes 125m/1D R:R)", group=GL,
+     tooltip="On 125m and 1D, a fixed 0.50% T1 is only 0.2R against a 200pt stop (forcing Req BE% to 73-81%). When ON, T1 is at least 1.0x Initial Stop (1R) and T2 is at least 2.0x Initial Stop (2R), and initial Stop is capped at maxStopAtr x ATR.")
+minT1R        = input.float(1.00, "Minimum T1 Risk-Reward Multiple (x 1R Stop)", minval=0.50, maxval=3.00, step=0.10, group=GL)
+minT2R        = input.float(2.00, "Minimum T2 Risk-Reward Multiple (x 1R Stop)", minval=1.00, maxval=5.00, step=0.25, group=GL)
+maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)", minval=0.80, maxval=4.00, step=0.10, group=GL,
+     tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
+
+f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
+    bool  hasSL     = not na(_rawSL) and _rawSL > 0.0
+    float safeAtr   = nz(atr14, close * 0.006)
+    bool  validSide = hasSL and (_isLong ? _rawSL < close : _rawSL > close)
+    float rawDist   = validSide ? (_isLong ? (close - _rawSL) : (_rawSL - close)) : (1.2 * safeAtr)
+    float minStop   = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
+    float maxStop   = math.max(minStop, maxStopAtr * safeAtr)
+    float riskPts   = hasSL ? (useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)) : 0.0
+    float effSL     = hasSL ? (_isLong ? (close - riskPts) : (close + riskPts)) : 0.0
+    float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
+    float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
+    float t1Pts   = hasSL ? (useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1) : 0.0
+    float t2Pts   = hasSL ? (useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2) : 0.0
+    float t1Price = hasSL ? (_isLong ? (close + t1Pts) : (close - t1Pts)) : 0.0
+    float t2Price = hasSL ? (_isLong ? (close + t2Pts) : (close - t2Pts)) : 0.0
+    [riskPts, t1Pts, t2Pts, effSL, t1Price, t2Price]
+
+float swBotSL = nz(activeSwingLvl, low)  - (swingSlAtr * nz(activeSwingAtr, atr14))
+float swTopSL = nz(activeSwingLvl, high) + (swingSlAtr * nz(activeSwingAtr, atr14))
+
 float synSafeAtr = nz(atr14, close * 0.006)
 float synBullSL  = stLine < close ? stLine : (close - 1.2 * synSafeAtr)
 float synBearSL  = stLine > close ? stLine : (close + 1.2 * synSafeAtr)
 bool  synergyBullTrigger = isBullSynergy and not isBullSynergy[1]
 bool  synergyBearTrigger = isBearSynergy and not isBearSynergy[1]
+
+// Pre-calculate capped stop losses & risk points for labels (matching ledger & webhook parity)
+[btRiskPts, btT1, btT2, btEffSL, _, _]         = f_calcRiskAndTargets(false, bullTrapSL)
+[synbRiskPts, synbT1, synbT2, synbEffSL, _, _] = f_calcRiskAndTargets(false, synBearSL)
+[swtRiskPts, swtT1, swtT2, swtEffSL, _, _]     = f_calcRiskAndTargets(false, swTopSL)
+
+[btrpRiskPts, btrpT1, btrpT2, btrpEffSL, _, _] = f_calcRiskAndTargets(true, bearTrapSL)
+[synpRiskPts, synpT1, synpT2, synpEffSL, _, _] = f_calcRiskAndTargets(true, synBullSL)
+[swbRiskPts, swbT1, swbT2, swbEffSL, _, _]     = f_calcRiskAndTargets(true, swBotSL)
 
 // ───────────────────────────────────────────────────────────────────
 //  INTELLIGENT ANTI-COLLISION SIGNAL LABEL ENGINE (Zero Overlap)
@@ -1110,12 +1159,12 @@ if bearCount > 0
     if combineMultiLabels and bearCount > 1
         string consolidatedBearText = "🔴 BEAR CONFLUENCE [" + str.tostring(bearCount) + "x]"
         if hasBearSyn
-            consolidatedBearText += "\n⚡ BEAR SYNERGY (STBT) · SL: " + str.tostring(math.round(synBearSL))
+            consolidatedBearText += "\n⚡ BEAR SYNERGY (STBT) · SL: " + str.tostring(math.round(synbEffSL)) + " [Cap/R: " + str.tostring(math.round(synbRiskPts)) + "pt]"
         if hasBullTrap
-            consolidatedBearText += "\n🚨 BULL TRAP · SL: " + str.tostring(math.round(bullTrapSL)) + " " + bullTrapTag
+            consolidatedBearText += "\n🚨 BULL TRAP · SL: " + str.tostring(math.round(btEffSL)) + " [Cap/R: " + str.tostring(math.round(btRiskPts)) + "pt] " + bullTrapTag
         if hasSwTop
             string swTopKind = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
-            consolidatedBearText += "\n📉 " + swTopKind + " (" + evalHtfLabel + ") · Top: " + str.tostring(math.round(activeSwingLvl)) + " [" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
+            consolidatedBearText += "\n📉 " + swTopKind + " (" + evalHtfLabel + ") · Top: " + str.tostring(math.round(activeSwingLvl)) + " [SL: " + str.tostring(math.round(swtEffSL)) + " · " + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
         label.new(bar_index, high, consolidatedBearText,
              yloc=yloc.abovebar, style=label.style_label_down,
              color=color.new(#b71c1c, 0), textcolor=color.white, size=effLblSize)
@@ -1124,14 +1173,14 @@ if bearCount > 0
         if hasBearSyn
             float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
-                 "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synBearSL)),
+                 "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synbEffSL)) + " [Cap/R: " + str.tostring(math.round(synbRiskPts)) + "pt]",
                  yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
                  color=color.new(#c62828, 0), textcolor=color.white, size=effLblSize)
             bearIdx += 1
         if hasBullTrap
             float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
-                 "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bullTrapSL)) + "\n" + bullTrapTag,
+                 "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(btEffSL)) + " [Cap/R: " + str.tostring(math.round(btRiskPts)) + "pt]\n" + bullTrapTag,
                  yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
                  color=color.new(#f57c00, 0), textcolor=color.white, size=effLblSize)
             bearIdx += 1
@@ -1140,6 +1189,7 @@ if bearCount > 0
             string swKindTopTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
             label.new(bar_index, yPos,
                  "🔴 " + swKindTopTxt + " (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
+                 "\nSL: " + str.tostring(math.round(swtEffSL)) + " [Cap/R: " + str.tostring(math.round(swtRiskPts)) + "pt]" +
                  "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
                  yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
                  color=color.new(#d50000, 0), textcolor=color.white, size=effLblSize)
@@ -1150,12 +1200,12 @@ if bullCount > 0
     if combineMultiLabels and bullCount > 1
         string consolidatedBullText = "🟢 BULL CONFLUENCE [" + str.tostring(bullCount) + "x]"
         if hasBullSyn
-            consolidatedBullText += "\n⚡ BULL SYNERGY (BTST) · SL: " + str.tostring(math.round(synBullSL))
+            consolidatedBullText += "\n⚡ BULL SYNERGY (BTST) · SL: " + str.tostring(math.round(synpEffSL)) + " [Cap/R: " + str.tostring(math.round(synpRiskPts)) + "pt]"
         if hasBearTrap
-            consolidatedBullText += "\n🟢 BEAR TRAP · SL: " + str.tostring(math.round(bearTrapSL)) + " " + bearTrapTag
+            consolidatedBullText += "\n🟢 BEAR TRAP · SL: " + str.tostring(math.round(btrpEffSL)) + " [Cap/R: " + str.tostring(math.round(btrpRiskPts)) + "pt] " + bearTrapTag
         if hasSwBot
             string swBotKind = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
-            consolidatedBullText += "\n📈 " + swBotKind + " (" + evalHtfLabel + ") · Base: " + str.tostring(math.round(activeSwingLvl)) + " [" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
+            consolidatedBullText += "\n📈 " + swBotKind + " (" + evalHtfLabel + ") · Base: " + str.tostring(math.round(activeSwingLvl)) + " [SL: " + str.tostring(math.round(swbEffSL)) + " · " + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
         label.new(bar_index, low, consolidatedBullText,
              yloc=yloc.belowbar, style=label.style_label_up,
              color=color.new(#1b5e20, 0), textcolor=color.white, size=effLblSize)
@@ -1164,14 +1214,14 @@ if bullCount > 0
         if hasBullSyn
             float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
-                 "⚡ BULL SYNERGY (BTST)\nFut Long + Put Blitz\nSL: " + str.tostring(math.round(synBullSL)),
+                 "⚡ BULL SYNERGY (BTST)\nFut Long + Put Blitz\nSL: " + str.tostring(math.round(synpEffSL)) + " [Cap/R: " + str.tostring(math.round(synpRiskPts)) + "pt]",
                  yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
                  color=color.new(#2e7d32, 0), textcolor=color.white, size=effLblSize)
             bullIdx += 1
         if hasBearTrap
             float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
-                 "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bearTrapSL)) + "\n" + bearTrapTag,
+                 "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(btrpEffSL)) + " [Cap/R: " + str.tostring(math.round(btrpRiskPts)) + "pt]\n" + bearTrapTag,
                  yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
                  color=color.new(#00bfa5, 0), textcolor=color.white, size=effLblSize)
             bullIdx += 1
@@ -1180,6 +1230,7 @@ if bullCount > 0
             string swKindBotTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
             label.new(bar_index, yPos,
                  "🟢 " + swKindBotTxt + " (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
+                 "\nSL: " + str.tostring(math.round(swbEffSL)) + " [Cap/R: " + str.tostring(math.round(swbRiskPts)) + "pt]" +
                  "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
                  yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
                  color=color.new(#00c853, 0), textcolor=color.white, size=effLblSize)
@@ -1916,42 +1967,7 @@ fill(pLo, pHi, color=color.new(#00e5ff, 88), title="Conf zone")
 
 
 
-// ═══════════════════════════════════════════════════════════════════
-//  HOISTED RISK & TARGET SPECIFICATION (Shared by Alerts & Ledger)
-// ═══════════════════════════════════════════════════════════════════
-GL = "Engine levels on chart (SL + T1/T2/T3)"
-lvlShow = input.bool(true,  "Draw SL + T1/T2/T3 on entry alerts", group=GL)
-lvlBars = input.int(40,     "Extend lines this many bars", minval=5, group=GL)
-t1LPct  = input.float(0.50, "Long T1 %",  step=0.01, group=GL)
-t2LPct  = input.float(0.92, "Long T2 %",  step=0.01, group=GL)
-t3LPct  = input.float(1.79, "Long T3 %",  step=0.01, group=GL)
-t1SPct  = input.float(0.50, "Short T1 %", step=0.01, group=GL)
-t2SPct  = input.float(1.12, "Short T2 %", step=0.01, group=GL)
-t3SPct  = input.float(2.12, "Short T3 %", step=0.01, group=GL)
-
-useRFloor     = input.bool(true,  "Enforce Min 1.0R Target 1 & 2.0R Target 2 Floor (Fixes 125m/1D R:R)", group=GL,
-     tooltip="On 125m and 1D, a fixed 0.50% T1 is only 0.2R against a 200pt stop (forcing Req BE% to 73-81%). When ON, T1 is at least 1.0x Initial Stop (1R) and T2 is at least 2.0x Initial Stop (2R), and initial Stop is capped at maxStopAtr x ATR.")
-minT1R        = input.float(1.00, "Minimum T1 Risk-Reward Multiple (x 1R Stop)", minval=0.50, maxval=3.00, step=0.10, group=GL)
-minT2R        = input.float(2.00, "Minimum T2 Risk-Reward Multiple (x 1R Stop)", minval=1.00, maxval=5.00, step=0.25, group=GL)
-maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)", minval=0.80, maxval=4.00, step=0.10, group=GL,
-     tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
-
-f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
-    bool  hasSL     = not na(_rawSL) and _rawSL > 0.0
-    float safeAtr   = nz(atr14, close * 0.006)
-    bool  validSide = hasSL and (_isLong ? _rawSL < close : _rawSL > close)
-    float rawDist   = validSide ? (_isLong ? (close - _rawSL) : (_rawSL - close)) : (1.2 * safeAtr)
-    float minStop   = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
-    float maxStop   = math.max(minStop, maxStopAtr * safeAtr)
-    float riskPts   = hasSL ? (useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)) : 0.0
-    float effSL     = hasSL ? (_isLong ? (close - riskPts) : (close + riskPts)) : 0.0
-    float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
-    float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
-    float t1Pts   = hasSL ? (useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1) : 0.0
-    float t2Pts   = hasSL ? (useRFloor ? math.max(baseT2, minT2R * riskPts) : baseT2) : 0.0
-    float t1Price = hasSL ? (_isLong ? (close + t1Pts) : (close - t1Pts)) : 0.0
-    float t2Price = hasSL ? (_isLong ? (close + t2Pts) : (close - t2Pts)) : 0.0
-    [riskPts, t1Pts, t2Pts, effSL, t1Price, t2Price]
+// (Risk inputs, f_calcRiskAndTargets, and swBotSL/swTopSL hoisted above for label, alert, and ledger parity)
 
 // ═══════════════════════════════════════════════════════════════════
 //  UNIFIED JSON ALERT (All Intraday & 125m/1D Swing Grades)
@@ -2036,8 +2052,6 @@ if gapT2Long or gapT2Short
     alert(f_json("GAP_ADD", gapT2Long ? "LONG" : "SHORT", gapSL, sigCount, 0, "INTRADAY", false), alert.freq_once_per_bar)
 
 // Swing & Smart Money Trap Alerts
-float swBotSL = nz(activeSwingLvl, low)  - (swingSlAtr * nz(activeSwingAtr, atr14))
-float swTopSL = nz(activeSwingLvl, high) + (swingSlAtr * nz(activeSwingAtr, atr14))
 if confirmBottom
     alert(f_json("SWING_BOTTOM", "LONG", swBotSL, sigCount, activeSwingTag, swKindLong, isBottomArmed), alert.freq_once_per_bar_close)
 if confirmTop
@@ -2124,7 +2138,7 @@ verifWindow   = input.string("Modern Real-OI Era (2021-01-01 to 2026-11-08)", "E
      ], group=GBT_VER,
      tooltip="Because rules were refined after viewing 2020-2026 regimes and Aug-Nov 2026 dates, all history through Nov 8, 2026 is In-Sample. True Out-of-Sample validation requires Forward Paper Trading from Nov 9, 2026 onward.")
 verifMode     = input.string("Traps Only (Bull/Bear Trap)", "Signals to Audit in Ledger",
-     options=["Traps Only (Bull/Bear Trap)", "Structural Swings Only (125m/1D)", "Traps + Structural Swings"], group=GBT_VER)
+     options=["Traps Only (Bull/Bear Trap)", "Structural Swings Only (125m/1D)", "Traps + Structural Swings", "Synergy Only (Bull/Bear Synergy)", "All (Traps + Swings + Synergy)"], group=GBT_VER)
 gateSwingsFlw = input.bool(false, "Also Require Orderflow Gate on 125m/1D Structural Swings", group=GBT_VER,
      tooltip="Toggle ON vs OFF on 125m/1D charts to test whether requiring bullTrapFlow/bearTrapFlow improves or starves 125m/1D structural swing signals.")
 costPtsInput  = input.float(4.0,  "Unified Round-Trip Cost (Nifty Index Points)", minval=0.0, maxval=25.0, step=0.5, group=GBT_VER,
@@ -2215,8 +2229,10 @@ if pendDir != 0 and trDir == 0
 
 // 2. Evaluate active trade on current bar
 if trDir != 0
-    bool  closedNow = false
-    float netPnl    = 0.0
+    bool   closedNow     = false
+    float  netPnl        = 0.0
+    string exitReasonStr = ""
+    float  exitFillPrice = close
 
     // 2a. If Time-Stop triggered at prior bar close, exit at THIS bar's OPEN (matching strategy.close() next-open fill!)
     if trTimeStopPend
@@ -2226,6 +2242,8 @@ if trDir != 0
         closedNow      := true
         statTimeExits  += 1
         trTimeStopPend := false
+        exitReasonStr  := "TIME_STOP_EXIT"
+        exitFillPrice  := open
     else
         trBarsHeld += 1
         bool wasHitT1 = trHitT1
@@ -2237,10 +2255,13 @@ if trDir != 0
                 float leg2Pnl = trHitT1 ? (slFill - trEntry) * (1.0 - scaleOutPct) : (slFill - trEntry)
                 netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
                 closedNow     := true
+                exitFillPrice := slFill
                 if trHitT1
-                    statBeStops += 1
+                    statBeStops   += 1
+                    exitReasonStr := "BREAKEVEN_STOP"
                 else
                     statFullSlHits += 1
+                    exitReasonStr  := "STOP_LOSS_HIT"
             else
                 // Check T1 hit (with gap-up fill at `math.max(open, trT1)`)
                 if not trHitT1 and high >= trT1
@@ -2255,11 +2276,15 @@ if trDir != 0
                     netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
                     closedNow     := true
                     statT2Hits    += 1
+                    exitReasonStr := "TARGET_2_HIT"
+                    exitFillPrice := t2Fill
                 // Conservative same-bar post-T1 reversal check: if T1 was first touched on this bar AND price reversed back below entry by bar close, stop out runner at BE!
                 else if not wasHitT1 and trHitT1 and low <= trEntry and close <= trEntry
-                    netPnl      := trLeg1Pnl - costPtsInput
-                    closedNow   := true
-                    statBeStops += 1
+                    netPnl        := trLeg1Pnl - costPtsInput
+                    closedNow     := true
+                    statBeStops   += 1
+                    exitReasonStr := "BREAKEVEN_STOP"
+                    exitFillPrice := trEntry
                 // Arm next-open Time-Stop if maxHoldBars reached at bar close
                 else if trBarsHeld >= effMaxHold or not inAuditWindow
                     trTimeStopPend := true
@@ -2271,10 +2296,13 @@ if trDir != 0
                 float leg2Pnl = trHitT1 ? (trEntry - slFill) * (1.0 - scaleOutPct) : (trEntry - slFill)
                 netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
                 closedNow     := true
+                exitFillPrice := slFill
                 if trHitT1
-                    statBeStops += 1
+                    statBeStops   += 1
+                    exitReasonStr := "BREAKEVEN_STOP"
                 else
                     statFullSlHits += 1
+                    exitReasonStr  := "STOP_LOSS_HIT"
             else
                 if not trHitT1 and low <= trT1
                     float t1Fill = math.min(open, trT1)
@@ -2287,10 +2315,14 @@ if trDir != 0
                     netPnl        := trLeg1Pnl + leg2Pnl - costPtsInput
                     closedNow     := true
                     statT2Hits    += 1
+                    exitReasonStr := "TARGET_2_HIT"
+                    exitFillPrice := t2Fill
                 else if not wasHitT1 and trHitT1 and high >= trEntry and close >= trEntry
-                    netPnl      := trLeg1Pnl - costPtsInput
-                    closedNow   := true
-                    statBeStops += 1
+                    netPnl        := trLeg1Pnl - costPtsInput
+                    closedNow     := true
+                    statBeStops   += 1
+                    exitReasonStr := "BREAKEVEN_STOP"
+                    exitFillPrice := trEntry
                 else if trBarsHeld >= effMaxHold or not inAuditWindow
                     trTimeStopPend := true
 
@@ -2300,8 +2332,7 @@ if trDir != 0
     // Record completed trade metrics (with nz() guard so early-bar na never poisons statSumInitR with NaN!)
     if closedNow
         if whSendExits
-            string exitReasonStr = (trDir == 1 ? (high >= trT2) : (low <= trT2)) ? "TARGET_2_HIT" : (trHitT1 ? "BREAKEVEN_STOP" : (trTimeStopPend ? "TIME_STOP_EXIT" : "STOP_LOSS_HIT"))
-            alert(f_json(exitReasonStr, trDir == 1 ? "LONG" : "SHORT", close, 0, 0, "EXIT", false), alert.freq_once_per_bar)
+            alert(f_json(exitReasonStr, trDir == 1 ? "LONG" : "SHORT", exitFillPrice, 0, 0, "EXIT", false), alert.freq_once_per_bar)
         float safeInitR = math.max(1.0, nz(trInitRisk, nz(atr14, close * 0.005)))
         float safeT1Dist = math.max(1.0, nz(math.abs(trT1 - trEntry), close * 0.005))
         statN        += 1
@@ -2322,32 +2353,35 @@ if trDir != 0
         trDir       := 0
 
 // 3. Queue new order at confirmed bar close if flat and inside walk-forward window
-bool includeTraps  = verifMode == "Traps Only (Bull/Bear Trap)" or verifMode == "Traps + Structural Swings"
-bool includeSwings = verifMode == "Structural Swings Only (125m/1D)" or verifMode == "Traps + Structural Swings"
+bool includeTraps   = verifMode == "Traps Only (Bull/Bear Trap)" or verifMode == "Traps + Structural Swings" or verifMode == "All (Traps + Swings + Synergy)"
+bool includeSwings  = verifMode == "Structural Swings Only (125m/1D)" or verifMode == "Traps + Structural Swings" or verifMode == "All (Traps + Swings + Synergy)"
+bool includeSynergy = verifMode == "Synergy Only (Bull/Bear Synergy)" or verifMode == "All (Traps + Swings + Synergy)"
 
 bool swLongGated   = confirmBottom and (not gateSwingsFlw or bearTrapFlow)
 bool swShortGated  = confirmTop    and (not gateSwingsFlw or bullTrapFlow)
 
-bool auditLongSig  = inAuditWindow and ((includeTraps and bearTrapSig) or (includeSwings and swLongGated))
-bool auditShortSig = inAuditWindow and ((includeTraps and bullTrapSig) or (includeSwings and swShortGated))
+bool auditLongSig  = inAuditWindow and ((includeTraps and bearTrapSig) or (includeSwings and swLongGated) or (includeSynergy and synergyBullTrigger))
+bool auditShortSig = inAuditWindow and ((includeTraps and bullTrapSig) or (includeSwings and swShortGated) or (includeSynergy and synergyBearTrigger))
 
 // (f_calcRiskAndTargets hoisted above for alert parity)
 
 if trDir == 0 and pendDir == 0 and barstate.isconfirmed and not na(atr14)
     if auditLongSig
-        float rawSL = (includeSwings and swLongGated) ? swBotSL : bearTrapSL
+        float rawSL = (includeTraps and bearTrapSig) ? bearTrapSL : ((includeSwings and swLongGated) ? swBotSL : synBullSL)
         [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(true, rawSL)
-        pendDir     := 1
-        pendRiskPts := rPts
-        pendT1Pts   := t1P
-        pendT2Pts   := t2P
+        if rPts > 0
+            pendDir     := 1
+            pendRiskPts := rPts
+            pendT1Pts   := t1P
+            pendT2Pts   := t2P
     else if auditShortSig
-        float rawSL = (includeSwings and swShortGated) ? swTopSL : bullTrapSL
+        float rawSL = (includeTraps and bullTrapSig) ? bullTrapSL : ((includeSwings and swShortGated) ? swTopSL : synBearSL)
         [rPts, t1P, t2P, effSL_a, t1Price_a, t2Price_a] = f_calcRiskAndTargets(false, rawSL)
-        pendDir     := -1
-        pendRiskPts := rPts
-        pendT1Pts   := t1P
-        pendT2Pts   := t2P
+        if rPts > 0
+            pendDir     := -1
+            pendRiskPts := rPts
+            pendT1Pts   := t1P
+            pendT2Pts   := t2P
 
 // Helper: True Wilson Score 95% Confidence Interval (z = 1.96, z^2 = 3.8416)
 f_wilson95(int _wins, int _n) =>

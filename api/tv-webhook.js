@@ -215,14 +215,91 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     }
   }
 
-  // ── CASE 2: Tier-2 Structural / Trend Confirmation (SWING_BOTTOM, SWING_TOP, MEGA, SYNERGY) ──
+  // ── CASE 2: High-Conviction Synergy (SYNERGY_BULL / SYNERGY_BEAR) ──
+  else if (grade === "SYNERGY_BULL" || grade === "SYNERGY_BEAR") {
+    tier = "HIGH_CONVICTION_SYNERGY";
+    const isLong = dir === "LONG";
+
+    if (isLong) {
+      // Bull Synergy: Chart flagged Long Buildup + Put Blitz
+      // Validate against real 22-strike Option Chain
+      if (
+        severeOppositeCallWriting ||
+        liveFutQuad === "SHORT_BUILDUP" ||
+        (deltaPCR !== null && deltaPCR < 0.85)
+      ) {
+        decision = "VETO_DIVERGENT_SYNERGY";
+        recommendedLots = 0;
+        tier = "VETOED_DIVERGENT";
+        reason.push(
+          `VETOED: Chart flagged Bull Synergy, but real 22-strike Option Chain shows Call Writing resistance (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Futures Short Buildup. Fake bull flow.`
+        );
+      } else if (distToRoof !== null && distToRoof < 30 && deltaPCR !== null && deltaPCR < 1.30) {
+        decision = "DOWNGRADE_TO_SCALP";
+        recommendedLots = 1;
+        tier = "SCALP_ONLY";
+        reason.push(
+          `CAUTION: Bull Synergy approaching Call Roof ${roofStrike} (dist: ${distToRoof.toFixed(0)} pts). Cap at 1 intraday lot.`
+        );
+      } else {
+        const verified =
+          (deltaPCR !== null && deltaPCR >= 1.25) ||
+          scannerScenario === "HIGH_CONVICTION_BULLISH_SYNERGY" ||
+          scannerScenario === "BULLISH_SYNERGY";
+        decision = verified ? "EXECUTE_HIGH_CONVICTION_SYNERGY" : "EXECUTE_MODERATE_SYNERGY";
+        recommendedLots = verified ? 2 : 1;
+        tier = verified ? "HIGH_CONVICTION_SYNERGY" : "MODERATE_SYNERGY";
+        reason.push(
+          verified
+            ? `HIGH CONVICTION BULL SYNERGY VERIFIED: Real 22-strike Option Chain confirms Put Writing Blitz (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) above Floor ${floorStrike}.`
+            : `MODERATE BULL SYNERGY: Chart triggered Bull Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}). Sized to 1 Lot.`
+        );
+      }
+    } else {
+      // Bear Synergy: Chart flagged Short Buildup + Call Blitz
+      // Validate against real 22-strike Option Chain
+      if (
+        severeOppositePutWriting ||
+        liveFutQuad === "LONG_BUILDUP" ||
+        (deltaPCR !== null && deltaPCR > 1.15) ||
+        (distToFloor !== null && Math.abs(distToFloor) <= 40 && deltaPCR !== null && deltaPCR >= 0.90)
+      ) {
+        decision = "VETO_DIVERGENT_SYNERGY";
+        recommendedLots = 0;
+        tier = "VETOED_DIVERGENT";
+        reason.push(
+          `VETOED: Chart flagged Bear Synergy, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Floor defense near ${floorStrike}. High risk of bounce.`
+        );
+      } else if (distToFloor !== null && distToFloor < 30 && deltaPCR !== null && deltaPCR > 0.70) {
+        decision = "DOWNGRADE_TO_SCALP";
+        recommendedLots = 1;
+        tier = "SCALP_ONLY";
+        reason.push(
+          `CAUTION: Bear Synergy approaching Put Floor ${floorStrike} (dist: ${distToFloor.toFixed(0)} pts). Cap at 1 intraday lot.`
+        );
+      } else {
+        const verified =
+          (deltaPCR !== null && deltaPCR <= 0.75) ||
+          scannerScenario === "HIGH_CONVICTION_BEARISH_SYNERGY" ||
+          scannerScenario === "BEARISH_SYNERGY";
+        decision = verified ? "EXECUTE_HIGH_CONVICTION_SYNERGY" : "EXECUTE_MODERATE_SYNERGY";
+        recommendedLots = verified ? 2 : 1;
+        tier = verified ? "HIGH_CONVICTION_SYNERGY" : "MODERATE_SYNERGY";
+        reason.push(
+          verified
+            ? `HIGH CONVICTION BEAR SYNERGY VERIFIED: Real 22-strike Option Chain confirms Call Writing Blitz (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) below Roof ${roofStrike}.`
+            : `MODERATE BEAR SYNERGY: Chart triggered Bear Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}). Sized to 1 Lot.`
+        );
+      }
+    }
+  }
+
+  // ── CASE 3: Tier-2 Structural / Trend Confirmation (SWING_BOTTOM, SWING_TOP, MEGA, TREND_FLIP) ──
   else if (
     [
       "SWING_BOTTOM",
       "SWING_TOP",
       "MEGA",
-      "SYNERGY_BULL",
-      "SYNERGY_BEAR",
       "TREND_FLIP",
     ].includes(grade)
   ) {
@@ -380,8 +457,11 @@ export async function sendTelegramAlert(fused) {
   if (!botToken || !chatId) return;
 
   const isTrap = fused.grade === "BEAR_TRAP_BUY" || fused.grade === "BULL_TRAP_SELL";
+  const isSynergy = fused.grade === "SYNERGY_BULL" || fused.grade === "SYNERGY_BEAR";
   const icon =
-    fused.decision === "VETO_SIGNAL" || fused.decision === "BLOCKED_BY_ACTIVE_TRADE"
+    fused.decision === "VETO_SIGNAL" ||
+    fused.decision === "VETO_DIVERGENT_SYNERGY" ||
+    fused.decision === "BLOCKED_BY_ACTIVE_TRADE"
       ? "🚫"
       : fused.decision === "LOG_ONLY"
       ? "ℹ️"
@@ -400,13 +480,25 @@ export async function sendTelegramAlert(fused) {
 
   let lines = [];
 
-  if (fused.decision === "LOG_ONLY") {
+  if (fused.decision === "VETO_DIVERGENT_SYNERGY" || fused.decision === "VETO_SIGNAL") {
+    lines = [
+      `🚫 *VETOED · REAL OPTION CHAIN DIVERGENCE*`,
+      `• *Chart Signal:* \`${fused.grade}\`${kindBadge} (${fused.direction})`,
+      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Chart Price:* \`${fused.entryPrice}\``,
+      fused.stopLoss ? `• *Reference SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)` : null,
+      `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
+      `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
+      `• *Institutional Verdict:* ${fused.reasoning}`,
+      `• *Directive:* 🚫 *DO NOT TRADE (0 Lots)*. The TradingView proxy triggered, but live institutional option writers are defending the opposite side!`,
+    ].filter(Boolean);
+  } else if (fused.decision === "LOG_ONLY") {
     lines = [
       `${icon} *LOG_ONLY* · \`${fused.grade}\`${kindBadge} (${fused.direction})`,
       `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
       `• *Signal Close:* \`${fused.entryPrice}\``,
       fused.stopLoss ? `• *Reference SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)` : null,
-      `• *Status:* Informational alert logged for review. Forward paper trading strictly executes Traps Only (Bear/Bull Trap).`,
+      `• *Status:* Informational alert logged for review. Forward paper trading strictly executes Traps & Verified Synergy.`,
     ].filter(Boolean);
   } else if (fused.decision === "BLOCKED_BY_ACTIVE_TRADE") {
     lines = [
@@ -417,7 +509,7 @@ export async function sendTelegramAlert(fused) {
       `• *Rule:* Strictly 1 position at a time (as backtested). Close existing trade before entering a new one.`,
     ].filter(Boolean);
   } else {
-    // Executable Trap
+    // Executable Trap or Synergy
     const targetLine = fused.target1Price
       ? `• *Targets (Fill-Relative):* T1: \`${fused.target1Price}\` (+${fused.target1Dist ?? "--"} pts / 1.0R) | T2: \`${fused.target2Price}\` (+${fused.target2Dist ?? "--"} pts / 2.0R)`
       : null;
@@ -434,14 +526,14 @@ export async function sendTelegramAlert(fused) {
       `• *Verdict:* ${fused.reasoning}`,
     ].filter(Boolean);
 
-    if (isTrap && fused.decision === "EXECUTE_TIER1_SCOUT") {
+    if ((isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
       lines.push(
-        `\n📋 *EXECUTION & EXIT PROTOCOL (Frozen Baseline):*`,
+        `\n📋 *${isSynergy ? "SYNERGY" : "TRAP"} EXECUTION & EXIT PROTOCOL:*`,
         `1. *Fill:* At market open next bar. Levels are fill-relative:`,
         `   • Stop Loss: Entry ${fused.direction === "LONG" ? "-" : "+"} \`${fused.riskPoints}\` pts`,
         `   • Target 1: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target1Dist}\` pts -> *Scale out 60% & Move SL to Breakeven*`,
         `   • Target 2: Entry ${fused.direction === "LONG" ? "+" : "-"} \`${fused.target2Dist}\` pts -> *Exit remaining 40%*`,
-        `2. *Time-Stop:* Max 20 bars (5 Hours on 15m). Exit at market if open after 20 bars (closed 53% of backtest trades).`,
+        `2. *Time-Stop:* Max 20 bars (5 Hours on 15m) / 15 bars (on 125m). Exit at market if open after max bars.`,
         `3. *Single-Position Rule:* Strictly one trade at a time.`
       );
     }
@@ -1153,16 +1245,18 @@ export default async function handler(req, res) {
     // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
     const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner);
 
-    // 4. Enforce Baseline Paper Trading Policy (Traps Only & Single-Position Rule)
+    // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
     const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
+    const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
+    const isActionable = isTrap || isSynergy;
 
-    if (!isTrap) {
-      // Non-trap signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
+    if (!isActionable) {
+      // Non-actionable signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
       fusedVerdict.decision = "LOG_ONLY";
       fusedVerdict.recommendedLots = 0;
-      fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward baseline paper trading acts on Traps Only (Bear/Bull Trap).`;
+      fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward paper trading executes Traps and Verified Synergy.`;
     } else {
-      // Check Single-Position Rule for Traps
+      // Check Single-Position Rule for Traps & Synergy
       let activeTrade = null;
       if (redis) {
         try {
@@ -1174,8 +1268,8 @@ export default async function handler(req, res) {
       if (activeTrade && activeTrade.active) {
         fusedVerdict.decision = "BLOCKED_BY_ACTIVE_TRADE";
         fusedVerdict.recommendedLots = 0;
-        fusedVerdict.reasoning = `BLOCKED: Active trade already open (${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice}). The tested 15m system strictly enforces one position at a time.`;
-      } else if (fusedVerdict.decision === "EXECUTE_TIER1_SCOUT") {
+        fusedVerdict.reasoning = `BLOCKED: Active trade already open (${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice}). The tested system strictly enforces one position at a time.`;
+      } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
         // Record active trade with 6-hour TTL (24 bars on 15m)
         const activeData = {
           active: true,
