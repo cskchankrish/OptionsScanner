@@ -65,6 +65,105 @@ export function getActiveExpiryDate(contractExpiry) {
   return `${d}-${m}-${y}`;
 }
 
+export function isTodayExpiryDate(expiryStr, currentDate = new Date()) {
+  if (!expiryStr || typeof expiryStr !== "string") return false;
+  const istDate = new Date(currentDate.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const d = String(istDate.getDate()).padStart(2, "0");
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const m = monthNames[istDate.getMonth()];
+  const y = istDate.getFullYear();
+  const todayStr = `${d}-${m}-${y}`;
+  return expiryStr.trim().toLowerCase() === todayStr.toLowerCase();
+}
+
+export function getActiveMonthlyExpiry(expiryDates = [], currentDate = new Date()) {
+  if (!Array.isArray(expiryDates) || expiryDates.length === 0) return "";
+  const istDate = new Date(currentDate.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const dayOfMonth = istDate.getDate();
+  const currentMonthIdx = istDate.getMonth();
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  
+  // Rule: If <= 15th, use current month's monthly expiry. If > 15th, roll to next month's monthly expiry
+  let targetMonthName = monthNames[currentMonthIdx];
+  if (dayOfMonth > 15) {
+    targetMonthName = monthNames[(currentMonthIdx + 1) % 12];
+  }
+  const matching = expiryDates.filter(e => typeof e === "string" && e.includes(`-${targetMonthName}-`));
+  if (matching.length > 0) return matching[matching.length - 1];
+  return expiryDates[expiryDates.length > 2 ? 2 : expiryDates.length - 1] || expiryDates[0] || "";
+}
+
+export function calculateDte(expiryDateStr, currentDate = new Date()) {
+  if (!expiryDateStr || typeof expiryDateStr !== "string") return 0;
+  const parts = expiryDateStr.split("-");
+  if (parts.length < 3) return 0;
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const mIdx = monthNames.indexOf(parts[1]);
+  if (mIdx === -1) return 0;
+  const exp = new Date(Number(parts[2]), mIdx, Number(parts[0]), 15, 30, 0);
+  const now = new Date(currentDate.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const diffMs = exp.getTime() - now.getTime();
+  return Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+}
+
+export function extractOptionChainMetrics(records = [], spot = 25000) {
+  const filteredRows = records.filter(r => {
+    const st = Number(r.strikePrice);
+    return st && Math.abs(st - spot) <= 550;
+  });
+
+  let maxPutDoi = -Infinity;
+  let floorStrike = Math.floor(spot / 100) * 100;
+  let maxCallDoi = -Infinity;
+  let roofStrike = Math.ceil(spot / 100) * 100 + 100;
+
+  let totPutWriting = 0;
+  let totCallWriting = 0;
+  let totPutOI = 0;
+  let totCallOI = 0;
+
+  for (const r of filteredRows) {
+    const strike = Number(r.strikePrice);
+    const pe = r.PE || {};
+    const ce = r.CE || {};
+
+    const pDoi = Number(pe.changeinOpenInterest) || 0;
+    const cDoi = Number(ce.changeinOpenInterest) || 0;
+    const pOi = Number(pe.openInterest) || 0;
+    const cOi = Number(ce.openInterest) || 0;
+
+    totPutOI += pOi;
+    totCallOI += cOi;
+
+    if (pDoi > 0) totPutWriting += pDoi;
+    if (cDoi > 0) totCallWriting += cDoi;
+
+    if (strike <= spot && pDoi > maxPutDoi) {
+      maxPutDoi = pDoi;
+      floorStrike = strike;
+    }
+
+    if (strike >= spot && cDoi > maxCallDoi) {
+      maxCallDoi = cDoi;
+      roofStrike = strike;
+    }
+  }
+
+  const deltaPcr = calculateDeltaPcr(totPutWriting, totCallWriting);
+  const pcr = Number((totPutOI / (totCallOI || 1)).toFixed(2));
+
+  return {
+    totPutWriting,
+    totCallWriting,
+    totPutOI,
+    totCallOI,
+    floorStrike,
+    roofStrike,
+    deltaPcr,
+    pcr,
+  };
+}
+
 export function getMarketSessionInfo() {
   const day = getISTDayOfWeek(); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
   const mins = getISTMinutes();
@@ -1048,9 +1147,21 @@ export function calculateEODDecision({
   dayOfWeek = 5,
   nowMins = 905,
   fusion = null,
+  targetContract = null,
+  isRollover = false,
 }) {
   let score = 0;
   const audit = [];
+
+  // Expiry Day Rollover Protocol Audit
+  if (isRollover && targetContract) {
+    audit.push({
+      label: "Expiry Day Rollover Protocol",
+      status: "NEXT_WEEK_EVALUATED",
+      detail: `Expiry Day active. Evaluated Next Week contract (${targetContract}) for overnight carry instead of expiring 0DTE contracts.`,
+      impact: "Active",
+    });
+  }
 
   // Apply Smart Money Futures Fusion Score Boost (+1 on Bullish Synergy, -1 on Bearish Synergy, -1 on Bull Trap, +1 on Bear Trap)
   if (fusion?.scoreBoost && Number.isFinite(fusion.scoreBoost)) {
@@ -1434,6 +1545,8 @@ export function calculateEODDecision({
     isClosingDataValid,
     lastHourNetDelta,
     fusion,
+    targetContract: targetContract || null,
+    isRollover: Boolean(isRollover),
   };
 }
 
@@ -1636,16 +1749,43 @@ export default async function handler(req, res) {
     });
     if (!contractRes.ok) throw new Error(`contract-info status ${contractRes.status}`);
     const contractData = await contractRes.json();
-    const expiry = contractData.expiryDates?.[0] || "";
+    const expiryDates = contractData.expiryDates || [];
+    const nearExpiry = expiryDates[0] || "";
+    const nextExpiry = expiryDates[1] || "";
+    const monthlyExpiry = getActiveMonthlyExpiry(expiryDates);
+    const isExpiryDay = isTodayExpiryDate(nearExpiry);
+
+    let targetExpiry = nearExpiry;
+    if (req.query?.expiry === "next" && nextExpiry) {
+      targetExpiry = nextExpiry;
+    } else if (req.query?.expiry === "monthly" && monthlyExpiry) {
+      targetExpiry = monthlyExpiry;
+    } else if (req.query?.expiry && expiryDates.includes(req.query.expiry)) {
+      targetExpiry = req.query.expiry;
+    }
 
     // 3. Fetch v3 option chain AND Nifty Futures concurrently via Promise.allSettled
-    const v3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(expiry)}`;
+    const v3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(targetExpiry)}`;
     const futUrl = "https://www.nseindia.com/api/liveEquity-derivatives?index=nse50_fut";
 
-    const [v3Settled, futSettled] = await Promise.allSettled([
+    const fetchPromises = [
       fetch(v3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }),
       fetch(futUrl, { headers: sessionHeaders, signal: AbortSignal.timeout(4500) }),
-    ]);
+    ];
+
+    const currentMinutes = getISTMinutes();
+    const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || req.query?.rollover === "true"));
+    const shouldFetchNextChain = (isAfternoonRollover || req.query?.expiry === "both") && (targetExpiry !== nextExpiry);
+
+    if (shouldFetchNextChain) {
+      const nextV3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(nextExpiry)}`;
+      fetchPromises.push(fetch(nextV3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }));
+    }
+
+    const settledResults = await Promise.allSettled(fetchPromises);
+    const v3Settled = settledResults[0];
+    const futSettled = settledResults[1];
+    const nextSettled = shouldFetchNextChain ? settledResults[2] : null;
 
     if (v3Settled.status !== "fulfilled" || !v3Settled.value.ok) {
       throw new Error(`v3 option chain failed: status ${v3Settled.status === "fulfilled" ? v3Settled.value.status : v3Settled.reason?.message}`);
@@ -1654,8 +1794,21 @@ export default async function handler(req, res) {
 
     const spot = Number(v3Data.records?.underlyingValue) || 25030.35;
     const records = v3Data.filtered?.data || v3Data.records?.data || [];
-    const expiryDate = getActiveExpiryDate(expiry);
+    const expiryDate = getActiveExpiryDate(targetExpiry);
     const timestampStr = v3Data.records?.timestamp || new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
+
+    // Parse Next Expiry metrics if fetched during Expiry Day Rollover
+    let nextMetrics = null;
+    if (nextSettled && nextSettled.status === "fulfilled" && nextSettled.value.ok) {
+      try {
+        const nextV3Data = await nextSettled.value.json();
+        const nextRows = nextV3Data.filtered?.data || nextV3Data.records?.data || [];
+        nextMetrics = extractOptionChainMetrics(nextRows, spot);
+        nextMetrics.expiry = nextExpiry;
+      } catch (e) {
+        console.warn("Next expiry chain parse warning:", e.message);
+      }
+    }
 
     // Parse Nifty Futures with Rollover Protection & Graceful Degradation
     let futuresMetrics = null;
@@ -1820,18 +1973,21 @@ export default async function handler(req, res) {
       intradayHistory: timeline,
     });
 
+    const isEvaluatingNextExpiry = Boolean(isAfternoonRollover && nextMetrics);
     const eodDecision = calculateEODDecision({
       spot,
-      floorStrike,
-      roofStrike,
-      totPutWriting,
-      totCallWriting,
-      pcr,
-      deltaPcr,
+      floorStrike: isEvaluatingNextExpiry ? nextMetrics.floorStrike : floorStrike,
+      roofStrike: isEvaluatingNextExpiry ? nextMetrics.roofStrike : roofStrike,
+      totPutWriting: isEvaluatingNextExpiry ? nextMetrics.totPutWriting : totPutWriting,
+      totCallWriting: isEvaluatingNextExpiry ? nextMetrics.totCallWriting : totCallWriting,
+      pcr: isEvaluatingNextExpiry ? nextMetrics.pcr : pcr,
+      deltaPcr: isEvaluatingNextExpiry ? nextMetrics.deltaPcr : deltaPcr,
       timeline,
       dayOfWeek: getISTDayOfWeek(),
       nowMins: getISTMinutes(),
       fusion,
+      targetContract: isEvaluatingNextExpiry ? nextExpiry : targetExpiry,
+      isRollover: isEvaluatingNextExpiry,
     });
 
     smartMoney.eodDecision = eodDecision;
@@ -1903,6 +2059,32 @@ export default async function handler(req, res) {
       eodHistory,
       intradayTimeline: timeline,
       hasRedis: Boolean(REDIS_URL),
+      rollover: {
+        isExpiryDay,
+        nearExpiry,
+        nextExpiry,
+        monthlyExpiry,
+        activeContract: targetExpiry,
+        isAfternoonRollover,
+        isEvaluatingNextExpiry,
+        nextExpiryMetrics: nextMetrics || null,
+      },
+      swingRadar: {
+        monthlyExpiry,
+        dte: calculateDte(monthlyExpiry),
+        underlyingSpot: spot,
+        futuresBuildup: futuresMetrics?.buildup || "NEUTRAL",
+        futuresBasis: futuresMetrics?.rawBasis || 0,
+        adjustedBasisSpread: futuresMetrics?.adjustedBasisSpread || 0,
+        protocol: "Monthly Expiry (<=15th: current month, >15th: next month) · T+2 Holding Window",
+        executionVehicle: (futuresMetrics?.buildup === "LONG_BUILDUP" || eodDecision.bias === "BULLISH")
+          ? "BULL_CALL_SPREAD (+ATM CE / -OTM CE) [Zero Theta Burn & Gap-Protection]"
+          : (futuresMetrics?.buildup === "SHORT_BUILDUP" || eodDecision.bias === "BEARISH")
+          ? "BEAR_PUT_SPREAD (+ATM PE / -OTM PE) [Zero Theta Burn & Gap-Protection]"
+          : "NEUTRAL_WAIT_FOR_125M_BREAK",
+        timeHorizon: "T+2 Days (6 to 7 bars of 125m)",
+        riskWarning: "Strictly avoid naked OTM option buying overnight due to binary gap risk. Spreads or Deep ITM (Delta >= 0.70) are mandatory.",
+      },
       sessionWindow: {
         isSundayDiwali: sessionInfo.isSunday,
         isSaturday: sessionInfo.isSaturday,

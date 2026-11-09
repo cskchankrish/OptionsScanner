@@ -561,6 +561,11 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
     `• *Spot Index:* \`₹${Math.round(spot)}\` | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
   ];
 
+  if (eodDecision.targetContract) {
+    const rolloverNotice = eodDecision.isRollover ? " 🔄 *(Next-Week Rollover)*" : "";
+    lines.push(`• *Target Contract Expiry:* \`${eodDecision.targetContract}\`${rolloverNotice}`);
+  }
+
   if (isBTST || isSTBT) {
     if (eodDecision.target) lines.push(`• *Target:* \`₹${eodDecision.target}\``);
     if (eodDecision.stopLoss) lines.push(`• *Strict SL:* \`₹${eodDecision.stopLoss}\``);

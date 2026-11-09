@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import {
   calculateEODDecision,
   calculateDeltaPcr,
+  isTodayExpiryDate,
+  getActiveMonthlyExpiry,
+  calculateDte,
+  extractOptionChainMetrics,
   DEFAULT_EOD_SEED_HISTORY
 } from "../api/nifty-oi.js";
 
@@ -593,5 +597,76 @@ test("calculateEODDecision integrates Smart Money Futures Fusion and enforces Be
   assert.ok(fusionAudit, "Must have 5th pillar 'Smart Money Futures Fusion' in audit");
   assert.equal(fusionAudit.status, "BULLISH_VETO");
   assert.equal(fusionAudit.impact, "VETO STBT (Bear Trap)");
+});
+
+test("isTodayExpiryDate correctly identifies today's expiry in IST", () => {
+  const fakeNov9 = new Date("2026-11-09T14:15:00+05:30");
+  assert.equal(isTodayExpiryDate("09-Nov-2026", fakeNov9), true);
+  assert.equal(isTodayExpiryDate("17-Nov-2026", fakeNov9), false);
+  assert.equal(isTodayExpiryDate("", fakeNov9), false);
+  assert.equal(isTodayExpiryDate(null, fakeNov9), false);
+});
+
+test("getActiveMonthlyExpiry selects current month <=15th and rolls to next month >15th", () => {
+  const expiries = [
+    "09-Nov-2026", "17-Nov-2026", "23-Nov-2026",
+    "01-Dec-2026", "08-Dec-2026", "29-Dec-2026",
+    "25-Jan-2027"
+  ];
+
+  // Nov 9 <= 15: Selects 23-Nov-2026 (current month end)
+  const dateBefore15 = new Date("2026-11-09T10:00:00+05:30");
+  assert.equal(getActiveMonthlyExpiry(expiries, dateBefore15), "23-Nov-2026");
+
+  // Nov 16 > 15: Rolls to 29-Dec-2026 (next month end)
+  const dateAfter15 = new Date("2026-11-16T10:00:00+05:30");
+  assert.equal(getActiveMonthlyExpiry(expiries, dateAfter15), "29-Dec-2026");
+});
+
+test("calculateDte calculates days to expiry correctly", () => {
+  const fakeNov9 = new Date("2026-11-09T10:00:00+05:30");
+  assert.equal(calculateDte("09-Nov-2026", fakeNov9), 1);
+  assert.equal(calculateDte("17-Nov-2026", fakeNov9), 9);
+  assert.equal(calculateDte("23-Nov-2026", fakeNov9), 15);
+  assert.equal(calculateDte("", fakeNov9), 0);
+});
+
+test("extractOptionChainMetrics extracts writing, OI, floor, roof, deltaPCR, and PCR", () => {
+  const sampleRecords = [
+    { strikePrice: 24900, PE: { changeinOpenInterest: 20000, openInterest: 80000 }, CE: { changeinOpenInterest: 5000, openInterest: 30000 } },
+    { strikePrice: 25000, PE: { changeinOpenInterest: 15000, openInterest: 50000 }, CE: { changeinOpenInterest: 25000, openInterest: 90000 } },
+    { strikePrice: 25100, PE: { changeinOpenInterest: 2000, openInterest: 10000 }, CE: { changeinOpenInterest: 35000, openInterest: 110000 } }
+  ];
+
+  const metrics = extractOptionChainMetrics(sampleRecords, 25000);
+  assert.equal(metrics.floorStrike, 24900);
+  assert.equal(metrics.roofStrike, 25100);
+  assert.equal(metrics.totPutWriting, 37000);
+  assert.equal(metrics.totCallWriting, 65000);
+  assert.ok(metrics.deltaPcr < 1.0);
+  assert.ok(metrics.pcr < 1.0);
+});
+
+test("calculateEODDecision records Expiry Day Rollover Protocol in audit when isRollover is true", () => {
+  const result = calculateEODDecision({
+    spot: 25000,
+    floorStrike: 24900,
+    roofStrike: 25100,
+    totPutWriting: 40000,
+    totCallWriting: 120000,
+    pcr: 0.75,
+    deltaPcr: 0.40,
+    dayOfWeek: 1, // Monday
+    nowMins: 915,
+    targetContract: "17-Nov-2026",
+    isRollover: true,
+  });
+
+  assert.equal(result.targetContract, "17-Nov-2026");
+  assert.equal(result.isRollover, true);
+  const rolloverAudit = result.audit.find(a => a.label === "Expiry Day Rollover Protocol");
+  assert.ok(rolloverAudit, "Must include Expiry Day Rollover Protocol in audit");
+  assert.equal(rolloverAudit.status, "NEXT_WEEK_EVALUATED");
+  assert.ok(rolloverAudit.detail.includes("17-Nov-2026"));
 });
 
