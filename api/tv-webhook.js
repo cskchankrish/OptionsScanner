@@ -291,21 +291,24 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
   }
 
   // Derive final Stop Loss & Targets
-  const finalSl = cappedSl !== null && cappedSl > 0
+  let finalSl = cappedSl !== null && cappedSl > 0
     ? cappedSl
     : (rawSl !== null && rawSl > 0 ? rawSl : null);
 
-  const finalRiskPts = rDist !== null && rDist > 0
+  let finalRiskPts = rDist !== null && rDist > 0
     ? Math.round(rDist * 100) / 100
     : (finalSl !== null ? Math.abs(Math.round((close - finalSl) * 100) / 100) : null);
 
-  const finalT1Price = t1Price !== null && t1Price > 0
-    ? Math.round(t1Price * 100) / 100
-    : (finalRiskPts !== null && finalSl !== null ? Math.round((dir === "LONG" ? close + finalRiskPts : close - finalRiskPts) * 100) / 100 : null);
-
-  const finalT2Price = t2Price !== null && t2Price > 0
-    ? Math.round(t2Price * 100) / 100
-    : (finalRiskPts !== null && finalSl !== null ? Math.round((dir === "LONG" ? close + 2 * finalRiskPts : close - 2 * finalRiskPts) * 100) / 100 : null);
+  // Guard against inverted Stop Loss (e.g. SL below entry on a short, or SL above entry on a long)
+  if (finalSl !== null && close > 0) {
+    if (dir === "SHORT" && finalSl <= close) {
+      finalRiskPts = finalRiskPts && finalRiskPts > 0 ? finalRiskPts : 70;
+      finalSl = Math.round((close + finalRiskPts) * 100) / 100;
+    } else if (dir === "LONG" && finalSl >= close) {
+      finalRiskPts = finalRiskPts && finalRiskPts > 0 ? finalRiskPts : 70;
+      finalSl = Math.round((close - finalRiskPts) * 100) / 100;
+    }
+  }
 
   const finalT1Dist = t1Dist !== null && t1Dist > 0
     ? Math.round(t1Dist * 100) / 100
@@ -314,6 +317,14 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
   const finalT2Dist = t2Dist !== null && t2Dist > 0
     ? Math.round(t2Dist * 100) / 100
     : (finalRiskPts !== null ? Math.round(2 * finalRiskPts * 100) / 100 : null);
+
+  const finalT1Price = (finalRiskPts !== null && finalSl !== null)
+    ? Math.round((dir === "LONG" ? close + finalT1Dist : close - finalT1Dist) * 100) / 100
+    : null;
+
+  const finalT2Price = (finalRiskPts !== null && finalSl !== null)
+    ? Math.round((dir === "LONG" ? close + finalT2Dist : close - finalT2Dist) * 100) / 100
+    : null;
 
   return {
     timestamp: new Date().toISOString(),

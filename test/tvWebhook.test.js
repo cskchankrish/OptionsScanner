@@ -239,3 +239,23 @@ test("fuseChartWithOptionChain: BEAR_TRAP_BUY preserves exact cappedSl, rDist, a
   assert.equal(res.target1Dist, 64);
   assert.equal(res.target2Dist, 128);
 });
+
+test("fuseChartWithOptionChain: Guards against inverted Stop Loss for SHORT trades (SL must be above entry)", () => {
+  const tv = {
+    dir: "SHORT",
+    grade: "SYNERGY_BEAR",
+    close: 24932.6,
+    sl: 24875.04, // Inverted: below entry price!
+    cappedSl: 24875.04,
+    rDist: 57.56,
+    t1Dist: 57.56,
+    t2Dist: 115.12,
+  };
+
+  const res = fuseChartWithOptionChain(tv, null);
+  // Stop loss must be above entry for a short trade!
+  assert.ok(res.stopLoss > res.entryPrice, `Expected stopLoss (${res.stopLoss}) > entryPrice (${res.entryPrice})`);
+  assert.equal(res.stopLoss, 24990.16); // 24932.6 + 57.56
+  assert.equal(res.target1Price, 24875.04); // 24932.6 - 57.56
+  assert.equal(res.target2Price, 24817.48); // 24932.6 - 115.12
+});

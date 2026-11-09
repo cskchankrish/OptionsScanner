@@ -1811,13 +1811,14 @@ maxStopAtr    = input.float(1.80, "Max Initial Stop Distance Cap (x Chart ATR14)
      tooltip="Caps abnormally wide stops so a distant swing pivot never creates a 300+ pt stop loss.")
 
 f_calcRiskAndTargets(bool _isLong, float _rawSL) =>
-    bool  hasSL   = not na(_rawSL) and _rawSL > 0.0
-    float safeAtr = nz(atr14, close * 0.006)
-    float rawDist = hasSL ? (_isLong ? (close - _rawSL) : (_rawSL - close)) : 0.0
-    float minStop = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
-    float maxStop = math.max(minStop, maxStopAtr * safeAtr)
-    float riskPts = hasSL ? (useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)) : 0.0
-    float effSL   = hasSL ? (_isLong ? (close - riskPts) : (close + riskPts)) : 0.0
+    bool  hasSL     = not na(_rawSL) and _rawSL > 0.0
+    float safeAtr   = nz(atr14, close * 0.006)
+    bool  validSide = hasSL and (_isLong ? _rawSL < close : _rawSL > close)
+    float rawDist   = validSide ? (_isLong ? (close - _rawSL) : (_rawSL - close)) : (1.2 * safeAtr)
+    float minStop   = math.max(syminfo.mintick * 20.0, 0.35 * safeAtr)
+    float maxStop   = math.max(minStop, maxStopAtr * safeAtr)
+    float riskPts   = hasSL ? (useRFloor ? math.min(maxStop, math.max(minStop, rawDist)) : math.max(minStop, rawDist)) : 0.0
+    float effSL     = hasSL ? (_isLong ? (close - riskPts) : (close + riskPts)) : 0.0
     float baseT1  = close * ((_isLong ? t1LPct : t1SPct) / 100.0)
     float baseT2  = close * ((_isLong ? t2LPct : t2SPct) / 100.0)
     float t1Pts   = hasSL ? (useRFloor ? math.max(baseT1, minT1R * riskPts) : baseT1) : 0.0
@@ -1919,10 +1920,13 @@ if bearTrapSig
     alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8, "TRAP", isBottomArmed), alert.freq_once_per_bar_close)
 if bullTrapSig
     alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8, "TRAP", isTopArmed), alert.freq_once_per_bar_close)
+float synSafeAtr = nz(atr14, close * 0.006)
+float synBullSL  = stLine < close ? stLine : (close - 1.2 * synSafeAtr)
+float synBearSL  = stLine > close ? stLine : (close + 1.2 * synSafeAtr)
 if whSendSynergy and isBullSynergy and not isBullSynergy[1]
-    alert(f_json("SYNERGY_BULL", "LONG", stLine, sigCount, 9, "SYNERGY", isBottomArmed), alert.freq_once_per_bar_close)
+    alert(f_json("SYNERGY_BULL", "LONG", synBullSL, sigCount, 9, "SYNERGY", isBottomArmed), alert.freq_once_per_bar_close)
 if whSendSynergy and isBearSynergy and not isBearSynergy[1]
-    alert(f_json("SYNERGY_BEAR", "SHORT", stLine, sigCount, 9, "SYNERGY", isTopArmed), alert.freq_once_per_bar_close)
+    alert(f_json("SYNERGY_BEAR", "SHORT", synBearSL, sigCount, 9, "SYNERGY", isTopArmed), alert.freq_once_per_bar_close)
 
 
 // ═══════════════════════════════════════════════════════════════════
