@@ -226,7 +226,8 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       if (
         severeOppositeCallWriting ||
         liveFutQuad === "SHORT_BUILDUP" ||
-        (deltaPCR !== null && deltaPCR < 0.85)
+        (deltaPCR !== null && deltaPCR < 0.95) ||
+        (nearCallWall && deltaPCR !== null && deltaPCR <= 1.15)
       ) {
         decision = "VETO_DIVERGENT_SYNERGY";
         recommendedLots = 0;
@@ -234,7 +235,7 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
         reason.push(
           `VETOED: Chart flagged Bull Synergy, but real 22-strike Option Chain shows Call Writing resistance (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Futures Short Buildup. Fake bull flow.`
         );
-      } else if (distToRoof !== null && distToRoof < 30 && deltaPCR !== null && deltaPCR < 1.30) {
+      } else if (distToRoof !== null && distToRoof < 50 && deltaPCR !== null && deltaPCR < 1.30) {
         decision = "DOWNGRADE_TO_SCALP";
         recommendedLots = 1;
         tier = "SCALP_ONLY";
@@ -261,8 +262,8 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       if (
         severeOppositePutWriting ||
         liveFutQuad === "LONG_BUILDUP" ||
-        (deltaPCR !== null && deltaPCR > 1.15) ||
-        (distToFloor !== null && Math.abs(distToFloor) <= 40 && deltaPCR !== null && deltaPCR >= 0.90)
+        (deltaPCR !== null && deltaPCR > 1.05) ||
+        (nearPutWall && deltaPCR !== null && deltaPCR >= 0.85)
       ) {
         decision = "VETO_DIVERGENT_SYNERGY";
         recommendedLots = 0;
@@ -270,7 +271,7 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
         reason.push(
           `VETOED: Chart flagged Bear Synergy, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Floor defense near ${floorStrike}. High risk of bounce.`
         );
-      } else if (distToFloor !== null && distToFloor < 30 && deltaPCR !== null && deltaPCR > 0.70) {
+      } else if (distToFloor !== null && distToFloor < 50 && deltaPCR !== null && deltaPCR > 0.70) {
         decision = "DOWNGRADE_TO_SCALP";
         recommendedLots = 1;
         tier = "SCALP_ONLY";
