@@ -94,6 +94,8 @@ breakBars1D   = input.int(2,      "Daily Structural Break Bars (2-Day High/Low)"
      tooltip="On the Daily chart, a bottom/top only confirms when a Daily candle closes beyond the prior 2-Day High/Low AND the Daily 5-EMA.")
 strictBaseFilter = input.bool(true, "Strict Base Filter: Block Weak [Base Breakout · 3/5] Bear Flags", group=GBT,
      tooltip="Validated across 2020-2026: When ON, a pullback base without an SFP Sweep MUST have either RSI Divergence OR reclaim the 34-EMA with a confirmed Pivot, eliminating 3/5 bear-flag bull traps in downtrends.")
+eliminateBaseBreakout = input.bool(true, "Eliminate Naked Base Breakout (Require SFP, RSI Div, or Pivot)", group=GBT,
+     tooltip="Completely eliminates naked 'Base Breakout' signals (Tag 5) that lack SFP sweeps or RSI divergence, which frequently fail or reverse.")
 invertFlagCont   = input.bool(true, "Invert Weak 3/5 Counter-Trend Setups into Trend Continuation Flags", group=GBT,
      tooltip="Converts a weak 3/5 counter-trend bounce in a downtrend into a 'Bear Flag Cont ★' TOP when price rolls over below the 2-bar low & 5/13/34 EMAs (and converts a weak 3/5 pullback in an uptrend into a 'Bull Flag Cont ★' BOTTOM when price breaks above the 2-bar high & 5/13/34 EMAs).")
 useVolFilter  = input.bool(true,  "Include Volume Climax Boost (Futures / Stocks)", group=GBT)
@@ -101,6 +103,12 @@ volMult       = input.float(1.35, "Volume Climax Multiplier (x 20-SMA)", minval=
 swingSlAtr    = input.float(0.35, "Swing Alert SL Buffer (x HTF ATR)", minval=0.10, step=0.05, group=GBT)
 btOverride200 = input.bool(true,  "Override 200-EMA Block when Confirmed Swing Active", group=GBT)
 showSwingLbl  = input.bool(true,  "Show Swing Labels on Chart", group=GBT)
+
+G_LBL = "⑪ Visual Styling & Anti-Collision Label Controls"
+combineMultiLabels = input.bool(true,  "Consolidate Multi-Signal Candle Labels (Anti-Collision)", group=G_LBL,
+     tooltip="When multiple signals fire on the same candle (e.g. Bear Synergy + Bull Trap + Trend Pullback), merges them into a clean, compact single card with hierarchical bullets so labels never overlap.")
+lblSizeInput       = input.string("small", "Swing & Signal Label Size", options=["tiny", "small", "normal"], group=G_LBL,
+     tooltip="Controls font and box size for all Swing Top/Bottom, Trap, and Synergy labels. 'small' or 'tiny' keeps candles clearly visible without clutter.")
 
 GFU = "⑩ Real-Time Smart Money Trap Engine (Real Futures _OI + Webhook Bridge)"
 fuEnabled     = input.bool(true,  "Enable Smart Money Trap Engine", group=GFU,
@@ -326,7 +334,7 @@ atr14 = ta.atr(14)
 //  ⑨ 2-STAGE STRUCTURAL BASE & TOP ENGINE (v3.5 — Validated on 125m & 1D)
 // ═══════════════════════════════════════════════════════════════════
 
-f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult, bool usePrevClosed, bool relaxGate, float extVol, float extVolSma) =>
+f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool noBaseBrk, bool invFlag, bool useVol, float vMult, bool usePrevClosed, bool relaxGate, float extVol, float extVolSma) =>
     float hEma5  = ta.ema(close, 5)
     float hEma13 = ta.ema(close, 13)
     float hEma34 = ta.ema(close, 34)
@@ -407,22 +415,25 @@ f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float str
     var int   topSetupTag = 5
     var int   topSetupSc  = 3
 
-    // When strictBase is ON (default), a Base without SFP must have either RSI Divergence (`divBot`/`divTop`) OR a confirmed Pivot reclaiming the 34-EMA (`pivBot and close > hEma34`), eliminating weak 3/5 bear-flag bull traps!
-    bool validBaseBot = strictBase ? (baseBot and (divBot or volClimax or (pivBot and close > hEma34))) : baseBot
-    bool validBaseTop = strictBase ? (baseTop and (divTop or volClimax or (pivTop and close < hEma34))) : baseTop
+    // When noBaseBrk is true (default ON), naked base breakouts (Tag 5) are eliminated completely!
+    // A pullback base is only armed if confirmed by RSI Divergence (`divBot`/`divTop`) or Volume Climax (`volClimax`).
+    bool validBaseBot = noBaseBrk ? (baseBot and (divBot or volClimax)) :
+         strictBase ? (baseBot and (divBot or volClimax or (pivBot and close > hEma34))) : baseBot
+    bool validBaseTop = noBaseBrk ? (baseTop and (divTop or volClimax)) :
+         strictBase ? (baseTop and (divTop or volClimax or (pivTop and close < hEma34))) : baseTop
     bool validPivBot  = strictBase ? (pivBot  and (divBot or volClimax or minRsi4 <= 34.0 or close > hEma34)) : pivBot
     bool validPivTop  = strictBase ? (pivTop  and (divTop or volClimax or maxRsi4 >= 66.0 or close < hEma34)) : pivTop
 
     if (sfpBot or validPivBot or validBaseBot) and stretchBot and (rsiBotOk or sfpBot or volClimax)
         botSetupLo  := candLo
         botSetupBar := bar_index
-        botSetupTag := (sfpBot and divBot) ? 1 : sfpBot ? 2 : (baseBot and divBot) ? 3 : divBot ? 4 : baseBot ? 5 : 6
+        botSetupTag := (sfpBot and divBot) ? 1 : sfpBot ? 2 : (baseBot and divBot) ? 3 : divBot ? 4 : (noBaseBrk ? 6 : (baseBot ? 5 : 6))
         botSetupSc  := 2 + (divBot ? 1 : 0) + (sfpBot ? 1 : 0) + (pivBot ? 1 : 0) + (volClimax ? 1 : 0)
 
     if (sfpTop or validPivTop or validBaseTop) and stretchTop and (rsiTopOk or sfpTop or volClimax)
         topSetupHi  := candHi
         topSetupBar := bar_index
-        topSetupTag := (sfpTop and divTop) ? 1 : sfpTop ? 2 : (baseTop and divTop) ? 3 : divTop ? 4 : baseTop ? 5 : 6
+        topSetupTag := (sfpTop and divTop) ? 1 : sfpTop ? 2 : (baseTop and divTop) ? 3 : divTop ? 4 : (noBaseBrk ? 6 : (baseTop ? 5 : 6))
         topSetupSc  := 2 + (divTop ? 1 : 0) + (sfpTop ? 1 : 0) + (pivTop ? 1 : 0) + (volClimax ? 1 : 0)
 
     // ── Stage A2: Invert Weak 3/5 Counter-Trend Bounces/Pullbacks into Trend Continuation Flags ──
@@ -572,7 +583,7 @@ float htfExtVolSma = useFutVolHtf ? nz(htfFutVSma_raw, 0.0) : 0.0
 
 [htfState, htfBotLvl, htfTopLvl, htfFireBot, htfFireTop, htfArmBot, htfArmTop, htfAtr, htfTag, htfSc, htfBarIdx, htfScoutBot, htfScoutTop, htfCandLo, htfCandHi, htfScoutKind] = request.security(
      syminfo.tickerid, evalHtf,
-     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult, useClosedPrevHtf, relax125mGate, htfExtVol, htfExtVolSma),
+     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, eliminateBaseBreakout, invertFlagCont, useVolFilter, volMult, useClosedPrevHtf, relax125mGate, htfExtVol, htfExtVolSma),
      lookahead=barmerge.lookahead_on)
 
 // ── Track Unique HTF Confirmations on Current Chart ──
@@ -626,20 +637,7 @@ f_swReasonText(int t) =>
         7 => "Trend Flag Cont ★"
         =>   "Pivot Breakout"
 
-// Pinpoint Label Placement via yloc.belowbar / yloc.abovebar
-if showSwingLbl and confirmBottom
-    string swKindBotTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
-    label.new(bar_index, low,
-         "🟢 " + swKindBotTxt + " (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
-         "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
-         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00c853, 0), textcolor=color.white, size=size.normal)
-
-if showSwingLbl and confirmTop
-    string swKindTopTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
-    label.new(bar_index, high,
-         "🔴 " + swKindTopTxt + " (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
-         "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
-         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#d50000, 0), textcolor=color.white, size=size.normal)
+// Note: Swing Top / Bottom & Trend Pullback labels are rendered in the unified Anti-Collision engine below (line ~1100)
 
 
 // ───────────────────────────────────────────────────────────────────
@@ -1091,25 +1089,101 @@ float synBearSL  = stLine > close ? stLine : (close + 1.2 * synSafeAtr)
 bool  synergyBullTrigger = isBullSynergy and not isBullSynergy[1]
 bool  synergyBearTrigger = isBearSynergy and not isBearSynergy[1]
 
-if showTrapLbl and bullTrapSig
-    label.new(bar_index, high,
-         "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bullTrapSL)) + "\n" + bullTrapTag,
-         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#f57c00, 0), textcolor=color.white, size=size.small)
+// ───────────────────────────────────────────────────────────────────
+//  INTELLIGENT ANTI-COLLISION SIGNAL LABEL ENGINE (Zero Overlap)
+// ───────────────────────────────────────────────────────────────────
+string effLblSize = lblSizeInput == "tiny" ? size.tiny :
+     lblSizeInput == "normal" ? size.normal : size.small
 
-if showTrapLbl and bearTrapSig
-    label.new(bar_index, low,
-         "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bearTrapSL)) + "\n" + bearTrapTag,
-         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00bfa5, 0), textcolor=color.white, size=size.small)
+bool hasSwTop     = showSwingLbl and confirmTop
+bool hasSwBot     = showSwingLbl and confirmBottom
+bool hasBullTrap  = showTrapLbl and bullTrapSig
+bool hasBearTrap  = showTrapLbl and bearTrapSig
+bool hasBearSyn   = showTrapLbl and synergyBearTrigger
+bool hasBullSyn   = showTrapLbl and synergyBullTrigger
 
-if showTrapLbl and synergyBullTrigger
-    label.new(bar_index, low,
-         "⚡ BULL SYNERGY (BTST)\nFut Long + Put Blitz\nSL: " + str.tostring(math.round(synBullSL)),
-         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#2e7d32, 0), textcolor=color.white, size=size.small)
+int bearCount = (hasSwTop ? 1 : 0) + (hasBullTrap ? 1 : 0) + (hasBearSyn ? 1 : 0)
+int bullCount = (hasSwBot ? 1 : 0) + (hasBearTrap ? 1 : 0) + (hasBullSyn ? 1 : 0)
 
-if showTrapLbl and synergyBearTrigger
-    label.new(bar_index, high,
-         "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synBearSL)),
-         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#c62828, 0), textcolor=color.white, size=size.small)
+// ── BEARISH SIGNALS (Above Bar) ──
+if bearCount > 0
+    if combineMultiLabels and bearCount > 1
+        string consolidatedBearText = "🔴 BEAR CONFLUENCE [" + str.tostring(bearCount) + "x]"
+        if hasBearSyn
+            consolidatedBearText += "\n⚡ BEAR SYNERGY (STBT) · SL: " + str.tostring(math.round(synBearSL))
+        if hasBullTrap
+            consolidatedBearText += "\n🚨 BULL TRAP · SL: " + str.tostring(math.round(bullTrapSL)) + " " + bullTrapTag
+        if hasSwTop
+            string swTopKind = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
+            consolidatedBearText += "\n📉 " + swTopKind + " (" + evalHtfLabel + ") · Top: " + str.tostring(math.round(activeSwingLvl)) + " [" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
+        label.new(bar_index, high, consolidatedBearText,
+             yloc=yloc.abovebar, style=label.style_label_down,
+             color=color.new(#b71c1c, 0), textcolor=color.white, size=effLblSize)
+    else
+        int bearIdx = 0
+        if hasBearSyn
+            float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
+            label.new(bar_index, yPos,
+                 "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synBearSL)),
+                 yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
+                 color=color.new(#c62828, 0), textcolor=color.white, size=effLblSize)
+            bearIdx += 1
+        if hasBullTrap
+            float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
+            label.new(bar_index, yPos,
+                 "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bullTrapSL)) + "\n" + bullTrapTag,
+                 yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
+                 color=color.new(#f57c00, 0), textcolor=color.white, size=effLblSize)
+            bearIdx += 1
+        if hasSwTop
+            float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
+            string swKindTopTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING TOP"
+            label.new(bar_index, yPos,
+                 "🔴 " + swKindTopTxt + " (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
+                 "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
+                 yloc=combineMultiLabels ? yloc.abovebar : yloc.price, style=label.style_label_down,
+                 color=color.new(#d50000, 0), textcolor=color.white, size=effLblSize)
+            bearIdx += 1
+
+// ── BULLISH SIGNALS (Below Bar) ──
+if bullCount > 0
+    if combineMultiLabels and bullCount > 1
+        string consolidatedBullText = "🟢 BULL CONFLUENCE [" + str.tostring(bullCount) + "x]"
+        if hasBullSyn
+            consolidatedBullText += "\n⚡ BULL SYNERGY (BTST) · SL: " + str.tostring(math.round(synBullSL))
+        if hasBearTrap
+            consolidatedBullText += "\n🟢 BEAR TRAP · SL: " + str.tostring(math.round(bearTrapSL)) + " " + bearTrapTag
+        if hasSwBot
+            string swBotKind = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
+            consolidatedBullText += "\n📈 " + swBotKind + " (" + evalHtfLabel + ") · Base: " + str.tostring(math.round(activeSwingLvl)) + " [" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]"
+        label.new(bar_index, low, consolidatedBullText,
+             yloc=yloc.belowbar, style=label.style_label_up,
+             color=color.new(#1b5e20, 0), textcolor=color.white, size=effLblSize)
+    else
+        int bullIdx = 0
+        if hasBullSyn
+            float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
+            label.new(bar_index, yPos,
+                 "⚡ BULL SYNERGY (BTST)\nFut Long + Put Blitz\nSL: " + str.tostring(math.round(synBullSL)),
+                 yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
+                 color=color.new(#2e7d32, 0), textcolor=color.white, size=effLblSize)
+            bullIdx += 1
+        if hasBearTrap
+            float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
+            label.new(bar_index, yPos,
+                 "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bearTrapSL)) + "\n" + bearTrapTag,
+                 yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
+                 color=color.new(#00bfa5, 0), textcolor=color.white, size=effLblSize)
+            bullIdx += 1
+        if hasSwBot
+            float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
+            string swKindBotTxt = activeSwingTag == 7 ? "TREND PULLBACK" : "SWING BOTTOM"
+            label.new(bar_index, yPos,
+                 "🟢 " + swKindBotTxt + " (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
+                 "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
+                 yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
+                 color=color.new(#00c853, 0), textcolor=color.white, size=effLblSize)
+            bullIdx += 1
 
 
 // ───────────────────────────────────────────────────────────────────
