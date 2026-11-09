@@ -137,7 +137,7 @@ extRoofStrike = input.float(0.0,  "Manual Mode: Options Call Wall (Roof Strike, 
      tooltip="Key Options Call Wall / Roof resistance strike from OptionsScanner (e.g., 25200). 0 = Auto-calculate from Spot.")
 extFloorStrike= input.float(0.0,  "Manual Mode: Options Put Wall (Floor Strike, 0=Auto)", group=GFU,
      tooltip="Key Options Put Wall / Floor support strike from OptionsScanner (e.g., 25000). 0 = Auto-calculate from Spot.")
-showTrapLbl   = input.bool(true,  "Plot Real-Time 🚨 BULL TRAP / 🟢 BEAR TRAP Signals", group=GFU)
+showTrapLbl   = input.bool(true,  "Plot Real-Time 🚨 TRAP & ⚡ SYNERGY Signals on Chart", group=GFU)
 whSendSynergy = input.bool(true,  "Fire Webhook on Smart Money BTST/STBT Synergy", group=GFU,
      tooltip="When enabled, fires SYNERGY_BULL / SYNERGY_BEAR JSON webhooks to your OptionsScanner bridge when High-Conviction Futures + Options Synergy triggers.")
 G_EXP = "🧪 Experimental HTF Toggles (Default OFF - Frozen for Nov 9 Baseline)"
@@ -1082,6 +1082,12 @@ string fusionVerdict = bullTrapSig ? "🚨 BULL TRAP (Scout Short)" :
      futQuadrant == "SHORT_COVERING" ? "🚀 SHORT COVERING" :
      futQuadrant == "LONG_UNWINDING" ? "⚠ LONG UNWINDING" : "⚪ NEUTRAL / CHOP"
 
+float synSafeAtr = nz(atr14, close * 0.006)
+float synBullSL  = stLine < close ? stLine : (close - 1.2 * synSafeAtr)
+float synBearSL  = stLine > close ? stLine : (close + 1.2 * synSafeAtr)
+bool  synergyBullTrigger = isBullSynergy and not isBullSynergy[1]
+bool  synergyBearTrigger = isBearSynergy and not isBearSynergy[1]
+
 if showTrapLbl and bullTrapSig
     label.new(bar_index, high,
          "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bullTrapSL)) + "\n" + bullTrapTag,
@@ -1091,6 +1097,16 @@ if showTrapLbl and bearTrapSig
     label.new(bar_index, low,
          "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bearTrapSL)) + "\n" + bearTrapTag,
          yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00bfa5, 0), textcolor=color.white, size=size.small)
+
+if showTrapLbl and synergyBullTrigger
+    label.new(bar_index, low,
+         "⚡ BULL SYNERGY (BTST)\nFut Long + Put Blitz\nSL: " + str.tostring(math.round(synBullSL)),
+         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#2e7d32, 0), textcolor=color.white, size=size.small)
+
+if showTrapLbl and synergyBearTrigger
+    label.new(bar_index, high,
+         "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synBearSL)),
+         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#c62828, 0), textcolor=color.white, size=size.small)
 
 
 // ───────────────────────────────────────────────────────────────────
@@ -1920,12 +1936,9 @@ if bearTrapSig
     alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8, "TRAP", isBottomArmed), alert.freq_once_per_bar_close)
 if bullTrapSig
     alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8, "TRAP", isTopArmed), alert.freq_once_per_bar_close)
-float synSafeAtr = nz(atr14, close * 0.006)
-float synBullSL  = stLine < close ? stLine : (close - 1.2 * synSafeAtr)
-float synBearSL  = stLine > close ? stLine : (close + 1.2 * synSafeAtr)
-if whSendSynergy and isBullSynergy and not isBullSynergy[1]
+if whSendSynergy and synergyBullTrigger
     alert(f_json("SYNERGY_BULL", "LONG", synBullSL, sigCount, 9, "SYNERGY", isBottomArmed), alert.freq_once_per_bar_close)
-if whSendSynergy and isBearSynergy and not isBearSynergy[1]
+if whSendSynergy and synergyBearTrigger
     alert(f_json("SYNERGY_BEAR", "SHORT", synBearSL, sigCount, 9, "SYNERGY", isTopArmed), alert.freq_once_per_bar_close)
 
 
