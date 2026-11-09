@@ -147,6 +147,8 @@ extFloorStrike= input.float(0.0,  "Manual Mode: Options Put Wall (Floor Strike, 
 showTrapLbl   = input.bool(true,  "Plot Real-Time 🚨 TRAP & ⚡ SYNERGY Signals on Chart", group=GFU)
 whSendSynergy = input.bool(true,  "Fire Webhook on Smart Money BTST/STBT Synergy", group=GFU,
      tooltip="When enabled, fires SYNERGY_BULL / SYNERGY_BEAR JSON webhooks to your OptionsScanner bridge when High-Conviction Futures + Options Synergy triggers.")
+whSendExits   = input.bool(true,  "Fire Webhook on T1 Target & Trade Exits", group=GFU,
+     tooltip="When enabled, automatically notifies Telegram and logs to CSV when Target 1 is achieved (moving SL to cost), when Target 2 is hit, or when trade closes.")
 G_EXP = "🧪 Experimental HTF Toggles (Default OFF - Frozen for Nov 9 Baseline)"
 relax125mGate = input.bool(false, "Item 3: Relax 125m Confirmation (EMA5 Rising instead of EMA13)", group=G_EXP,
      tooltip="A/B Experiment: When ON, relaxes 125m confirmation gate to match Daily (close > 5-EMA and 5-EMA rising). Default OFF to protect baseline.")
@@ -2225,8 +2227,14 @@ if trDir != 0
                 else if trBarsHeld >= effMaxHold or not inAuditWindow
                     trTimeStopPend := true
 
+        if not wasHitT1 and trHitT1 and whSendExits
+            alert(f_json("TARGET_1_HIT", trDir == 1 ? "LONG" : "SHORT", trEntry, 0, 0, "EXIT", false), alert.freq_once_per_bar)
+
     // Record completed trade metrics (with nz() guard so early-bar na never poisons statSumInitR with NaN!)
     if closedNow
+        if whSendExits
+            string exitReasonStr = (trDir == 1 ? (high >= trT2) : (low <= trT2)) ? "TARGET_2_HIT" : (trHitT1 ? "BREAKEVEN_STOP" : (trTimeStopPend ? "TIME_STOP_EXIT" : "STOP_LOSS_HIT"))
+            alert(f_json(exitReasonStr, trDir == 1 ? "LONG" : "SHORT", close, 0, 0, "EXIT", false), alert.freq_once_per_bar)
         float safeInitR = math.max(1.0, nz(trInitRisk, nz(atr14, close * 0.005)))
         float safeT1Dist = math.max(1.0, nz(math.abs(trT1 - trEntry), close * 0.005))
         statN        += 1

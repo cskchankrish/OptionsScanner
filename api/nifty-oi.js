@@ -1843,6 +1843,12 @@ export default async function handler(req, res) {
       eodDecision,
     });
 
+    // Automatic lifecycle check on active TradingView trade against live spot
+    try {
+      const { evaluateActiveTradeLifecycle } = await import("./tv-webhook.js");
+      await evaluateActiveTradeLifecycle(spot);
+    } catch (e) {}
+
     const payload = {
       success: true,
       isLive: true,

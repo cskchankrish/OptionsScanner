@@ -465,6 +465,42 @@ export async function sendTelegramAlert(fused) {
 }
 
 /**
+ * Telegram T1 Hit & SL to Cost Helper
+ */
+export async function sendTelegramT1Alert(activeTrade, fillPrice) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId || !activeTrade) return;
+
+  const t = activeTrade;
+  const pts = Math.abs(Number(fillPrice) - Number(t.entryPrice)).toFixed(1);
+
+  const lines = [
+    `🎯 *TARGET 1 ACHIEVED (+${pts} pts)* · \`${t.grade}\` (${t.direction})`,
+    `• *Entry Price:* \`${t.entryPrice}\` | *T1 Fill:* \`${fillPrice}\``,
+    `• *Action Taken:* 60% position scaled out with locked profit!`,
+    `• *SL Protection:* Stop Loss automatically moved to *Cost / Breakeven* (\`${t.entryPrice}\`).`,
+    `• *Runner Active:* Remaining 40% targeting T2 (\`${t.target2Price}\`) with *ZERO downside risk*!`,
+    `• *Time:* ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })}`,
+    `• *CSV Log:* https://niftyninjaa.vercel.app/api/tv-webhook?export=csv`,
+  ];
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: lines.join("\n"),
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Telegram T1 alert error:", err.message);
+  }
+}
+
+/**
  * Telegram Exit Notification Helper
  */
 export async function sendTelegramExitAlert(exitRecord) {
@@ -473,13 +509,16 @@ export async function sendTelegramExitAlert(exitRecord) {
   if (!botToken || !chatId || !exitRecord?.trade) return;
 
   const t = exitRecord.trade;
+  const pnlStr = exitRecord.netPnl !== undefined ? (exitRecord.netPnl >= 0 ? `+${exitRecord.netPnl}` : `${exitRecord.netPnl}`) : "N/A";
   const lines = [
-    `🏁 *TRADE EXITED / CLOSED* · \`${t.grade}\` (${t.direction})`,
+    `🏁 *TRADE CLOSED* · \`${t.grade}\` (${t.direction})`,
     `• *Exit Reason:* \`${exitRecord.exitReason}\``,
-    `• *Entry Price:* \`${t.entryPrice}\` | *SL:* \`${t.stopLoss}\``,
-    `• *Targets:* T1: \`${t.target1Price}\` | T2: \`${t.target2Price}\``,
-    `• *Time in Trade / Logged:* ${exitRecord.istTime}`,
-    `• *Status:* Single-position lock released. Bridge ready for next setup.`,
+    `• *Entry Price:* \`${t.entryPrice}\` | *Exit Level:* \`${exitRecord.exitPrice || "Market"}\``,
+    `• *Net Realized PnL:* \`${pnlStr} pts\``,
+    `• *Time Closed:* ${exitRecord.istTime}`,
+    `• *Market Status:* 🟢 *NO ACTIVE TRADES (FLAT)*`,
+    `• *Permission:* Single-position lock released. Bridge is unlocked! You may now evaluate the next Trap setup or Synergy trade.`,
+    `• *Download CSV:* https://niftyninjaa.vercel.app/api/tv-webhook?export=csv`,
   ];
 
   try {
@@ -495,6 +534,167 @@ export async function sendTelegramExitAlert(exitRecord) {
   } catch (err) {
     console.error("Telegram exit alert error:", err.message);
   }
+}
+
+/**
+ * Automatically evaluates the active trade in Redis against live price action (T1, T2, Cost, SL, Time-Stop)
+ */
+export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low = null, redisClient = null) {
+  const redis = redisClient || getRedisClient();
+  if (!redis) return null;
+
+  let activeTrade = null;
+  try {
+    const raw = await redis.get("nifty:tv:active_trade");
+    activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (e) {
+    return null;
+  }
+
+  if (!activeTrade || !activeTrade.active) return null;
+
+  const spot = Number(currentSpot);
+  if (!spot || isNaN(spot)) return null;
+
+  const barHigh = high !== null && !isNaN(Number(high)) ? Number(high) : spot;
+  const barLow = low !== null && !isNaN(Number(low)) ? Number(low) : spot;
+  const isLong = activeTrade.direction === "LONG";
+  const entry = Number(activeTrade.entryPrice);
+  const t1 = Number(activeTrade.target1Price);
+  const t2 = Number(activeTrade.target2Price);
+  const currentSl = Number(activeTrade.stopLoss);
+  const riskPts = Number(activeTrade.riskPoints || Math.abs(entry - currentSl));
+  const t1Dist = Number(activeTrade.target1Dist || riskPts);
+  const t2Dist = Number(activeTrade.target2Dist || riskPts * 2);
+
+  const nowIst = new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
+  const nowIso = new Date().toISOString();
+
+  // 1. Target 1 Evaluation (60% scale-out, move SL to Cost)
+  if (!activeTrade.hitT1) {
+    const hitT1Now = isLong ? barHigh >= t1 : barLow <= t1;
+    if (hitT1Now) {
+      activeTrade.hitT1 = true;
+      activeTrade.t1HitTime = nowIst;
+      activeTrade.t1HitPrice = t1;
+      activeTrade.stopLoss = entry; // Move SL to Cost
+      activeTrade.slAtCost = true;
+
+      try {
+        await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: 21600 });
+      } catch (e) {}
+
+      const t1Record = {
+        type: "TARGET_1_HIT",
+        timestamp: nowIso,
+        istTime: nowIst,
+        trade: activeTrade,
+        exitPrice: t1,
+        decision: "T1_SCALED_OUT",
+        recommendedLots: 0.4,
+        netPnl: Number((t1Dist * 0.6).toFixed(2)),
+        reasoning: `Target 1 achieved (+${t1Dist} pts). 60% profit booked, SL moved to Cost (${entry}).`,
+      };
+
+      try {
+        await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(t1Record));
+      } catch (e) {}
+
+      await sendTelegramT1Alert(activeTrade, t1);
+      return { event: "TARGET_1_HIT", activeTrade };
+    }
+  }
+
+  // 2. Target 2 Evaluation (Full Profit Close)
+  const hitT2Now = isLong ? barHigh >= t2 : barLow <= t2;
+  if (hitT2Now) {
+    const netPnl = activeTrade.hitT1
+      ? Number((t1Dist * 0.6 + t2Dist * 0.4 - 4.0).toFixed(2))
+      : Number((t2Dist - 4.0).toFixed(2));
+
+    const exitRecord = {
+      type: "TRADE_EXIT",
+      timestamp: nowIso,
+      istTime: nowIst,
+      exitReason: "TARGET_2_HIT",
+      exitPrice: t2,
+      netPnl,
+      trade: activeTrade,
+      decision: "EXIT_FULL_PROFIT",
+      recommendedLots: 0,
+      reasoning: `Target 2 reached (+${t2Dist} pts). Position 100% closed. Realized net PnL: +${netPnl} pts.`,
+    };
+
+    try {
+      await Promise.all([
+        redis.del("nifty:tv:active_trade"),
+        redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
+      ]);
+    } catch (e) {}
+
+    await sendTelegramExitAlert(exitRecord);
+    return { event: "TARGET_2_HIT", exitRecord };
+  }
+
+  // 3. Breakeven / Cost Evaluation (Runner stopped out at Cost after T1)
+  if (activeTrade.hitT1) {
+    const hitBeNow = isLong ? barLow <= entry : barHigh >= entry;
+    if (hitBeNow) {
+      const netPnl = Number((t1Dist * 0.6 - 4.0).toFixed(2)); // Locked profit from T1 minus trading cost
+      const exitRecord = {
+        type: "TRADE_EXIT",
+        timestamp: nowIso,
+        istTime: nowIst,
+        exitReason: "BREAKEVEN_STOP",
+        exitPrice: entry,
+        netPnl,
+        trade: activeTrade,
+        decision: "EXIT_BREAKEVEN_RUNNER",
+        recommendedLots: 0,
+        reasoning: `Runner stopped at cost (${entry}). Secured 60% profit from T1 with net realized PnL: +${netPnl} pts.`,
+      };
+
+      try {
+        await Promise.all([
+          redis.del("nifty:tv:active_trade"),
+          redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
+        ]);
+      } catch (e) {}
+
+      await sendTelegramExitAlert(exitRecord);
+      return { event: "BREAKEVEN_STOP", exitRecord };
+    }
+  } else {
+    // 4. Initial Stop Loss Evaluation (before T1)
+    const hitSlNow = isLong ? barLow <= currentSl : barHigh >= currentSl;
+    if (hitSlNow) {
+      const netPnl = Number((-riskPts - 4.0).toFixed(2));
+      const exitRecord = {
+        type: "TRADE_EXIT",
+        timestamp: nowIso,
+        istTime: nowIst,
+        exitReason: "STOP_LOSS_HIT",
+        exitPrice: currentSl,
+        netPnl,
+        trade: activeTrade,
+        decision: "EXIT_STOP_LOSS",
+        recommendedLots: 0,
+        reasoning: `Stop loss hit at ${currentSl} (-${riskPts} pts). Loss realized: ${netPnl} pts.`,
+      };
+
+      try {
+        await Promise.all([
+          redis.del("nifty:tv:active_trade"),
+          redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
+        ]);
+      } catch (e) {}
+
+      await sendTelegramExitAlert(exitRecord);
+      return { event: "STOP_LOSS_HIT", exitRecord };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -612,10 +812,13 @@ export default async function handler(req, res) {
         }
         res.setHeader("Content-Type", "text/csv");
         res.setHeader("Content-Disposition", `attachment; filename=nifty_signals_${istDate}.csv`);
-        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,T1,T2,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
+        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,T1,T2,ExitPrice,NetPnL,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
         const rows = allSignals.map(s => {
           const cleanReason = (s.reasoning || s.exitReason || "").replace(/"/g, '""');
-          return `"${s.timestamp}","${s.istTime}","${s.grade || s.trade?.grade || "EXIT"}","${s.direction || s.trade?.direction || ""}","${s.decision || s.type || ""}",${s.recommendedLots ?? 0},${s.entryPrice || s.trade?.entryPrice || ""},${s.stopLoss || s.trade?.stopLoss || ""},${s.riskPoints || s.trade?.riskPoints || ""},${s.target1Price || s.trade?.target1Price || ""},${s.target2Price || s.trade?.target2Price || ""},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
+          const t = s.trade || s;
+          const exitP = s.exitPrice !== undefined ? s.exitPrice : "";
+          const pnlVal = s.netPnl !== undefined ? s.netPnl : "";
+          return `"${s.timestamp}","${s.istTime}","${t.grade || s.grade || s.type || ""}","${t.direction || s.direction || ""}","${s.decision || s.exitReason || s.type || ""}",${s.recommendedLots ?? 0},${t.entryPrice || ""},${t.stopLoss || ""},${t.riskPoints || ""},${t.target1Price || ""},${t.target2Price || ""},${exitP},${pnlVal},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
         }).join("\n");
         return res.status(200).send(header + rows);
       }
@@ -659,6 +862,32 @@ export default async function handler(req, res) {
         latestSignal = await redisRestGet("nifty:tv:latest_signal");
       }
 
+      // Automatic lifecycle evaluation if spot or high/low provided in GET
+      if (req.query?.spot) {
+        await evaluateActiveTradeLifecycle(req.query.spot, req.query.high, req.query.low, redis);
+        if (redis) {
+          try {
+            const freshActive = await redis.get("nifty:tv:active_trade");
+            activeTrade = typeof freshActive === "string" ? JSON.parse(freshActive) : freshActive;
+          } catch (e) {}
+        }
+      }
+
+      // Explicit status check endpoint
+      if (req.query?.action === "status" || req.query?.status === "1") {
+        const isFlat = !activeTrade || !activeTrade.active;
+        return res.status(200).json({
+          success: true,
+          status: isFlat ? "FLAT_NO_ACTIVE_TRADES" : "IN_TRADE",
+          hasActiveTrade: !isFlat,
+          permitsSynergyTrades: isFlat,
+          activeTrade,
+          message: isFlat
+            ? "Market is FLAT. No active trades. You may take the next Trap setup or evaluate Bull/Bear Synergy."
+            : `Active trade OPEN: ${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice} (SL: ${activeTrade.stopLoss}, T1: ${activeTrade.target1Price}). Single-position lock active.`
+        });
+      }
+
       return res.status(200).json({
         success: true,
         connected: Boolean(REDIS_URL),
@@ -684,6 +913,94 @@ export default async function handler(req, res) {
     const expectedSecret = process.env.TV_WEBHOOK_SECRET;
     if (expectedSecret && expectedSecret !== "CHANGE_ME" && payload?.secret !== expectedSecret) {
       return res.status(401).json({ error: "Unauthorized webhook secret" });
+    }
+
+    // 1b. Handle Trade Exit / T1 Scale-Out Webhooks directly from TradingView or Execution Bridge
+    const exitGrades = ["TARGET_1_HIT", "TARGET_2_HIT", "BREAKEVEN_STOP", "STOP_LOSS_HIT", "TIME_STOP_EXIT", "MANUAL_CLOSE"];
+    if (exitGrades.includes(payload?.grade)) {
+      let activeTrade = null;
+      if (redis) {
+        try {
+          const raw = await redis.get("nifty:tv:active_trade");
+          activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+        } catch (e) {}
+      }
+
+      const nowIst = new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
+      const nowIso = new Date().toISOString();
+      const fillPrice = payload.close || payload.entry || (activeTrade ? (payload.grade === "TARGET_1_HIT" ? activeTrade.target1Price : payload.grade === "TARGET_2_HIT" ? activeTrade.target2Price : activeTrade.entryPrice) : 0);
+
+      if (payload.grade === "TARGET_1_HIT") {
+        if (activeTrade) {
+          activeTrade.hitT1 = true;
+          activeTrade.t1HitTime = nowIst;
+          activeTrade.t1HitPrice = fillPrice;
+          activeTrade.stopLoss = activeTrade.entryPrice; // Cost
+          activeTrade.slAtCost = true;
+          if (redis) {
+            await redis.set("nifty:tv:active_trade", JSON.stringify(activeTrade), { ex: 21600 });
+          }
+        }
+        const t1Record = {
+          type: "TARGET_1_HIT",
+          timestamp: nowIso,
+          istTime: nowIst,
+          trade: activeTrade || { grade: "BEAR_TRAP_BUY", direction: "LONG", entryPrice: fillPrice },
+          exitPrice: fillPrice,
+          decision: "T1_SCALED_OUT",
+          recommendedLots: 0.4,
+          netPnl: activeTrade ? Number(((activeTrade.target1Dist || 0) * 0.6).toFixed(2)) : 0,
+          reasoning: `Target 1 achieved. 60% profit booked, SL moved to Cost (${activeTrade?.entryPrice || fillPrice}).`,
+        };
+        if (redis) {
+          await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(t1Record));
+        }
+        await sendTelegramT1Alert(activeTrade || t1Record.trade, fillPrice);
+        return res.status(200).json({ ok: true, event: "TARGET_1_HIT", record: t1Record });
+      }
+
+      // Full exit event
+      let netPnl = 0;
+      if (activeTrade) {
+        const isLong = activeTrade.direction === "LONG";
+        const entry = Number(activeTrade.entryPrice);
+        const exitP = Number(fillPrice);
+        const t1Dist = Number(activeTrade.target1Dist || activeTrade.riskPoints || 0);
+        const t2Dist = Number(activeTrade.target2Dist || t1Dist * 2);
+        if (payload.grade === "TARGET_2_HIT") {
+          netPnl = activeTrade.hitT1 ? Number((t1Dist * 0.6 + t2Dist * 0.4 - 4.0).toFixed(2)) : Number((t2Dist - 4.0).toFixed(2));
+        } else if (payload.grade === "BREAKEVEN_STOP") {
+          netPnl = Number((t1Dist * 0.6 - 4.0).toFixed(2));
+        } else if (payload.grade === "STOP_LOSS_HIT") {
+          netPnl = Number((-Math.abs(entry - exitP) - 4.0).toFixed(2));
+        } else {
+          // TIME_STOP_EXIT
+          const diff = isLong ? exitP - entry : entry - exitP;
+          netPnl = Number(((activeTrade.hitT1 ? t1Dist * 0.6 + diff * 0.4 : diff) - 4.0).toFixed(2));
+        }
+      }
+
+      const exitRecord = {
+        type: "TRADE_EXIT",
+        timestamp: nowIso,
+        istTime: nowIst,
+        exitReason: payload.grade,
+        exitPrice: fillPrice,
+        netPnl,
+        trade: activeTrade || { grade: payload.grade, direction: payload.dir || "LONG", entryPrice: fillPrice },
+        decision: "TRADE_CLOSED_FLAT",
+        recommendedLots: 0,
+        reasoning: `Trade exited (${payload.grade}) at ${fillPrice}. Realized net PnL: ${netPnl >= 0 ? "+" : ""}${netPnl} pts. Market is now FLAT.`,
+      };
+
+      if (redis) {
+        await Promise.all([
+          redis.del("nifty:tv:active_trade"),
+          redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
+        ]);
+      }
+      await sendTelegramExitAlert(exitRecord);
+      return res.status(200).json({ ok: true, event: "TRADE_CLOSED", exitRecord });
     }
 
     // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis

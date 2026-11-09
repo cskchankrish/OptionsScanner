@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fuseChartWithOptionChain, getIstDateString } from "../api/tv-webhook.js";
+import { fuseChartWithOptionChain, getIstDateString, evaluateActiveTradeLifecycle } from "../api/tv-webhook.js";
 
 test("getIstDateString returns YYYY-MM-DD format", () => {
   const d = getIstDateString();
@@ -258,4 +258,130 @@ test("fuseChartWithOptionChain: Guards against inverted Stop Loss for SHORT trad
   assert.equal(res.stopLoss, 24990.16); // 24932.6 + 57.56
   assert.equal(res.target1Price, 24875.04); // 24932.6 - 57.56
   assert.equal(res.target2Price, 24817.48); // 24932.6 - 115.12
+});
+
+test("evaluateActiveTradeLifecycle: Long trade triggers T1, moves SL to cost", async () => {
+  const trade = {
+    active: true,
+    grade: "BEAR_TRAP_BUY",
+    direction: "LONG",
+    entryPrice: 24908,
+    target1Price: 25045,
+    target2Price: 25182,
+    stopLoss: 24771,
+    riskPoints: 137,
+    target1Dist: 137,
+    target2Dist: 274,
+    hitT1: false,
+  };
+
+  let store = { "nifty:tv:active_trade": JSON.stringify(trade) };
+  let list = [];
+  const mockRedis = {
+    async get(k) { return store[k] || null; },
+    async set(k, v) { store[k] = v; return "OK"; },
+    async del(k) { delete store[k]; return 1; },
+    async lpush(k, v) { list.unshift(v); return list.length; },
+  };
+
+  const res = await evaluateActiveTradeLifecycle(25050, 25055, 24908, mockRedis);
+  assert.equal(res?.event, "TARGET_1_HIT");
+  assert.equal(res?.activeTrade.hitT1, true);
+  assert.equal(res?.activeTrade.stopLoss, 24908); // SL moved to cost!
+  assert.equal(res?.activeTrade.slAtCost, true);
+  assert.equal(list.length, 1);
+});
+
+test("evaluateActiveTradeLifecycle: Long trade after T1 triggers Breakeven exit at cost", async () => {
+  const trade = {
+    active: true,
+    grade: "BEAR_TRAP_BUY",
+    direction: "LONG",
+    entryPrice: 24908,
+    target1Price: 25045,
+    target2Price: 25182,
+    stopLoss: 24908, // At cost
+    riskPoints: 137,
+    target1Dist: 137,
+    target2Dist: 274,
+    hitT1: true,
+    slAtCost: true,
+  };
+
+  let store = { "nifty:tv:active_trade": JSON.stringify(trade) };
+  let list = [];
+  const mockRedis = {
+    async get(k) { return store[k] || null; },
+    async set(k, v) { store[k] = v; return "OK"; },
+    async del(k) { delete store[k]; return 1; },
+    async lpush(k, v) { list.unshift(v); return list.length; },
+  };
+
+  const res = await evaluateActiveTradeLifecycle(24890, 25050, 24889, mockRedis);
+  assert.equal(res?.event, "BREAKEVEN_STOP");
+  assert.equal(res?.exitRecord.exitReason, "BREAKEVEN_STOP");
+  assert.equal(res?.exitRecord.exitPrice, 24908);
+  assert.ok(res?.exitRecord.netPnl > 70); // 137 * 0.6 - 4 = ~78.2 pts profit
+  assert.equal(store["nifty:tv:active_trade"], undefined); // Position closed & deleted!
+  assert.equal(list.length, 1);
+});
+
+test("evaluateActiveTradeLifecycle: Long trade triggers Target 2 full profit exit", async () => {
+  const trade = {
+    active: true,
+    grade: "BEAR_TRAP_BUY",
+    direction: "LONG",
+    entryPrice: 24908,
+    target1Price: 25045,
+    target2Price: 25182,
+    stopLoss: 24908,
+    riskPoints: 137,
+    target1Dist: 137,
+    target2Dist: 274,
+    hitT1: true,
+  };
+
+  let store = { "nifty:tv:active_trade": JSON.stringify(trade) };
+  let list = [];
+  const mockRedis = {
+    async get(k) { return store[k] || null; },
+    async set(k, v) { store[k] = v; return "OK"; },
+    async del(k) { delete store[k]; return 1; },
+    async lpush(k, v) { list.unshift(v); return list.length; },
+  };
+
+  const res = await evaluateActiveTradeLifecycle(25190, 25195, 25000, mockRedis);
+  assert.equal(res?.event, "TARGET_2_HIT");
+  assert.equal(res?.exitRecord.exitReason, "TARGET_2_HIT");
+  assert.equal(store["nifty:tv:active_trade"], undefined); // Trade closed!
+});
+
+test("evaluateActiveTradeLifecycle: Long trade hits initial SL before T1", async () => {
+  const trade = {
+    active: true,
+    grade: "BEAR_TRAP_BUY",
+    direction: "LONG",
+    entryPrice: 24908,
+    target1Price: 25045,
+    target2Price: 25182,
+    stopLoss: 24771,
+    riskPoints: 137,
+    target1Dist: 137,
+    target2Dist: 274,
+    hitT1: false,
+  };
+
+  let store = { "nifty:tv:active_trade": JSON.stringify(trade) };
+  let list = [];
+  const mockRedis = {
+    async get(k) { return store[k] || null; },
+    async set(k, v) { store[k] = v; return "OK"; },
+    async del(k) { delete store[k]; return 1; },
+    async lpush(k, v) { list.unshift(v); return list.length; },
+  };
+
+  const res = await evaluateActiveTradeLifecycle(24760, 24908, 24750, mockRedis);
+  assert.equal(res?.event, "STOP_LOSS_HIT");
+  assert.equal(res?.exitRecord.exitReason, "STOP_LOSS_HIT");
+  assert.equal(store["nifty:tv:active_trade"], undefined);
 });
