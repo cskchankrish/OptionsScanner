@@ -155,8 +155,8 @@ resetNow       = input.bool(false, "↺ Reset Range + Counter NOW", group=G6)
 megaBreakAlone = input.bool(true, "MEGA fires on range break alone", group=G6)
 
 G7 = "Display Options"
-displayMode = input.string("Full", "Dashboard Display Mode",
-     options=["Full", "Compact", "Don't Show"], group=G7)
+displayMode = input.string("Minimal (125m Swing & OI)", "Dashboard Display Mode",
+     options=["Minimal (125m Swing & OI)", "Full (24 Rows)", "Compact (14 Rows)", "Don't Show"], group=G7)
 tablePos = input.string("Top Right", "Dashboard Position",
      options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=G7)
 showEmas  = input.bool(true, "Show EMA 13/34 lines",          group=G7)
@@ -167,7 +167,8 @@ showBox   = input.bool(true, "Show range box (Intraday)",     group=G7)
 showLines = input.bool(true, "Show boundary lines (Intraday)",group=G7)
 
 isDontShow = displayMode == "Don't Show"
-isCompact  = displayMode == "Compact"
+isMinimal  = displayMode == "Minimal (125m Swing & OI)"
+isCompact  = displayMode == "Compact (14 Rows)"
 
 // Auto-route HTF: Pure "D" on Daily chart, "125" (or "77"/"55" for 385m Futures) on Intraday charts
 string evalHtf = isDailyChart ? "D" :
@@ -1413,7 +1414,7 @@ if barstate.islast
     if cfgKey != lastCfg or na(dash)
         if not na(dash)
             table.delete(dash)
-        int nRows = isDontShow ? 1 : isCompact ? 14 : 24
+        int nRows = isDontShow ? 1 : isMinimal ? 3 : isCompact ? 14 : 24
         dash := table.new(tPos, 3, nRows,
              bgcolor      = isDontShow ? CTRAN : color.new(#0a1520, 5),
              border_width = isDontShow ? 0 : 1,
@@ -1425,7 +1426,38 @@ if barstate.islast
     if isDontShow
         table.cell(dash, 0, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
         table.cell(dash, 1, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
-        table.cell(dash, 2, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
+        table.cell(dash, 2, 0, "", bgcolor=CTRAN, text_size=size.tiny)
+
+    else if isMinimal
+        // Row 0: Header - Ticker, Timeframe, Spot Close
+        table.cell(dash, 0, 0, syminfo.ticker + " · " + timeframe.period + " (" + evalHtfLabel + ")", 
+             text_color=CW, bgcolor=CH, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 0, str.tostring(math.round(close)), 
+             text_color=CW, bgcolor=CH, text_size=size.small)
+        table.cell(dash, 2, 0, netDir == 1 ? "▲ LONG" : netDir == -1 ? "▼ SHORT" : "─ NEUTRAL", 
+             text_color=CW, bgcolor=dirBg, text_size=size.small)
+
+        // Row 1: Structural HTF Swing (125m Bot / Top)
+        swStat = isBottomActive ? "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+             isTopActive    ? "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+             isBottomArmed  ? "⏳ " + evalHtfLabel + " BOT SETUP" :
+             isTopArmed     ? "⏳ " + evalHtfLabel + " TOP SETUP" :
+             "✓ " + evalHtfLabel + " Structural Engine"
+        swStatusColor = isBottomActive or isTopActive ? (isBottomActive ? CB : CR) : (isBottomArmed or isTopArmed ? CY : CD)
+        table.cell(dash, 0, 1, swStat, 
+             text_color=CW, bgcolor=swStatusColor, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 1, isBottomActive ? "BOT CONFIRMED" : isTopActive ? "TOP CONFIRMED" : isBottomArmed or isTopArmed ? "WAIT BREAK" : "NEUTRAL", 
+             text_color=CW, bgcolor=CD, text_size=size.tiny)
+        table.cell(dash, 2, 1, activeSwingLvl > 0 ? ("Lvl " + str.tostring(math.round(activeSwingLvl))) : ("SL " + str.tostring(math.round(stLine))), 
+             text_color=CGr, bgcolor=CD, text_size=size.tiny)
+
+        // Row 2: Smart Money Flow / OI Fusion & Basis
+        table.cell(dash, 0, 2, fusionVerdict + " [" + futOiSource + "]", 
+             text_color=CW, bgcolor=bullTrapSig or isBearSynergy ? CR : bearTrapSig or isBullSynergy ? CB : CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 2, futQuadrant, 
+             text_color=CW, bgcolor=futQuadrant == "LONG_BUILDUP" ? CB : futQuadrant == "SHORT_BUILDUP" ? CR : CD, text_size=size.tiny)
+        table.cell(dash, 2, 2, "OI " + (effOiChgPct >= 0 ? "+" : "") + str.tostring(effOiChgPct, "0.0") + "% · B " + (rawBasis >= 0 ? "+" : "") + str.tostring(rawBasis, "0.0"), 
+             text_color=rawBasis >= 0 ? color.new(#a5d6a7,0) : color.new(#ef9a9a,0), bgcolor=CD, text_size=size.tiny)
 
     else if not isCompact
         table.cell(dash,0,0,"  "+syminfo.ticker+" · SD v4.3 Real-OI",   text_color=CW, bgcolor=CH, text_size=size.small, text_halign=text.align_left)
