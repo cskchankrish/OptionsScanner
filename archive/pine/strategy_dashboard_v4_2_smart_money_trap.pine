@@ -1,0 +1,1763 @@
+// ═══════════════════════════════════════════════════════════════════
+//  Strategy Dashboard v3.5 (125m & Daily Structural Turn Edition)
+//  • Validated against Aug-Nov 2026 NIFTY 50 Daily & 125m price action:
+//      - Eliminates false downtrend bottoms (Sep 10, Sep 15, Sep 25)
+//        by requiring a 2-Stage Structural Breakout Turn:
+//        (1) HTF Exhaustion Setup (SFP Sweep, Pivot, or Pullback Base)
+//        (2) Mandatory Structural Break (`close > 5-EMA`, `close > prior
+//            N-bar High`, and on 125m `close > 13-EMA`)
+//      - Eliminates false mid-rally tops (Oct 30 13:25) by requiring
+//        `close < 5-EMA`, `close < prior N-bar Low`, and `close < 13-EMA`
+//      - Captures Higher-Low Pullback Bases on Daily (Oct 23-27 after
+//        Oct 19 Top) using 7-Day Wave Drop (`>= 1.25x ATR`) + 2-Day
+//        High + 5-EMA Breakout
+//      - Standard candle formation set as default (`casGapFix = false`)
+//  • Auto-switches between Pure 1D on Daily Chart and 125m on Intraday
+//  • Pinpoint Label Placement (`yloc.belowbar` / `yloc.abovebar`)
+//  • Strict Pine v6 5-space continuation formatting (zero CE10156)
+// ═══════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("Strategy Dashboard v4.2 (Smart Money Futures + Options Real-Time Trap Engine)",
+     shorttitle       = "SD v4.2 Trap",
+     overlay          = true,
+     max_bars_back    = 500,
+     max_lines_count  = 150,
+     max_labels_count = 150)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  TIMEFRAME & SESSION GATES
+// ───────────────────────────────────────────────────────────────────
+
+isDailyChart = timeframe.isdaily
+isIntraday   = timeframe.isintraday
+
+
+// ───────────────────────────────────────────────────────────────────
+//  INPUTS
+// ───────────────────────────────────────────────────────────────────
+
+GW = "⓪ Webhook & Security"
+webhookSecret = input.string("REPLACE_WITH_NEW_ROTATED_SECRET", "Webhook Secret", group=GW,
+     tooltip="Paste your rotated webhook secret here. Never hardcode secrets in the source code.")
+
+G1 = "① EMA Crossover (13/34)"
+shortLen = input.int(13, "Short EMA Length", minval=1, group=G1)
+longLen  = input.int(34, "Long EMA Length",  minval=1, group=G1)
+
+G2 = "② Supertrend (ATR Mode)"
+stMult = input.float(3.0, "ATR Multiplier", step=0.5, group=G2)
+stPd   = input.int(5,     "ATR Period",               group=G2)
+
+G3 = "③ Daily EMA"
+dLen = input.int(5, "EMA Length (HLC3 source)", minval=1, group=G3)
+
+G4 = "④ Ichimoku Cloud"
+iConv  = input.int(13, "Conversion Line Length",      minval=1, group=G4)
+iBase  = input.int(3,  "Base Line Length",            minval=1, group=G4)
+iSpanB = input.int(13, "Leading Span B Length",       minval=1, group=G4)
+iDisp  = input.int(16, "Lagging Span (Displacement)", minval=1, group=G4)
+
+G5 = "⑤⑥⑦⑧ EMA Filters — 89 & 200"
+ema89Len   = input.int(89,  "89 EMA Length",             minval=1, group=G5)
+ema200Len  = input.int(200, "200 EMA Length",            minval=1, group=G5)
+show89Band = input.bool(true, "Show 89 EMA band (Intraday)", group=G5)
+show200    = input.bool(true, "Show 200 EMA line (Intraday)", group=G5)
+
+GP = "CPR & Pivot Levels"
+showCPR    = input.bool(true,  "Show CPR (current period only)", group=GP,
+     tooltip="Central Pivot Range = TC, PP, BC. Drawn only for the current Day / Week / Month.")
+showDCpr   = input.bool(true,  "Daily CPR",   group=GP)
+showWCpr   = input.bool(true,  "Weekly CPR",  group=GP)
+showMCpr   = input.bool(true,  "Monthly CPR", group=GP)
+showCPRlbl = input.bool(true,  "Show CPR labels", group=GP)
+showRS     = input.bool(false, "Show R/S levels (daily, current day only)", group=GP,
+     tooltip="Optional. Shows R1, R2, S1, S2 for the current day only. Off by default.")
+
+GBT = "⑨ Concrete Base & Top Engine (125m Intraday / Pure 1D on Daily)"
+btEnabled     = input.bool(true,  "Enable Base & Top Engine", group=GBT)
+sessionType   = input.string("Standard 375m (125m HTF / 15m Exec)", "Session & HTF Alignment",
+     options=["Standard 375m (125m HTF / 15m Exec)", "Extended 385m Futures (77m HTF / 11m Exec)", "Extended 385m Futures (55m HTF / 11m Exec)"], group=GBT,
+     tooltip="Standard 375m (09:15-15:30) uses 125m (3 bars/day). For 385m Futures (09:15-15:40) on an 11m chart, 77m (5 bars/day) or 55m (7 bars/day) divides 385 evenly. On the Daily chart, it ALWAYS uses pure 1D structure.")
+lookback125   = input.int(9,      "125m Lookback Bars (9 = 3 Trading Days)", minval=4, maxval=30, group=GBT)
+lookback1D    = input.int(7,      "Daily Lookback Bars (7 Trading Days)",    minval=4, maxval=20, group=GBT)
+pivLeft       = input.int(3,      "Pivot Left Bars (HTF Structure)",         minval=2, maxval=10, group=GBT)
+pivRight      = input.int(1,      "Pivot Right Bars (Fast 1-Bar Turn)",      minval=1, maxval=3,  group=GBT)
+atrStretch    = input.float(1.0,  "Min 34-EMA Stretch (x HTF ATR)",          minval=0.5, step=0.1, group=GBT)
+waveImpulse   = input.float(1.25, "OR Prior Wave Pullback/Rally (x HTF ATR)", minval=0.8, step=0.05, group=GBT,
+     tooltip="Catches Higher-Low pullback bases (like Oct 23-27 on Daily and 125m) where price pulls back >= 1.25x ATR from the recent high without needing a deep crash below the 34-EMA.")
+breakBars125  = input.int(3,      "125m Structural Break Bars (3 = 1 Day High/Low)", minval=1, maxval=6, group=GBT,
+     tooltip="To prevent false bottoms on 1-day bear bounces (Sep 10/15/25) and false mid-day tops (Oct 30 13:25), 125m must close beyond the prior 3-bar (1-day) High/Low AND the 5 & 13 EMAs.")
+breakBars1D   = input.int(2,      "Daily Structural Break Bars (2-Day High/Low)", minval=1, maxval=5, group=GBT,
+     tooltip="On the Daily chart, a bottom/top only confirms when a Daily candle closes beyond the prior 2-Day High/Low AND the Daily 5-EMA.")
+strictBaseFilter = input.bool(true, "Strict Base Filter: Block Weak [Base Breakout · 3/5] Bear Flags", group=GBT,
+     tooltip="Validated across 2020-2026: When ON, a pullback base without an SFP Sweep MUST have either RSI Divergence OR reclaim the 34-EMA with a confirmed Pivot, eliminating 3/5 bear-flag bull traps in downtrends.")
+invertFlagCont   = input.bool(true, "Invert Weak 3/5 Counter-Trend Setups into Trend Continuation Flags", group=GBT,
+     tooltip="Converts a weak 3/5 counter-trend bounce in a downtrend into a 'Bear Flag Cont ★' TOP when price rolls over below the 2-bar low & 5/13/34 EMAs (and converts a weak 3/5 pullback in an uptrend into a 'Bull Flag Cont ★' BOTTOM when price breaks above the 2-bar high & 5/13/34 EMAs).")
+useVolFilter  = input.bool(true,  "Include Volume Climax Boost (Futures / Stocks)", group=GBT)
+volMult       = input.float(1.35, "Volume Climax Multiplier (x 20-SMA)", minval=1.1, step=0.05, group=GBT)
+swingSlAtr    = input.float(0.35, "Swing Alert SL Buffer (x HTF ATR)", minval=0.10, step=0.05, group=GBT)
+btOverride200 = input.bool(true,  "Override 200-EMA Block when Confirmed Swing Active", group=GBT)
+showSwingLbl  = input.bool(true,  "Show Swing Labels on Chart", group=GBT)
+
+GFU = "⑩ Real-Time Smart Money Trap Engine (Futures + Options)"
+fuEnabled     = input.bool(true,  "Enable Smart Money Trap Engine", group=GFU,
+     tooltip="Captures Bull Traps (Price Up on Short-Covering + Call Wall Rejection) and Bear Traps (Price Down on Long-Unwinding + Put Wall Absorption) in real-time on the chart.")
+futTicker     = input.symbol("NSE:NIFTY1!", "Nifty Futures Ticker (Near Continuous)", group=GFU,
+     tooltip="TradingView continuous futures symbol (e.g., NSE:NIFTY1! or BANKNIFTY1!).")
+dteInput      = input.int(12,     "Days to Futures Expiry (DTE for Fair Basis)", minval=0, maxval=35, group=GFU)
+trapLookback  = input.int(24,     "Trap Lookback Bars (24 = 1 Full 15m Day)", minval=6, maxval=125, group=GFU,
+     tooltip="Evaluates intraday traps against the 24-bar (1 full trading day / 6 hrs on 15m, or 72 bars on 5m) structural extremes.")
+extOptMode    = input.string("Auto (Futures Orderflow + Basis Proxy)", "Options Corridor Feed Mode",
+     options=["Auto (Futures Orderflow + Basis Proxy)", "Manual / Scanner Override (From OptionsScanner)"], group=GFU)
+extDeltaPcr   = input.float(1.00, "Manual Mode: Live Corridor ΔPCR", minval=0.10, maxval=5.00, step=0.05, group=GFU)
+extRoofStrike = input.float(0.0,  "Manual Mode: Options Call Wall (Roof Strike, 0=Auto)", group=GFU,
+     tooltip="Key Options Call Wall / Roof resistance strike from OptionsScanner (e.g., 25200). 0 = Auto-calculate from Spot.")
+extFloorStrike= input.float(0.0,  "Manual Mode: Options Put Wall (Floor Strike, 0=Auto)", group=GFU,
+     tooltip="Key Options Put Wall / Floor support strike from OptionsScanner (e.g., 25000). 0 = Auto-calculate from Spot.")
+showTrapLbl   = input.bool(true,  "Plot Real-Time 🚨 BULL TRAP / 🟢 BEAR TRAP Signals", group=GFU)
+
+G6 = "Range & Signal Settings"
+megaMinSigs    = input.int(6,   "Signals needed before watch",   minval=2, maxval=20, group=G6)
+megaMaxSigs    = input.int(9,   "Max signals before auto-reset", minval=3, maxval=30, group=G6)
+minRangePts    = input.int(150, "Minimum valid range (pts)",     minval=50,  group=G6)
+maxRangePts    = input.int(600, "Maximum valid range (pts)",     minval=200, group=G6)
+resetNow       = input.bool(false, "↺ Reset Range + Counter NOW", group=G6)
+megaBreakAlone = input.bool(true, "MEGA fires on range break alone", group=G6)
+
+G7 = "Display Options"
+displayMode = input.string("Full", "Dashboard Display Mode",
+     options=["Full", "Compact", "Don't Show"], group=G7)
+tablePos = input.string("Top Right", "Dashboard Position",
+     options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=G7)
+showEmas  = input.bool(true, "Show EMA 13/34 lines",          group=G7)
+showST    = input.bool(true, "Show Supertrend line",          group=G7)
+showCloud = input.bool(true, "Show Ichimoku Cloud fill",      group=G7)
+showD5    = input.bool(true, "Show Daily 5-EMA line",         group=G7)
+showBox   = input.bool(true, "Show range box (Intraday)",     group=G7)
+showLines = input.bool(true, "Show boundary lines (Intraday)",group=G7)
+
+isDontShow = displayMode == "Don't Show"
+isCompact  = displayMode == "Compact"
+
+// Auto-route HTF: Pure "D" on Daily chart, "125" (or "77"/"55" for 385m Futures) on Intraday charts
+string evalHtf = isDailyChart ? "D" :
+     sessionType == "Extended 385m Futures (77m HTF / 11m Exec)" ? "77" :
+     sessionType == "Extended 385m Futures (55m HTF / 11m Exec)" ? "55" : "125"
+
+string evalHtfLabel = isDailyChart ? "1D" : evalHtf + "m"
+int    activeLb     = isDailyChart ? lookback1D   : lookback125
+int    activeBrk    = isDailyChart ? breakBars1D  : breakBars125
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ① EMA 13/34 & 5-EMA
+// ───────────────────────────────────────────────────────────────────
+
+ema5     = ta.ema(close, 5)
+shortEma = ta.ema(close, shortLen)
+longEma  = ta.ema(close, longLen)
+posCross = ta.crossover(shortEma, longEma)
+negCross = ta.crossunder(shortEma, longEma)
+
+var float buyRef  = na
+var float sellRef = na
+if posCross
+    buyRef  := high
+    sellRef := na
+if negCross
+    sellRef := low
+    buyRef  := na
+
+buySignal  = not na(buyRef)  and high > buyRef
+sellSignal = not na(sellRef) and low  < sellRef
+if buySignal
+    buyRef  := na
+if sellSignal
+    sellRef := na
+
+emaBull = shortEma > longEma
+emaBear = shortEma < longEma
+newSig  = buySignal or sellSignal
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ② SUPERTREND
+// ───────────────────────────────────────────────────────────────────
+
+[stLine, stDir] = ta.supertrend(stMult, stPd)
+stBull = stDir < 0
+stBear = stDir > 0
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ③ DAILY 5-EMA (HLC3)
+// ───────────────────────────────────────────────────────────────────
+
+d5Ema  = request.security(syminfo.tickerid, "D", ta.ema(hlc3, dLen)[1], lookahead=barmerge.lookahead_on)
+d5Bull = close > nz(d5Ema, close)
+d5Bear = close < nz(d5Ema, close)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ④ ICHIMOKU CLOUD
+// ───────────────────────────────────────────────────────────────────
+
+donchian(len) => math.avg(ta.lowest(len), ta.highest(len))
+convLine  = donchian(iConv)
+baseLine  = donchian(iBase)
+leadA     = math.avg(convLine, baseLine)
+leadB     = donchian(iSpanB)
+cTop      = math.max(leadA[iDisp - 1], leadB[iDisp - 1])
+cBot      = math.min(leadA[iDisp - 1], leadB[iDisp - 1])
+ichiAbove = close > cTop
+ichiBelow = close < cBot
+
+p1 = plot(showCloud ? leadA : na, "Span A", color.new(color.green, 90), offset=iDisp - 1, display=display.none)
+p2 = plot(showCloud ? leadB : na, "Span B", color.new(color.red,   90), offset=iDisp - 1, display=display.none)
+fill(p1, p2, leadA > leadB ? color.new(#00897b, 88) : color.new(#c62828, 88))
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ⑤ CHART 200 EMA & ⑦ CHART 89 EMA CHANNEL
+// ───────────────────────────────────────────────────────────────────
+
+ema200_15    = ta.ema(close, ema200Len)
+e200_15_bull = close > ema200_15
+e200_15_bear = close < ema200_15
+
+ema89h_15     = ta.ema(high, ema89Len)
+ema89l_15     = ta.ema(low,  ema89Len)
+e89_15_above  = close > ema89h_15
+e89_15_inside = close >= ema89l_15 and close <= ema89h_15
+e89_15_below  = close < ema89l_15
+
+
+// ───────────────────────────────────────────────────────────────────
+//  ⑥ 5m 200 EMA & ⑧ 5m 89 EMA CHANNEL
+// ───────────────────────────────────────────────────────────────────
+
+f_5m_emas(int l13, int l34, int l89, int l200) =>
+    [ta.ema(close, l13), ta.ema(close, l34), ta.ema(high, l89), ta.ema(low, l89), ta.ema(close, l200)]
+
+[ema13_5, ema34_5, ema89h_5, ema89l_5, ema200_5] = request.security(
+     syminfo.tickerid, "5", f_5m_emas(shortLen, longLen, ema89Len, ema200Len), lookahead=barmerge.lookahead_off)
+
+e200_5_bull  = close > nz(ema200_5, close)
+e200_5_bear  = close < nz(ema200_5, close)
+e89_5_above  = close > nz(ema89h_5, close)
+e89_5_inside = close >= nz(ema89l_5, close) and close <= nz(ema89h_5, close)
+e89_5_below  = close < nz(ema89l_5, close)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  CPR + PIVOT CALCULATIONS (Previous Period H, L, C)
+// ───────────────────────────────────────────────────────────────────
+
+[dPivH, dPivL, dPivC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+dPP   = (dPivH + dPivL + dPivC) / 3
+dBC   = (dPivH + dPivL) / 2
+dTC   = 2 * dPP - dBC
+dR1   = 2 * dPP - dPivL
+dR2   = dPP + (dPivH - dPivL)
+dS1   = 2 * dPP - dPivH
+dS2   = dPP - (dPivH - dPivL)
+dCPRw = math.abs(dTC - dBC)
+
+[wPivH, wPivL, wPivC] = request.security(syminfo.tickerid, "W", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+wPP = (wPivH + wPivL + wPivC) / 3
+wBC = (wPivH + wPivL) / 2
+wTC = 2 * wPP - wBC
+wS1 = 2 * wPP - wPivH
+wS2 = wPP - (wPivH - wPivL)
+wR1 = 2 * wPP - wPivL
+wR2 = wPP + (wPivH - wPivL)
+
+[mPivH, mPivL, mPivC] = request.security(syminfo.tickerid, "M", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+mPP = (mPivH + mPivL + mPivC) / 3
+mBC = (mPivH + mPivL) / 2
+mTC = 2 * mPP - mBC
+mS1 = 2 * mPP - mPivH
+mR1 = 2 * mPP - mPivL
+
+dPPbull = close > dPP
+wPPbull = close > wPP
+mPPbull = close > mPP
+
+newD  = timeframe.change("D")
+newW  = timeframe.change("W")
+newM  = timeframe.change("M")
+atr14 = ta.atr(14)
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ⑨ 2-STAGE STRUCTURAL BASE & TOP ENGINE (v3.5 — Validated on 125m & 1D)
+// ═══════════════════════════════════════════════════════════════════
+
+f_structuralSwingEngine(bool isD, int lb, int pL, int pR, int brkBars, float stretchM, float waveM, bool strictBase, bool invFlag, bool useVol, float vMult) =>
+    float hEma5  = ta.ema(close, 5)
+    float hEma13 = ta.ema(close, 13)
+    float hEma34 = ta.ema(close, 34)
+    float hAtr   = ta.atr(14)
+    float hRsi   = ta.rsi(close, 14)
+    float vSma   = ta.sma(volume, 20)
+
+    float prevLo = ta.lowest(low, lb)[1]
+    float prevHi = ta.highest(high, lb)[1]
+    float lo4    = ta.lowest(low, 4)
+    float hi4    = ta.highest(high, 4)
+
+    // 1. SFP Liquidity Sweep
+    bool sfpBot = not na(prevLo) and low < prevLo and close > prevLo
+    bool sfpTop = not na(prevHi) and high > prevHi and close < prevHi
+
+    // 2. Confirmed Pivot High/Low
+    float rawHi  = ta.pivothigh(high, pL, pR)
+    float rawLo  = ta.pivotlow(low,   pL, pR)
+    bool  pivBot = not na(rawLo)
+    bool  pivTop = not na(rawHi)
+
+    // 3. Multi-Bar Pullback Base / Resistance Hold (4-Year Validated: requires actual 3-bar test of 5-EMA + Wave Pullback)
+    float waveDrop  = ta.highest(high, lb) - lo4
+    float waveRally = hi4 - ta.lowest(low, lb)
+    bool  dipToEma5 = ta.lowest(low, 3)   <= hEma5
+    bool  popToEma5 = ta.highest(high, 3) >= hEma5
+    bool  baseBot   = (waveDrop  >= waveM * hAtr) and dipToEma5 and (close > hEma5)
+    bool  baseTop   = (waveRally >= waveM * hAtr) and popToEma5 and (close < hEma5)
+
+    // Strictly anchor to local 4-bar extreme so chained setups never carry stale multi-week lows/highs
+    float candLo = (sfpBot or baseBot) ? math.min(low, lo4)  : math.min(low[pR], lo4)
+    float candHi = (sfpTop or baseTop) ? math.max(high, hi4) : math.max(high[pR], hi4)
+
+    bool stretchBot = ((hEma34 - candLo) >= stretchM * hAtr) or (waveDrop  >= waveM * hAtr)
+    bool stretchTop = ((candHi - hEma34) >= stretchM * hAtr) or (waveRally >= waveM * hAtr)
+
+    // Decoupled Structural Memory for RSI Divergence
+    var float refLoP   = na
+    var float refLoRsi = na
+    var int   refLoBar = na
+    var float refHiP   = na
+    var float refHiRsi = na
+    var int   refHiBar = na
+
+    bool divBot = not na(refLoBar) and (bar_index - refLoBar <= 36) and (bar_index > refLoBar + 1) and
+         (candLo <= refLoP + 0.50 * hAtr) and (hRsi > refLoRsi + 1.5)
+    bool divTop = not na(refHiBar) and (bar_index - refHiBar <= 36) and (bar_index > refHiBar + 1) and
+         (candHi >= refHiP - 0.50 * hAtr) and (hRsi < refHiRsi - 1.5)
+
+    if pivBot or low <= nz(prevLo, low)
+        refLoP   := candLo
+        refLoRsi := hRsi
+        refLoBar := bar_index
+
+    if pivTop or high >= nz(prevHi, high)
+        refHiP   := candHi
+        refHiRsi := hRsi
+        refHiBar := bar_index
+
+    float minRsi4   = ta.lowest(hRsi, 4)
+    float maxRsi4   = ta.highest(hRsi, 4)
+    bool  rsiBotOk  = divBot or (minRsi4 <= 42.0 and hRsi > minRsi4 + 1.5)
+    bool  rsiTopOk  = divTop or (maxRsi4 >= 58.0 and hRsi < maxRsi4 - 1.5)
+    bool  hasVol    = not na(volume) and volume > 0 and not na(vSma) and vSma > 0
+    bool  volClimax = useVol and hasVol and (volume >= vMult * vSma)
+
+    // ── Stage A: Arm Setup Zone (Stays valid for up to 4 HTF bars while waiting for Structural Break) ──
+    var int   botSetupBar = -999
+    var float botSetupLo  = na
+    var int   botSetupTag = 5
+    var int   botSetupSc  = 3
+
+    var int   topSetupBar = -999
+    var float topSetupHi  = na
+    var int   topSetupTag = 5
+    var int   topSetupSc  = 3
+
+    // When strictBase is ON (default), a Base without SFP must have either RSI Divergence (`divBot`/`divTop`) OR a confirmed Pivot reclaiming the 34-EMA (`pivBot and close > hEma34`), eliminating weak 3/5 bear-flag bull traps!
+    bool validBaseBot = strictBase ? (baseBot and (divBot or volClimax or (pivBot and close > hEma34))) : baseBot
+    bool validBaseTop = strictBase ? (baseTop and (divTop or volClimax or (pivTop and close < hEma34))) : baseTop
+    bool validPivBot  = strictBase ? (pivBot  and (divBot or volClimax or minRsi4 <= 34.0 or close > hEma34)) : pivBot
+    bool validPivTop  = strictBase ? (pivTop  and (divTop or volClimax or maxRsi4 >= 66.0 or close < hEma34)) : pivTop
+
+    if (sfpBot or validPivBot or validBaseBot) and stretchBot and (rsiBotOk or sfpBot or volClimax)
+        botSetupLo  := candLo
+        botSetupBar := bar_index
+        botSetupTag := (sfpBot and divBot) ? 1 : sfpBot ? 2 : (baseBot and divBot) ? 3 : divBot ? 4 : baseBot ? 5 : 6
+        botSetupSc  := 2 + (divBot ? 1 : 0) + (sfpBot ? 1 : 0) + (pivBot ? 1 : 0) + (volClimax ? 1 : 0)
+
+    if (sfpTop or validPivTop or validBaseTop) and stretchTop and (rsiTopOk or sfpTop or volClimax)
+        topSetupHi  := candHi
+        topSetupBar := bar_index
+        topSetupTag := (sfpTop and divTop) ? 1 : sfpTop ? 2 : (baseTop and divTop) ? 3 : divTop ? 4 : baseTop ? 5 : 6
+        topSetupSc  := 2 + (divTop ? 1 : 0) + (sfpTop ? 1 : 0) + (pivTop ? 1 : 0) + (volClimax ? 1 : 0)
+
+    // ── Stage A2: Invert Weak 3/5 Counter-Trend Bounces/Pullbacks into Trend Continuation Flags ──
+    // A weak counter-trend Base in a Bear Trend (`hEma13 < hEma34`, no RSI Div, no SFP) is a Bear Flag Top setup!
+    // A weak counter-trend Top in a Bull Trend (`hEma13 > hEma34`, no RSI Div, no SFP) is a Bull Flag Base setup!
+    var int   bullFlagBar = -999
+    var float bullFlagLo  = na
+    var int   bearFlagBar = -999
+    var float bearFlagHi  = na
+
+    bool bearTrend = (hEma13 < hEma34) and (close <= hEma34 + 0.25 * hAtr)
+    bool bullTrend = (hEma13 > hEma34) and (close >= hEma34 - 0.25 * hAtr)
+
+    if invFlag and bearTrend and baseBot and not divBot and not sfpBot
+        bearFlagBar := bar_index
+        bearFlagHi  := hi4
+    if invFlag and bullTrend and baseTop and not divTop and not sfpTop
+        bullFlagBar := bar_index
+        bullFlagLo  := lo4
+
+    // Cancel armed setup if price slices beyond the setup anchor
+    if bar_index - botSetupBar <= 4 and not na(botSetupLo) and low < botSetupLo - 0.15 * hAtr
+        botSetupBar := -999
+        botSetupLo  := na
+    if bar_index - topSetupBar <= 4 and not na(topSetupHi) and high > topSetupHi + 0.15 * hAtr
+        topSetupBar := -999
+        topSetupHi  := na
+
+    // ── Stage B: Mandatory Structural Breakout / Breakdown Confirmation ──
+    float structHi = ta.highest(high, brkBars)[1]
+    float structLo = ta.lowest(low,   brkBars)[1]
+    float flagHi2  = ta.highest(high, 2)[1]
+    float flagLo2  = ta.lowest(low,   2)[1]
+
+    bool emaGateUp = isD ? (close > hEma5 and (close > hEma13 or hEma5 > hEma5[1])) : (close > hEma5 and close > hEma13)
+    bool emaGateDn = isD ? (close < hEma5 and (close < hEma13 or hEma5 < hEma5[1])) : (close < hEma5 and close < hEma13)
+
+    bool revUp  = (bar_index - botSetupBar <= 4) and not na(botSetupLo) and emaGateUp and (close > structHi) and (close > open)
+    bool revDn  = (bar_index - topSetupBar <= 4) and not na(topSetupHi) and emaGateDn and (close < structLo) and (close < open)
+    bool contUp = invFlag and (bar_index - bullFlagBar <= 4) and not na(bullFlagLo) and emaGateUp and (close > hEma34) and (close > flagHi2) and (close > open)
+    bool contDn = invFlag and (bar_index - bearFlagBar <= 4) and not na(bearFlagHi) and emaGateDn and (close < hEma34) and (close < flagLo2) and (close < open)
+
+    var int   sState     = 0
+    var bool  contUsed   = false
+    var float actBot     = na
+    var float actTop     = na
+    var int   lastSigBar = -999
+    var int   sTag       = 5
+    var int   sScore     = 3
+    bool      fireBot    = false
+    bool      fireTop    = false
+
+    if sState == -1 and not na(actBot) and close < actBot - 0.25 * hAtr
+        sState   := 0
+        actBot   := na
+        contUsed := false
+    if sState == 1 and not na(actTop) and close > actTop + 0.25 * hAtr
+        sState   := 0
+        actTop   := na
+        contUsed := false
+
+    int cooldown = isD ? 4 : 9
+    bool canBot = (sState != -1) or (not contUsed and bar_index - lastSigBar >= cooldown)
+    bool canTop = (sState != 1)  or (not contUsed and bar_index - lastSigBar >= cooldown)
+
+    if (revUp or contUp) and canBot
+        fireBot     := true
+        actBot      := revUp ? botSetupLo : bullFlagLo
+        actTop      := na
+        contUsed    := (sState == -1)
+        sState      := -1
+        lastSigBar  := bar_index
+        sTag        := revUp ? botSetupTag : 7
+        sScore      := revUp ? math.min(5, botSetupSc + 1) : 4
+        botSetupBar := -999
+        bullFlagBar := -999
+
+    if (revDn or contDn) and canTop
+        fireTop     := true
+        actTop      := revDn ? topSetupHi : bearFlagHi
+        actBot      := na
+        contUsed    := (sState == 1)
+        sState      := 1
+        lastSigBar  := bar_index
+        sTag        := revDn ? topSetupTag : 7
+        sScore      := revDn ? math.min(5, topSetupSc + 1) : 4
+        topSetupBar := -999
+        bearFlagBar := -999
+
+    // ── Tier 1 Early Scout Trap Signals (Fires on 125m BEFORE 13/34 EMA or Supertrend breaks to catch the initial 100-300 pt move!) ──
+    float barRngH  = math.max(high - low, syminfo.mintick)
+    float bullPosH = (close - low) / barRngH
+    float bearPosH = (high - close) / barRngH
+
+    bool revScoutBot = stretchBot and ((sfpBot and (divBot or hRsi <= 38.0) and bullPosH >= 0.50) or (pivBot and divBot)) and (close > hEma5) and (close > open)
+    bool revScoutTop = stretchTop and ((sfpTop and (divTop or hRsi >= 62.0) and bearPosH >= 0.50) or (pivTop and divTop)) and (close < hEma5) and (close < open)
+
+    bool dipTouch13   = ta.lowest(low, 3)   <= hEma13
+    bool popTouch13   = ta.highest(high, 3) >= hEma13
+    bool contScoutBot = (hEma13 > hEma34) and (close > hEma34) and (waveDrop  >= waveM * hAtr) and dipTouch13 and (close > hEma5) and (close > high[1]) and (close > open)
+    bool contScoutTop = (hEma13 < hEma34) and (close < hEma34) and (waveRally >= waveM * hAtr) and popTouch13 and (close < hEma5) and (close < low[1])  and (close < open)
+
+    var int lastScoutB   = -999
+    var int lastScoutDir = 0
+    int scoutCd = isD ? 3 : 6
+
+    bool fireScoutBot = (revScoutBot or contScoutBot) and not fireBot and (lastScoutDir != 1  or bar_index - lastScoutB >= scoutCd)
+    bool fireScoutTop = (revScoutTop or contScoutTop) and not fireTop and (lastScoutDir != -1 or bar_index - lastScoutB >= scoutCd)
+    int  scoutKind    = (revScoutBot or revScoutTop) ? 1 : 2
+
+    if fireScoutBot
+        lastScoutB   := bar_index
+        lastScoutDir := 1
+    if fireScoutTop
+        lastScoutB   := bar_index
+        lastScoutDir := -1
+
+    bool isArmedBot = (bar_index - botSetupBar <= 4) and not fireBot and sState != -1
+    bool isArmedTop = (bar_index - topSetupBar <= 4) and not fireTop and sState != 1
+
+    [sState, actBot, actTop, fireBot, fireTop, isArmedBot, isArmedTop, hAtr, sTag, sScore, bar_index, fireScoutBot, fireScoutTop, candLo, candHi, scoutKind]
+
+[htfState, htfBotLvl, htfTopLvl, htfFireBot, htfFireTop, htfArmBot, htfArmTop, htfAtr, htfTag, htfSc, htfBarIdx, htfScoutBot, htfScoutTop, htfCandLo, htfCandHi, htfScoutKind] = request.security(
+     syminfo.tickerid, evalHtf,
+     f_structuralSwingEngine(isDailyChart, activeLb, pivLeft, pivRight, activeBrk, atrStretch, waveImpulse, strictBaseFilter, invertFlagCont, useVolFilter, volMult),
+     lookahead=barmerge.lookahead_off)
+
+// ── Track Unique HTF Confirmations on Current Chart ──
+var int   lastConfirmedHtfBar = -1
+var int   activeSwingDir      = 0
+var float activeSwingLvl      = na
+var float activeSwingAtr      = na
+var int   activeSwingTag      = 5
+var int   activeSwingSc       = 3
+
+bool confirmBottom = btEnabled and htfFireBot and not na(htfBarIdx) and htfBarIdx != lastConfirmedHtfBar
+bool confirmTop    = btEnabled and htfFireTop and not na(htfBarIdx) and htfBarIdx != lastConfirmedHtfBar
+
+if confirmBottom
+    lastConfirmedHtfBar := htfBarIdx
+    activeSwingDir      := -1
+    activeSwingLvl      := htfBotLvl
+    activeSwingAtr      := htfAtr
+    activeSwingTag      := htfTag
+    activeSwingSc       := htfSc
+
+if confirmTop
+    lastConfirmedHtfBar := htfBarIdx
+    activeSwingDir      := 1
+    activeSwingLvl      := htfTopLvl
+    activeSwingAtr      := htfAtr
+    activeSwingTag      := htfTag
+    activeSwingSc       := htfSc
+
+if activeSwingDir == -1 and not na(activeSwingLvl) and close < activeSwingLvl - 0.25 * nz(activeSwingAtr, atr14)
+    activeSwingDir := 0
+    activeSwingLvl := na
+
+if activeSwingDir == 1 and not na(activeSwingLvl) and close > activeSwingLvl + 0.25 * nz(activeSwingAtr, atr14)
+    activeSwingDir := 0
+    activeSwingLvl := na
+
+isBottomArmed  = btEnabled and htfArmBot and activeSwingDir != -1
+isTopArmed     = btEnabled and htfArmTop and activeSwingDir != 1
+isBottomActive = btEnabled and activeSwingDir == -1 and not na(activeSwingLvl)
+isTopActive    = btEnabled and activeSwingDir == 1  and not na(activeSwingLvl)
+swingState     = isBottomActive ? -1 : isTopActive ? 1 : 0
+
+f_swReasonText(int t) =>
+    switch t
+        1 => "SFP + RSI Div ★"
+        2 => "SFP Sweep"
+        3 => "Base + RSI Div ★"
+        4 => "RSI Div"
+        5 => "Base Breakout"
+        7 => "Trend Flag Cont ★"
+        =>   "Pivot Breakout"
+
+// Pinpoint Label Placement via yloc.belowbar / yloc.abovebar
+if showSwingLbl and confirmBottom
+    label.new(bar_index, low,
+         "🟢 SWING BOTTOM (" + evalHtfLabel + ")\nBase: " + str.tostring(math.round(activeSwingLvl)) +
+         "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
+         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00c853, 0), textcolor=color.white, size=size.normal)
+
+if showSwingLbl and confirmTop
+    label.new(bar_index, high,
+         "🔴 SWING TOP (" + evalHtfLabel + ")\nTop: " + str.tostring(math.round(activeSwingLvl)) +
+         "\n[" + f_swReasonText(activeSwingTag) + " · " + str.tostring(activeSwingSc) + "/5]",
+         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#d50000, 0), textcolor=color.white, size=size.normal)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  SMART 200 EMA BLOCKER (With Confirmed Swing Override)
+// ───────────────────────────────────────────────────────────────────
+
+raw_ema200_block_long  = buySignal  and (e200_15_bear or e200_5_bear)
+raw_ema200_block_short = sellSignal and (e200_15_bull or e200_5_bull)
+
+ema200_block_long  = raw_ema200_block_long  and not (btOverride200 and isBottomActive)
+ema200_block_short = raw_ema200_block_short and not (btOverride200 and isTopActive)
+ema200_blocked     = ema200_block_long or ema200_block_short
+block15m = buySignal ? e200_15_bear : (sellSignal ? e200_15_bull : false)
+block5m  = buySignal ? e200_5_bear  : (sellSignal ? e200_5_bull  : false)
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  VBO — VOLATILITY BREAKOUT + COMPRESSION (v2.9.1)
+// ═══════════════════════════════════════════════════════════════════
+
+GV = "VBO Compression"
+aupMult     = input.float(0.28, "AUP Multiplier (0.10 for BNF)", step=0.01, group=GV)
+compMode    = input.string("PERCENT", "Compression Mode", options=["ABS","PERCENT","RELATIVE"], group=GV)
+compMaxPts  = input.float(130.0, "ABS: Max Points",  group=GV)
+compMinPts  = input.float(0.0,   "ABS: Min Points (0 = no floor)", group=GV)
+compMaxPct  = input.float(0.55,  "PERCENT: Max band as % of open", step=0.05, group=GV)
+lookbackD   = input.int(20, "RELATIVE: lookback (days)", minval=5, group=GV)
+compWinDays = input.int(2,  "Compression window (sessions after flag)", minval=0, maxval=5, group=GV)
+showVBO     = input.bool(true, "Plot VBO lines", group=GV)
+
+[vH1, vL1, vH2, vL2, vH3, vL3] = request.security(syminfo.tickerid, "1D",
+     [high[1], low[1], high[2], low[2], high[3], low[3]], lookahead=barmerge.lookahead_on)
+
+var float CDO = na
+if session.isfirstbar_regular
+    CDO := open
+
+vATRF = math.max(vH1, vH2, vH3) - math.min(vL1, vL2, vL3)
+vBand = aupMult * vATRF
+vboUp = CDO + vBand
+vboDn = CDO - vBand
+vDiff = 2 * vBand
+
+histLowDiff = request.security(syminfo.tickerid, "1D",
+     ta.lowest(2 * aupMult * (math.max(high[1], high[2], high[3]) - math.min(low[1], low[2], low[3])), lookbackD),
+     lookahead=barmerge.lookahead_on)
+
+isCompressed = compMode == "ABS"     ? (vDiff >= compMinPts and vDiff <= compMaxPts) :
+     compMode == "PERCENT" ? (vDiff / nz(CDO, close) * 100 <= compMaxPct) :
+     (vDiff <= histLowDiff * 1.1)
+
+var int sessSinceComp = 999
+if session.isfirstbar_regular
+    sessSinceComp := isCompressed ? 0 : sessSinceComp + 1
+compWindowActive = sessSinceComp <= compWinDays
+
+bool xVboUp = ta.crossover(close, vboUp)
+bool xVboDn = ta.crossunder(close, vboDn)
+vboBreakUp  = not na(CDO) and xVboUp
+vboBreakDn  = not na(CDO) and xVboDn
+
+plot(showVBO and not na(CDO) ? vboUp : na, "VBO Up",
+     isCompressed ? color.new(color.lime, 0) : color.new(color.yellow, 0), 2, plot.style_circles)
+plot(showVBO and not na(CDO) ? vboDn : na, "VBO Dn",
+     isCompressed ? color.new(color.lime, 0) : color.new(color.yellow, 0), 2, plot.style_circles)
+bgcolor(isCompressed ? color.new(color.lime, 92) : na, title="Compression Phase")
+
+
+// ───────────────────────────────────────────────────────────────────
+//  CONFLUENCE SCORING (max 8)
+// ───────────────────────────────────────────────────────────────────
+
+bullPart1 = (emaBull ? 1 : 0) + (stBull ? 1 : 0) + (d5Bull ? 1 : 0) + (ichiAbove ? 1 : 0)
+bullPart2 = (e200_15_bull ? 1 : 0) + (e200_5_bull ? 1 : 0) + (e89_15_above ? 1 : 0) + (e89_5_above ? 1 : 0)
+bullScore = bullPart1 + bullPart2
+
+bearPart1 = (emaBear ? 1 : 0) + (stBear ? 1 : 0) + (d5Bear ? 1 : 0) + (ichiBelow ? 1 : 0)
+bearPart2 = (e200_15_bear ? 1 : 0) + (e200_5_bear ? 1 : 0) + (e89_15_below ? 1 : 0) + (e89_5_below ? 1 : 0)
+bearScore = bearPart1 + bearPart2
+
+netDir = bullScore > bearScore ? 1 : bearScore > bullScore ? -1 : 0
+
+sizeLabel(sc) =>
+    switch sc
+        8 => "FULL   (8/8)"
+        7 => "LARGE  (7/8)"
+        6 => "LARGE  (6/8)"
+        5 => "MEDIUM (5/8)"
+        4 => "MEDIUM (4/8)"
+        3 => "SMALL  (3/8)"
+        => "SKIP"
+
+sizeLabelC(sc) =>
+    switch sc
+        8 => "FULL 8/8"
+        7 => "LRG  7/8"
+        6 => "LRG  6/8"
+        5 => "MED  5/8"
+        4 => "MED  4/8"
+        3 => "SML  3/8"
+        => "SKIP"
+
+dirLabel  = netDir ==  1 ? "▲  LONG"  : netDir == -1 ? "▼  SHORT" : "─  NEUTRAL"
+posLabel  = netDir !=  0 ? sizeLabel(netDir == 1 ? bullScore : bearScore)  : "SKIP — WAIT"
+posLabelC = netDir !=  0 ? sizeLabelC(netDir == 1 ? bullScore : bearScore) : "SKIP"
+
+
+// ───────────────────────────────────────────────────────────────────
+//  RANGE TRACKING + SIGNAL COUNTER
+// ───────────────────────────────────────────────────────────────────
+
+var int   sigCount   = 0
+var float rHigh      = na
+var float rLow       = na
+var int   rStartBar  = na
+var bool  inRange    = false
+var int   lastSigDir = 0
+
+if resetNow
+    sigCount   := 0
+    rHigh      := na
+    rLow       := na
+    rStartBar  := na
+    inRange    := false
+    lastSigDir := 0
+
+if newSig
+    sigCount += 1
+    if sigCount == 1
+        rHigh     := high
+        rLow      := low
+        rStartBar := bar_index
+        inRange   := true
+
+float prevRHigh = rHigh
+float prevRLow  = rLow
+
+if inRange
+    rHigh := math.max(nz(rHigh, high), high)
+    rLow  := math.min(nz(rLow,  low),  low)
+
+rangeSize = (not na(rHigh) and not na(rLow)) ? math.round(rHigh - rLow) : 0
+
+if inRange and (rangeSize > maxRangePts or sigCount > megaMaxSigs)
+    sigCount   := 0
+    rHigh      := na
+    rLow       := na
+    rStartBar  := na
+    inRange    := false
+    lastSigDir := 0
+
+aboveRange    = inRange and not na(prevRHigh) and close > prevRHigh
+belowRange    = inRange and not na(prevRLow)  and close < prevRLow
+prevRangeSize = (not na(prevRHigh) and not na(prevRLow)) ? math.round(prevRHigh - prevRLow) : 0
+rangeIsValid  = prevRangeSize >= minRangePts and prevRangeSize <= maxRangePts
+
+bool megaUp      = aboveRange and sigCount >= megaMinSigs and rangeIsValid and (megaBreakAlone or (newSig and buySignal))
+bool megaDn      = belowRange and sigCount >= megaMinSigs and rangeIsValid and (megaBreakAlone or (newSig and sellSignal))
+isMegaBreakout   = megaUp or megaDn
+bool megaBlocked = megaUp ? (e200_15_bear or e200_5_bear) : megaDn ? (e200_15_bull or e200_5_bull) : false
+int  megaSigNum  = sigCount
+
+isBreakoutWatch = inRange and sigCount >= megaMinSigs and not isMegaBreakout
+isPrewatch      = inRange and sigCount == megaMinSigs - 1 and newSig
+
+if isMegaBreakout
+    sigCount   := 0
+    rHigh      := na
+    rLow       := na
+    rStartBar  := na
+    inRange    := false
+    lastSigDir := 0
+
+signalsLeft = math.max(0, megaMinSigs - sigCount)
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ⑩ SMART MONEY FUTURES + OPTIONS TRAP FUSION ENGINE (v3.9)
+//  Implements the Builder Spec:
+//  • Pulls NIFTY1! Futures LTP, Volume, High, Low, Open
+//  • Computes Raw Basis, Cost-of-Carry Fair Basis, Adjusted Basis
+//    Spread, and Intraday Basis Delta (vs 09:15/09:20 session open)
+//  • Classifies 5-State Futures Quadrant with Deadband Filter
+//  • Detects 🚨 BULL TRAP (Price Up on Short-Covering + Roof Call/Basis Wall)
+//    and 🟢 BEAR TRAP (Price Down on Long-Unwinding + Floor Put/Basis Support)
+//    and generates actionable BUY/SELL signals with automatic SL!
+// ═══════════════════════════════════════════════════════════════════
+
+f_futStream() =>
+    float fO   = open
+    float fH   = high
+    float fL   = low
+    float fC   = close
+    float fV   = nz(volume, 0)
+    float fVS  = nz(ta.sma(volume, 20), 0)
+    float rng  = math.max(fH - fL, syminfo.mintick)
+    float bPos = (fC - fL) / rng
+    float sPos = (fH - fC) / rng
+    float signedVol = fC >= fO ? fV * bPos : -fV * sPos
+    [fO, fH, fL, fC, fV, fVS, signedVol]
+
+[futO, futH, futL, futC, futVol, futVolSma, futSignedVol] = request.security(
+     futTicker, timeframe.period, f_futStream(), lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+float chartVolSma = nz(ta.sma(volume, 20), 0)
+bool  hasFutFeed  = not na(futC) and futC > 0
+float fLast       = hasFutFeed ? futC : close
+float fOpenBar    = hasFutFeed ? futO : open
+float fHighBar    = hasFutFeed ? futH : high
+float fLowBar     = hasFutFeed ? futL : low
+float fVol        = hasFutFeed ? futVol : nz(volume, 0)
+float fVolSma     = hasFutFeed ? futVolSma : chartVolSma
+
+// Track Session Open Price & 09:20 IST Open Basis Baseline
+var float sessSpotOpen  = na
+var float sessFutOpen   = na
+var float openBasisBase = na
+var float cumFutVolChg  = 0.0
+var float cumFutTotalV  = 0.0
+
+if session.isfirstbar_regular or newD
+    sessSpotOpen  := open
+    sessFutOpen   := fOpenBar
+    openBasisBase := fLast - close
+    cumFutVolChg  := nz(futSignedVol, 0)
+    cumFutTotalV  := math.max(fVol, 1.0)
+else
+    cumFutVolChg  += nz(futSignedVol, 0)
+    cumFutTotalV  += fVol
+
+// 1. Fair-Value Cost-of-Carry Basis Math (With Distinct-Futures Guard so Spot=Fut never fakes negative basis!)
+bool  hasDistinctFut      = hasFutFeed and math.abs(fLast - close) > 0.05
+float rawBasis            = hasDistinctFut ? (fLast - close) : 0.0
+float fairBasis           = hasDistinctFut ? (close * ((0.068 * math.max(0, dteInput)) / 365.0)) : 0.0
+float adjustedBasisSpread = hasDistinctFut ? (rawBasis - fairBasis) : 0.0
+float intradayBasisDelta  = (hasDistinctFut and not na(openBasisBase)) ? (rawBasis - openBasisBase) : 0.0
+float barBasisDelta       = hasDistinctFut ? (rawBasis - nz(rawBasis[1], rawBasis)) : 0.0
+
+// 2. Price Change % & Institutional Participation (Aligned with Trend & Volume)
+float refOpenP       = nz(sessFutOpen, fOpenBar)
+float futPriceChg    = fLast - refOpenP
+float futPriceChgPct = refOpenP > 0 ? (futPriceChg / refOpenP) * 100.0 : 0.0
+float barRngNow      = math.max(high - low, syminfo.mintick)
+float bullClPos      = (close - low) / barRngNow
+float bearClPos      = (high - close) / barRngNow
+
+// When distinct Futures basis is present, use Basis + Volume; otherwise use EMA13/34 + Supertrend trend alignment so strong uptrends are classified as LONG_BUILDUP (not SHORT_COVERING!)
+bool  basisExpandingUp = hasDistinctFut ? ((adjustedBasisSpread >= -5.0 and barBasisDelta >= -1.0) or intradayBasisDelta >= 5.0) : (emaBull and stBull)
+bool  basisExpandingDn = hasDistinctFut ? (rawBasis < 0.0 or adjustedBasisSpread <= -10.0 or intradayBasisDelta <= -5.0) : (emaBear and stBear)
+bool  freshPartic      = (fVolSma > 0 and fVol >= 1.05 * fVolSma) or (hasDistinctFut and math.abs(intradayBasisDelta) >= 5.0) or (emaBull and stBull and close > shortEma) or (emaBear and stBear and close < shortEma)
+
+float effOiChgPct = freshPartic and ((futPriceChgPct >= 0.08 and basisExpandingUp) or (futPriceChgPct <= -0.08 and basisExpandingDn)) ?
+     math.max(0.35, math.abs(futPriceChgPct) * 1.5) :
+     (math.abs(futPriceChgPct) >= 0.08 ? -0.45 : 0.0)
+
+// 3. Deterministic 5-State Futures Quadrant Classifier (with Deadband Filter: |Price%| < 0.08% or |OI%| < 0.25%)
+bool inDeadband = math.abs(futPriceChgPct) < 0.08 or math.abs(effOiChgPct) < 0.25
+string futQuadrant = inDeadband ? "NEUTRAL_CHOP" :
+     (futPriceChgPct >= 0.08  and effOiChgPct >= 0.25)  ? "LONG_BUILDUP"   :
+     (futPriceChgPct <= -0.08 and effOiChgPct >= 0.25)  ? "SHORT_BUILDUP"  :
+     (futPriceChgPct >= 0.08  and effOiChgPct <= -0.25) ? "SHORT_COVERING" : "LONG_UNWINDING"
+
+// 4. Real-Time Smart Money Trap & Synergy Engine (Chart Timeframe + Accumulated Options/Futures Data)
+//    • Auto-calculates Floor & Roof strikes from Spot if manual inputs are 0
+float autoRoof  = math.ceil(close / 100.0) * 100.0 + 100.0
+float autoFloor = math.floor(close / 100.0) * 100.0 - 100.0
+float actRoof   = extRoofStrike > 0.0 ? extRoofStrike : autoRoof
+float actFloor  = extFloorStrike > 0.0 ? extFloorStrike : autoFloor
+
+bool isManualOpt        = extOptMode == "Manual / Scanner Override (From OptionsScanner)"
+bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : ((basisExpandingUp or adjustedBasisSpread >= 5.0 or intradayBasisDelta >= 5.0) and (bullClPos >= 0.50 or close > shortEma))
+bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.75) : ((basisExpandingDn or adjustedBasisSpread <= -5.0 or intradayBasisDelta <= -5.0) and (bearClPos >= 0.50 or close < shortEma))
+
+// High-Conviction Synergies
+bool isBullSynergy      = futQuadrant == "LONG_BUILDUP"  and isPutWritingBlitz  and (basisExpandingUp or not hasDistinctFut)
+bool isBearSynergy      = futQuadrant == "SHORT_BUILDUP" and isCallWritingBlitz and (basisExpandingDn or not hasDistinctFut)
+
+// Local Structural High / Low over trapLookback bars (default 24 bars on 15m = 6 hrs / 1 trading day)
+int   effTrapLb   = math.max(6, trapLookback)
+float localTrapHi = ta.highest(high, effTrapLb)[1]
+float localTrapLo = ta.lowest(low,   effTrapLb)[1]
+
+// ── BULL TRAP LOGIC (Real-Time Chart Timeframe) ──
+// 1. Price Action: Price broke above local swing high, swept Roof Strike, or pierced Daily R1/R2, then rejected
+bool sweepHi      = high >= localTrapHi and close < localTrapHi
+bool roofRej      = high >= actRoof - 0.20 * atr14 and close < actRoof
+bool pivRRej      = (high >= dR1 and close < dR1) or (high >= dR2 and close < dR2)
+bool bearCandRej  = (close < open) and (close < ema5) and (close < low[1] or bearClPos >= 0.50)
+bool bullTrapPA   = (sweepHi or roofRej or pivRRej or (high >= ta.highest(high, 4)[1] and bearCandRej)) and bearCandRej
+
+// 2. Smart Money Flow: Short-Covering (no fresh buyers) OR Call Blitz at Roof OR Negative Basis Collapse OR HTF Top Armed
+bool bullTrapFlow = (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (adjustedBasisSpread <= -5.0) or (intradayBasisDelta <= -5.0) or (rawBasis < 0.0) or htfArmTop or htfScoutTop
+
+// ── BEAR TRAP LOGIC (Real-Time Chart Timeframe) ──
+// 1. Price Action: Price dipped below local swing low, swept Floor Strike, or pierced Daily S1/S2, then absorbed
+bool sweepLo      = low <= localTrapLo and close > localTrapLo
+bool floorAbs     = low <= actFloor + 0.20 * atr14 and close > actFloor
+bool pivSAbs      = (low <= dS1 and close > dS1) or (low <= dS2 and close > dS2)
+bool bullCandAbs  = (close > open) and (close > ema5) and (close > high[1] or bullClPos >= 0.50)
+bool bearTrapPA   = (sweepLo or floorAbs or pivSAbs or (low <= ta.lowest(low, 4)[1] and bullCandAbs)) and bullCandAbs
+
+// 2. Smart Money Flow: Long-Unwinding (no fresh aggressive shorts) OR Put Blitz at Floor OR Positive Basis Expansion OR HTF Bottom Armed
+bool bearTrapFlow = (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (adjustedBasisSpread >= 5.0) or (intradayBasisDelta >= 5.0) or htfArmBot or htfScoutBot
+
+// Anti-Whipsaw Cooldown
+var int lastTrapBar = -999
+var int lastTrapDir = 0
+int trapCooldown    = isDailyChart ? 3 : 5
+
+bool rawBullTrap = fuEnabled and bullTrapPA and bullTrapFlow and not confirmTop
+bool rawBearTrap = fuEnabled and bearTrapPA and bearTrapFlow and not confirmBottom
+
+bool bullTrapSig = rawBullTrap and (lastTrapDir != -1 or bar_index - lastTrapBar >= trapCooldown)
+bool bearTrapSig = rawBearTrap and (lastTrapDir != 1  or bar_index - lastTrapBar >= trapCooldown)
+
+if bullTrapSig
+    lastTrapBar := bar_index
+    lastTrapDir := -1
+if bearTrapSig
+    lastTrapBar := bar_index
+    lastTrapDir := 1
+
+float bullTrapSL = math.max(high, ta.highest(high, 3)) + (swingSlAtr * nz(htfAtr, atr14))
+float bearTrapSL = math.min(low,  ta.lowest(low,   3)) - (swingSlAtr * nz(htfAtr, atr14))
+
+string bullTrapTag = isCallWritingBlitz ? "[Roof Call Blitz · ΔPCR ≤ 0.75]" :
+     futQuadrant == "SHORT_COVERING" ? "[Short-Covering Exhaustion]" :
+     adjustedBasisSpread <= -5.0 ? "[Futures Basis Breakdown]" : "[Liquidity Sweep Rejection]"
+
+string bearTrapTag = isPutWritingBlitz ? "[Floor Put Blitz · ΔPCR ≥ 1.30]" :
+     futQuadrant == "LONG_UNWINDING" ? "[Long-Unwinding Absorption]" :
+     adjustedBasisSpread >= 5.0 ? "[Futures Basis Accumulation]" : "[Liquidity Sweep Absorption]"
+
+string fusionScenario = bullTrapSig ? "BULL_TRAP" :
+     bearTrapSig   ? "BEAR_TRAP" :
+     isBullSynergy ? "BULLISH_SYNERGY" :
+     isBearSynergy ? "BEARISH_SYNERGY" : "MIXED_FLOW"
+
+string fusionVerdict = bullTrapSig ? "🚨 BULL TRAP (Scout Short)" :
+     bearTrapSig   ? "🟢 BEAR TRAP (Scout Buy)" :
+     isBullSynergy ? "🟢 BULL SYNERGY (High-Conv BTST)" :
+     isBearSynergy ? "🔴 BEAR SYNERGY (High-Conv STBT)" :
+     futQuadrant == "LONG_BUILDUP"   ? "▲ FUT LONG BUILDUP" :
+     futQuadrant == "SHORT_BUILDUP"  ? "▼ FUT SHORT BUILDUP" :
+     futQuadrant == "SHORT_COVERING" ? "🚀 SHORT COVERING" :
+     futQuadrant == "LONG_UNWINDING" ? "⚠ LONG UNWINDING" : "⚪ NEUTRAL / CHOP"
+
+if showTrapLbl and bullTrapSig
+    label.new(bar_index, high,
+         "🚨 BULL TRAP · SELL (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bullTrapSL)) + "\n" + bullTrapTag,
+         yloc=yloc.abovebar, style=label.style_label_down, color=color.new(#f57c00, 0), textcolor=color.white, size=size.small)
+
+if showTrapLbl and bearTrapSig
+    label.new(bar_index, low,
+         "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(bearTrapSL)) + "\n" + bearTrapTag,
+         yloc=yloc.belowbar, style=label.style_label_up, color=color.new(#00bfa5, 0), textcolor=color.white, size=size.small)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  CHART PLOTS (EMAs, ST, D5)
+// ───────────────────────────────────────────────────────────────────
+
+plot(showEmas ? shortEma  : na, "EMA 13",        color.new(#00bcd4, 0),  1)
+plot(showEmas ? longEma   : na, "EMA 34",        color.new(#ef5350, 0),  1)
+plot(showST   ? stLine    : na, "Supertrend",    stBull ? color.new(#69f0ae, 0) : color.new(#ff5252, 0), 2, plot.style_linebr)
+plot(showD5   ? d5Ema     : na, "D5-EMA",        color.new(#ffab40, 50), 2, plot.style_line)
+plot(show200  ? ema200_15 : na, "200 EMA",       color.new(#1565c0, 0),  2)
+plot(show89Band ? ema89h_15 : na, "89 Hi",       color.new(#7b1fa2, 20), 1)
+plot(show89Band ? ema89l_15 : na, "89 Lo",       color.new(#7b1fa2, 20), 1)
+
+e89h_p = plot(show89Band ? ema89h_15 : na, display=display.none)
+e89l_p = plot(show89Band ? ema89l_15 : na, display=display.none)
+fill(e89h_p, e89l_p, color.new(#7b1fa2, 94))
+
+plotshape(buySignal  and not isMegaBreakout, "Buy",       shape.triangleup,   location.belowbar, color.new(#00e676, 0), size=size.normal)
+plotshape(sellSignal and not isMegaBreakout, "Sell",      shape.triangledown, location.abovebar, color.new(#ff1744, 0), size=size.normal)
+plotshape(megaUp,                            "Mega Buy",  shape.triangleup,   location.belowbar, color.new(#ff6d00, 0), size=size.large)
+plotshape(megaDn,                            "Mega Sell", shape.triangledown, location.abovebar, color.new(#ff6d00, 0), size=size.large)
+plotshape(posCross, "Bull Cross", shape.circle, location.belowbar, color.new(#00bcd4, 50), size=size.tiny)
+plotshape(negCross, "Bear Cross", shape.circle, location.abovebar, color.new(#ef5350, 50), size=size.tiny)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  CPR LINES — current period only, via line.new()
+// ───────────────────────────────────────────────────────────────────
+
+var line  dTCln   = na
+var line  dPPln   = na
+var line  dBCln   = na
+var label dCPRlbl = na
+
+if showCPR and showDCpr and newD and not na(dPP)
+    line.delete(dTCln)
+    line.delete(dPPln)
+    line.delete(dBCln)
+    label.delete(dCPRlbl)
+    dTCln := line.new(bar_index, dTC, bar_index + 1, dTC, extend=extend.right, color=color.new(#1565c0, 45), width=1)
+    dPPln := line.new(bar_index, dPP, bar_index + 1, dPP, extend=extend.right, color=color.new(#1565c0, 0),  width=2)
+    dBCln := line.new(bar_index, dBC, bar_index + 1, dBC, extend=extend.right, color=color.new(#1565c0, 45), width=1)
+    if showCPRlbl
+        dCPRlbl := label.new(bar_index, dTC, "D-CPR", style=label.style_none, textcolor=color.new(#1565c0, 0), size=size.small)
+
+var line  wTCln   = na
+var line  wPPln   = na
+var line  wBCln   = na
+var label wCPRlbl = na
+
+if showCPR and showWCpr and newW and not na(wPP)
+    line.delete(wTCln)
+    line.delete(wPPln)
+    line.delete(wBCln)
+    label.delete(wCPRlbl)
+    wTCln := line.new(bar_index, wTC, bar_index + 1, wTC, extend=extend.right, color=color.new(#e65100, 45), width=1)
+    wPPln := line.new(bar_index, wPP, bar_index + 1, wPP, extend=extend.right, color=color.new(#e65100, 0),  width=2)
+    wBCln := line.new(bar_index, wBC, bar_index + 1, wBC, extend=extend.right, color=color.new(#e65100, 45), width=1)
+    if showCPRlbl
+        wCPRlbl := label.new(bar_index, wTC, "W-CPR", style=label.style_none, textcolor=color.new(#e65100, 0), size=size.small)
+
+var line  mTCln   = na
+var line  mPPln   = na
+var line  mBCln   = na
+var label mCPRlbl = na
+
+if showCPR and showMCpr and newM and not na(mPP)
+    line.delete(mTCln)
+    line.delete(mPPln)
+    line.delete(mBCln)
+    label.delete(mCPRlbl)
+    mTCln := line.new(bar_index, mTC, bar_index + 1, mTC, extend=extend.right, color=color.new(#6a1b9a, 45), width=1)
+    mPPln := line.new(bar_index, mPP, bar_index + 1, mPP, extend=extend.right, color=color.new(#6a1b9a, 0),  width=2)
+    mBCln := line.new(bar_index, mBC, bar_index + 1, mBC, extend=extend.right, color=color.new(#6a1b9a, 45), width=1)
+    if showCPRlbl
+        mCPRlbl := label.new(bar_index, mTC, "M-CPR", style=label.style_none, textcolor=color.new(#6a1b9a, 0), size=size.small)
+
+var line dR1ln = na
+var line dR2ln = na
+var line dS1ln = na
+var line dS2ln = na
+
+if showRS and newD and not na(dPP)
+    line.delete(dR1ln)
+    line.delete(dR2ln)
+    line.delete(dS1ln)
+    line.delete(dS2ln)
+    dR1ln := line.new(bar_index, dR1, bar_index + 1, dR1, extend=extend.right, color=color.new(#2e7d32, 25), width=1)
+    dR2ln := line.new(bar_index, dR2, bar_index + 1, dR2, extend=extend.right, color=color.new(#2e7d32, 55), width=1)
+    dS1ln := line.new(bar_index, dS1, bar_index + 1, dS1, extend=extend.right, color=color.new(#b71c1c, 25), width=1)
+    dS2ln := line.new(bar_index, dS2, bar_index + 1, dS2, extend=extend.right, color=color.new(#b71c1c, 55), width=1)
+
+if not showRS and not na(dR1ln)
+    line.delete(dR1ln)
+    line.delete(dR2ln)
+    line.delete(dS1ln)
+    line.delete(dS2ln)
+    dR1ln := na
+    dR2ln := na
+    dS1ln := na
+    dS2ln := na
+
+
+// ───────────────────────────────────────────────────────────────────
+//  RANGE BOX & BOUNDARY LINES — Intraday only
+// ───────────────────────────────────────────────────────────────────
+
+var box rangeBox = na
+if isIntraday and showBox
+    if newSig and sigCount == 1
+        box.delete(rangeBox)
+        rangeBox := box.new(bar_index, rHigh, bar_index, rLow,
+             border_color=color.new(#f9a825, 40), border_width=1, bgcolor=color.new(#f9a825, 94))
+    if not na(rangeBox) and inRange
+        box.set_right(rangeBox, bar_index)
+        box.set_top(rangeBox, rHigh)
+        box.set_bottom(rangeBox, rLow)
+        if isBreakoutWatch
+            box.set_border_color(rangeBox, color.new(#f57c00, 20))
+            box.set_bgcolor(rangeBox, color.new(#f57c00, 92))
+
+if (not isIntraday or not inRange) and not na(rangeBox)
+    box.delete(rangeBox)
+    rangeBox := na
+
+var line rHighLine = na
+var line rLowLine  = na
+if isIntraday and showLines and not na(rHigh) and not na(rLow) and (isPrewatch or isBreakoutWatch)
+    if na(rHighLine)
+        rHighLine := line.new(bar_index - 10, rHigh, bar_index, rHigh, color=color.new(#ffd54f, 0), style=line.style_dashed, width=2, extend=extend.right)
+    else
+        line.set_y1(rHighLine, rHigh)
+        line.set_y2(rHighLine, rHigh)
+    if na(rLowLine)
+        rLowLine := line.new(bar_index - 10, rLow, bar_index, rLow, color=color.new(#ffd54f, 0), style=line.style_dashed, width=2, extend=extend.right)
+    else
+        line.set_y1(rLowLine, rLow)
+        line.set_y2(rLowLine, rLow)
+
+if not isIntraday or not inRange
+    if not na(rHighLine)
+        line.delete(rHighLine)
+        rHighLine := na
+    if not na(rLowLine)
+        line.delete(rLowLine)
+        rLowLine  := na
+
+
+// ───────────────────────────────────────────────────────────────────
+//  CHART LABELS — Intraday Range & Signal Labels
+// ───────────────────────────────────────────────────────────────────
+
+if isIntraday
+    if isMegaBreakout
+        megaDir   = megaUp ? "▲  LONG" : "▼  SHORT"
+        megaScore = megaUp ? str.tostring(bullScore) : str.tostring(bearScore)
+        label.new(bar_index, megaUp ? low : high,
+             "🔥  RANGE BREAKOUT — MEGA MOVE\n" + megaDir +
+             "  |  Signal #" + str.tostring(megaSigNum) + "\n" +
+             "Range: " + str.tostring(prevRangeSize) + " pts  |  Score: " + megaScore + "/8",
+             yloc=megaUp ? yloc.belowbar : yloc.abovebar,
+             style=megaUp ? label.style_label_up : label.style_label_down,
+             color=color.new(#e65100, 0), textcolor=color.white, size=size.large)
+
+    else if newSig and inRange and isBreakoutWatch
+        currDir = buySignal ? 1 : -1
+        sameDir = lastSigDir == currDir and lastSigDir != 0
+        flipDir = lastSigDir != currDir and lastSigDir != 0
+        isEnter = sigCount == megaMinSigs
+
+        string actionLine = ""
+        if isEnter
+            actionLine := buySignal ? "▲  ENTER LONG   #" + str.tostring(sigCount) : "▼  ENTER SHORT  #" + str.tostring(sigCount)
+        else if sameDir
+            actionLine := buySignal ? "▲  HOLD / ADD   #" + str.tostring(sigCount) : "▼  HOLD / ADD   #" + str.tostring(sigCount)
+        else if flipDir
+            actionLine := buySignal ? "▲  REVERSE → LONG  #" + str.tostring(sigCount) : "▼  REVERSE → SHORT #" + str.tostring(sigCount)
+        else
+            actionLine := buySignal ? "▲ #" + str.tostring(sigCount) : "▼ #" + str.tostring(sigCount)
+
+        string slLine = buySignal ?
+             "SL < " + str.tostring(math.round(nz(rLow)))  + "  |  Range: " + str.tostring(rangeSize) + " pts" :
+             "SL > " + str.tostring(math.round(nz(rHigh))) + "  |  Range: " + str.tostring(rangeSize) + " pts"
+
+        string blockLine = not ema200_blocked ?
+             ((btOverride200 and (isBottomActive or isTopActive)) ? "✓ 200 EMA (" + evalHtfLabel + " Override)" : "✓ 200 EMA clear") :
+             (block15m and block5m ? "⚠ BLOCK: Both 5m + 15m against you" : block15m ? "⚠ BLOCK: 15m 200 EMA" : "⚠ BLOCK: 5m 200 EMA")
+
+        color lblColor = ema200_blocked ? color.new(#6a1b1b, 0) :
+             isEnter ? color.new(#2e7d32, 0) :
+             sameDir ? color.new(#1565c0, 0) :
+             flipDir ? color.new(#b71c1c, 0) : color.new(#f57c00, 0)
+
+        sigScore = buySignal ? str.tostring(bullScore) : str.tostring(bearScore)
+        label.new(bar_index, buySignal ? low : high,
+             actionLine + "\n" + slLine + "\nScore: " + sigScore + "/8\n" + blockLine,
+             yloc=buySignal ? yloc.belowbar : yloc.abovebar,
+             style=buySignal ? label.style_label_up : label.style_label_down,
+             color=lblColor, textcolor=color.white, size=size.normal)
+
+    else if newSig and inRange and isPrewatch
+        preScore = buySignal ? str.tostring(bullScore) : str.tostring(bearScore)
+        label.new(bar_index, buySignal ? low : high,
+             "⚠  NEXT → WATCH FOR BREAKOUT\n" + (buySignal ? "▲" : "▼") +
+             " Signal #" + str.tostring(sigCount) +
+             "\nRange: " + str.tostring(rangeSize) + " pts  |  Score: " + preScore + "/8",
+             yloc=buySignal ? yloc.belowbar : yloc.abovebar,
+             style=buySignal ? label.style_label_up : label.style_label_down,
+             color=color.new(#f9a825, 10), textcolor=color.black, size=size.small)
+
+    else if newSig and inRange
+        label.new(bar_index, buySignal ? low : high,
+             (buySignal ? "▲" : "▼") + " " + str.tostring(sigCount),
+             yloc=buySignal ? yloc.belowbar : yloc.abovebar,
+             style=buySignal ? label.style_label_up : label.style_label_down,
+             color=color.new(#546e7a, 20), textcolor=color.white, size=size.small)
+
+if newSig and not isMegaBreakout
+    lastSigDir := buySignal ? 1 : -1
+
+
+// ───────────────────────────────────────────────────────────────────
+//  COLOUR PALETTE & DASHBOARD STRINGS
+// ───────────────────────────────────────────────────────────────────
+
+CB    = color.new(#00695c,  0)
+CR    = color.new(#b71c1c,  0)
+CN    = color.new(#37474f, 10)
+CD    = color.new(#1a2a3a, 10)
+CH    = color.new(#0a1520,  5)
+CO    = color.new(#e65100,  0)
+CY    = color.new(#f57f17, 10)
+CRng  = color.new(#e65100, 10)
+CPur  = color.new(#6a1b9a,  0)
+CBlk  = color.new(#4e0000,  0)
+CPIV  = color.new(#0d47a1,  0)
+CW    = color.white
+CGr   = color.new(#b0bec5,  0)
+CLn   = color.new(#37474f,  0)
+CTRAN = color.new(color.white, 100)
+
+emaSigBg  = buySignal ? CB : sellSignal ? CR : CD
+ichiBg    = ichiAbove ? CB : ichiBelow  ? CR : CN
+e200_15bg = e200_15_bull ? CB : CR
+e200_5bg  = e200_5_bull  ? CB : CR
+zone15bg  = e89_15_above ? CB : e89_15_inside ? CN : CR
+zone5bg   = e89_5_above  ? CB : e89_5_inside  ? CN : CR
+blkRowBg  = ema200_blocked ? CBlk : color.new(#1b3a1b, 0)
+blkTxt    = ema200_blocked ? CW   : color.new(#a5d6a7, 0)
+dirBg     = netDir == 1 ? CB : netDir == -1 ? CR : CN
+cntBg     = isMegaBreakout ? CO : isBreakoutWatch ? CRng : isPrewatch ? CY : CD
+cntTxt    = isBreakoutWatch or isMegaBreakout ? CW : isPrewatch ? color.new(#1a1a00, 0) : CGr
+progCol   = isBreakoutWatch ? CO : isPrewatch ? CY : inRange ? CB : CGr
+emaSig    = buySignal ? "🟢  BUY  ▲" : sellSignal ? "🔴  SELL ▼" : "    —"
+dCPRbg    = dPPbull ? CB : CR
+wCPRbg    = wPPbull ? CB : CR
+mCPRbg    = mPPbull ? CB : CR
+
+ichiStat = ichiAbove ? "▲  ABOVE" : ichiBelow ? "▼  BELOW" : "◈  INSIDE"
+e200_15s = e200_15_bull ? "▲  ABOVE" : "▼  BELOW"
+e200_5s  = e200_5_bull  ? "▲  ABOVE" : "▼  BELOW"
+zone15s  = e89_15_above ? "▲  ABOVE" : e89_15_inside ? "◈  INSIDE" : "▼  BELOW"
+zone5s   = e89_5_above  ? "▲  ABOVE" : e89_5_inside  ? "◈  INSIDE" : "▼  BELOW"
+
+string blkLabel = not ema200_blocked ?
+     ((btOverride200 and (isBottomActive or isTopActive)) ? "✓ " + evalHtfLabel + " Override" : "✓ Path clear") :
+     (block15m and block5m ? "⚠ BOTH TF blocked" : block15m ? "⚠ 15m blocked" : "⚠ 5m blocked")
+
+string rangeStat   = not inRange ? "No range" : rangeSize < minRangePts ? "Too small" : rangeSize > maxRangePts ? "Too large" : isBreakoutWatch ? "⚠ WATCH" : "Consolidating"
+color  rangeStatBg = not inRange ? CD : rangeSize < minRangePts ? CN : rangeSize > maxRangePts ? CR : isBreakoutWatch ? CO : CY
+
+string fireStr = not inRange ? "No active range" : sigCount < megaMinSigs - 1 ? str.tostring(signalsLeft) + " more needed" : isPrewatch ? "⚠ NEXT → WATCH!" : "🔥 WAIT: RANGE BREAK"
+color  fireBg  = isPrewatch ? CY : isBreakoutWatch ? CO : CD
+color  fireTxt = isPrewatch ? color.new(#1a1a00, 0) : isBreakoutWatch ? CW : CGr
+
+prog = math.min(sigCount, megaMinSigs)
+bars = ""
+for i = 1 to megaMinSigs
+    bars := bars + (i <= prog ? (isBreakoutWatch ? "▰" : "█") : "░")
+
+dCPRval = "PP " + str.tostring(math.round(dPP)) + "  W:" + str.tostring(math.round(dCPRw))
+wCPRval = "PP " + str.tostring(math.round(wPP))
+mCPRval = "PP " + str.tostring(math.round(mPP))
+
+tPos = switch tablePos
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+    =>                position.top_right
+
+
+// ───────────────────────────────────────────────────────────────────
+//  DASHBOARD TABLE (Full = 24 rows, Compact = 14 rows)
+// ───────────────────────────────────────────────────────────────────
+
+var table  dash    = na
+var string lastCfg = ""
+
+cfgKey = displayMode + "|" + tablePos
+
+if barstate.islast
+    if cfgKey != lastCfg or na(dash)
+        if not na(dash)
+            table.delete(dash)
+        int nRows = isDontShow ? 1 : isCompact ? 14 : 24
+        dash := table.new(tPos, 3, nRows,
+             bgcolor      = isDontShow ? CTRAN : color.new(#0a1520, 5),
+             border_width = isDontShow ? 0 : 1,
+             border_color = isDontShow ? CTRAN : color.new(#455a64, 0),
+             frame_width  = isDontShow ? 0 : 2,
+             frame_color  = isDontShow ? CTRAN : color.new(#00695c, 0))
+        lastCfg := cfgKey
+
+    if isDontShow
+        table.cell(dash, 0, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
+        table.cell(dash, 1, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
+        table.cell(dash, 2, 0, "", bgcolor=CTRAN, text_color=CTRAN, text_size=size.tiny)
+
+    else if not isCompact
+        table.cell(dash,0,0,"  "+syminfo.ticker+" · SD v4.2 Trap",   text_color=CW, bgcolor=CH, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,0,"STATUS",                           text_color=CW, bgcolor=CH, text_size=size.small)
+        table.cell(dash,2,0,"LEVEL",                            text_color=CW, bgcolor=CH, text_size=size.small)
+
+        table.cell(dash,0,1,"  ① EMA 13/34",                   text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,1,emaBull?"▲  BULL":"▼  BEAR",       text_color=CW, bgcolor=emaBull?CB:CR, text_size=size.small)
+        table.cell(dash,2,1,emaSig,                             text_color=CW, bgcolor=emaSigBg, text_size=size.small)
+
+        table.cell(dash,0,2,"  ② SUPERTREND",                  text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,2,stBull?"▲  BULL":"▼  BEAR",        text_color=CW, bgcolor=stBull?CB:CR, text_size=size.small)
+        table.cell(dash,2,2,"SL "+str.tostring(math.round(stLine)), text_color=CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,3,"  ③ DAILY 5-EMA",                 text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,3,d5Bull?"▲  ABOVE":"▼  BELOW",      text_color=CW, bgcolor=d5Bull?CB:CR, text_size=size.small)
+        table.cell(dash,2,3,str.tostring(math.round(d5Ema)),    text_color=CGr,bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,4,"  ④ ICHIMOKU",                    text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,4,ichiStat,                           text_color=CW, bgcolor=ichiBg, text_size=size.small)
+        table.cell(dash,2,4,str.tostring(math.round(cBot))+" – "+str.tostring(math.round(cTop)), text_color=CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,5,"",bgcolor=CPur,text_size=size.tiny)
+        table.cell(dash,1,5,"── EMA FILTERS ──",text_color=CW,bgcolor=CPur,text_size=size.tiny)
+        table.cell(dash,2,5,"",bgcolor=CPur,text_size=size.tiny)
+
+        table.cell(dash,0,6,"  ⑤ 15m · 200 EMA",               text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,6,e200_15s,                           text_color=CW, bgcolor=e200_15bg, text_size=size.small)
+        table.cell(dash,2,6,str.tostring(math.round(ema200_15)),text_color=CGr,bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,7,"  ⑥  5m · 200 EMA",               text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,7,e200_5s,                            text_color=CW, bgcolor=e200_5bg, text_size=size.small)
+        table.cell(dash,2,7,str.tostring(math.round(nz(ema200_5))), text_color=CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,8,"  ⑦ 15m · 89 zone",               text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,8,zone15s,                            text_color=CW, bgcolor=zone15bg, text_size=size.small)
+        table.cell(dash,2,8,str.tostring(math.round(ema89l_15))+" – "+str.tostring(math.round(ema89h_15)), text_color=CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,9,"  ⑧  5m · 89 zone",               text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,9,zone5s,                             text_color=CW, bgcolor=zone5bg, text_size=size.small)
+        table.cell(dash,2,9,str.tostring(math.round(nz(ema89l_5)))+" – "+str.tostring(math.round(nz(ema89h_5))), text_color=CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,10,"  200 EMA CHECK",                text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,10,(ema200_blocked?"🚫":"✓")+"  "+(ema200_blocked?"BLOCKED":"PATH CLEAR"), text_color=CW, bgcolor=blkRowBg, text_size=size.small)
+        table.cell(dash,2,10,blkLabel,                          text_color=blkTxt, bgcolor=blkRowBg, text_size=size.small)
+
+        table.cell(dash,0,11,"",bgcolor=CLn,text_size=size.tiny)
+        table.cell(dash,1,11,"── CONFLUENCE ──",text_color=CW,bgcolor=CLn,text_size=size.tiny)
+        table.cell(dash,2,11,"",bgcolor=CLn,text_size=size.tiny)
+
+        table.cell(dash,0,12,"  DIRECTION",                     text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,12,dirLabel,                          text_color=CW, bgcolor=dirBg, text_size=size.normal)
+        table.cell(dash,2,12,posLabel,                          text_color=CW, bgcolor=dirBg, text_size=size.small)
+
+        table.cell(dash,0,13,"  SCORE  (/ 8)",                 text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,13,"▲ "+str.tostring(bullScore)+"  /  ▼ "+str.tostring(bearScore), text_color=CW, bgcolor=CD, text_size=size.small)
+        table.cell(dash,2,13,str.tostring(math.round(close)),   text_color=CW, bgcolor=CD, text_size=size.small)
+
+        rSepBg = isBreakoutWatch ? color.new(#4a0000,0) : color.new(#1a3a1b,0)
+        table.cell(dash,0,14,"",bgcolor=rSepBg,text_size=size.tiny)
+        table.cell(dash,1,14,"── RANGE TRACKER ──",text_color=CW,bgcolor=rSepBg,text_size=size.tiny)
+        table.cell(dash,2,14,"",bgcolor=rSepBg,text_size=size.tiny)
+
+        table.cell(dash,0,15,"  RANGE SIZE",                    text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,15,str.tostring(rangeSize)+" pts",    text_color=CW, bgcolor=rangeStatBg, text_size=size.normal)
+        table.cell(dash,2,15,rangeStat,                         text_color=CW, bgcolor=rangeStatBg, text_size=size.small)
+
+        rLevels = not inRange?"—":"▲ "+str.tostring(math.round(nz(rHigh)))+"  ▼ "+str.tostring(math.round(nz(rLow)))
+        inside  = not inRange?"—":aboveRange?"↑ ABOVE!":belowRange?"↓ BELOW!":"Inside"
+        inBg    = aboveRange or belowRange ? CO : CD
+        table.cell(dash,0,16,"  RANGE LEVELS",                  text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,16,rLevels,                           text_color=inRange?CW:CGr, bgcolor=CD, text_size=size.small)
+        table.cell(dash,2,16,inside,                            text_color=aboveRange or belowRange?color.new(#ff6d00,0):CGr, bgcolor=inBg, text_size=size.small)
+
+        table.cell(dash,0,17,"  SIGNALS",                       text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,17,"# "+str.tostring(sigCount)+"  /  "+str.tostring(megaMinSigs), text_color=cntTxt, bgcolor=cntBg, text_size=size.large)
+        table.cell(dash,2,17,fireStr,                           text_color=fireTxt, bgcolor=fireBg, text_size=size.small)
+
+        table.cell(dash,0,18,"  PROGRESS",                      text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,18,bars,                              text_color=progCol, bgcolor=CD, text_size=size.small)
+        table.cell(dash,2,18,str.tostring(prog)+"/"+str.tostring(megaMinSigs), text_color=progCol, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,19,"",bgcolor=CPIV,text_size=size.tiny)
+        table.cell(dash,1,19,"── CPR (PP) ──",text_color=CW,bgcolor=CPIV,text_size=size.tiny)
+        table.cell(dash,2,19,"vs Price",text_color=CW,bgcolor=CPIV,text_size=size.tiny)
+
+        table.cell(dash,0,20,"  DAILY CPR",                     text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,20,dPPbull?"▲  ABOVE":"▼  BELOW",    text_color=CW, bgcolor=dCPRbg, text_size=size.small)
+        table.cell(dash,2,20,dCPRval,                           text_color=CGr, bgcolor=CD, text_size=size.tiny)
+
+        table.cell(dash,0,21,"  WEEKLY CPR",                    text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,21,wPPbull?"▲  ABOVE":"▼  BELOW",    text_color=CW, bgcolor=wCPRbg, text_size=size.small)
+        table.cell(dash,2,21,wCPRval,                           text_color=CGr, bgcolor=CD, text_size=size.tiny)
+
+        table.cell(dash,0,22,"  MONTHLY CPR",                   text_color=CGr,bgcolor=CD, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,22,mPPbull?"▲  ABOVE":"▼  BELOW",    text_color=CW, bgcolor=mCPRbg, text_size=size.small)
+        table.cell(dash,2,22,mCPRval,                           text_color=CGr, bgcolor=CD, text_size=size.tiny)
+
+        swStat = isBottomActive ? "🟢 " + evalHtfLabel + " BOT (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+             isTopActive    ? "🔴 " + evalHtfLabel + " TOP (" + str.tostring(math.round(activeSwingLvl)) + ")" :
+             isBottomArmed  ? "⏳ " + evalHtfLabel + " BOT SETUP (Wait Break)" :
+             isTopArmed     ? "⏳ " + evalHtfLabel + " TOP SETUP (Wait Break)" :
+             "✓ " + evalHtfLabel + " Structural Engine"
+        table.cell(dash,0,23,swStat,
+             text_color=isBottomActive or isTopActive ? color.new(#a5d6a7,0) : color.new(#ffe082,0), bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,23,fusionVerdict, text_color=CW, bgcolor=bullTrapSig or isBearSynergy ? CR : bearTrapSig or isBullSynergy ? CB : CD, text_size=size.tiny)
+        table.cell(dash,2,23,"Basis " + (rawBasis >= 0 ? "+" : "") + str.tostring(rawBasis, "#.#"), text_color=rawBasis >= 0 ? color.new(#a5d6a7,0) : color.new(#ef9a9a,0), bgcolor=CD, text_size=size.tiny)
+
+    else
+        table.cell(dash,0,0,syminfo.ticker+" · SD v4.2 Trap",     text_color=CW, bgcolor=CH, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,0,timeframe.period+" ("+evalHtfLabel+")", text_color=color.new(#a5d6a7,0), bgcolor=CH, text_size=size.tiny)
+        table.cell(dash,2,0,str.tostring(math.round(close)),    text_color=CW, bgcolor=CH, text_size=size.tiny)
+
+        table.cell(dash,0,1,netDir==1?"▲ LONG":netDir==-1?"▼ SHORT":"─ NEUTRAL", text_color=CW, bgcolor=dirBg, text_size=size.normal)
+        table.cell(dash,1,1,posLabelC,                          text_color=CW, bgcolor=dirBg, text_size=size.small)
+        table.cell(dash,2,1,"▲"+str.tostring(bullScore)+" ▼"+str.tostring(bearScore), text_color=CW, bgcolor=dirBg, text_size=size.small)
+
+        table.cell(dash,0,2,(ema200_blocked?"🚫 ":"✓ ")+(ema200_blocked?"200 BLOCKED":"200 OK"), text_color=CW, bgcolor=blkRowBg, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash,1,2,blkLabel,                           text_color=blkTxt, bgcolor=blkRowBg, text_size=size.tiny)
+        table.cell(dash,2,2,emaSig,                             text_color=CW, bgcolor=emaSigBg, text_size=size.small)
+
+        table.cell(dash,0,3,"① EMA  ② ST",                      text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,3,emaBull?"▲ BULL":"▼ BEAR",         text_color=CW, bgcolor=emaBull?CB:CR, text_size=size.small)
+        table.cell(dash,2,3,stBull ?"▲ BULL":"▼ BEAR",         text_color=CW, bgcolor=stBull ?CB:CR, text_size=size.small)
+
+        table.cell(dash,0,4,"③ D5-EMA  ④ ICHI",                 text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,4,d5Bull?"▲ ABOVE":"▼ BELOW",        text_color=CW, bgcolor=d5Bull?CB:CR, text_size=size.small)
+        table.cell(dash,2,4,ichiStat,                           text_color=CW, bgcolor=ichiBg, text_size=size.small)
+
+        table.cell(dash,0,5,"⑤ 15m200  ⑥ 5m200",                text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,5,e200_15s,                           text_color=CW, bgcolor=e200_15bg, text_size=size.small)
+        table.cell(dash,2,5,e200_5s,                            text_color=CW, bgcolor=e200_5bg,  text_size=size.small)
+
+        table.cell(dash,0,6,"⑦ 15m89   ⑧ 5m89",                 text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,6,zone15s,                            text_color=CW, bgcolor=zone15bg, text_size=size.small)
+        table.cell(dash,2,6,zone5s,                             text_color=CW, bgcolor=zone5bg,  text_size=size.small)
+
+        table.cell(dash,0,7,"RANGE",                            text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,7,str.tostring(rangeSize)+" pts",     text_color=CW, bgcolor=rangeStatBg, text_size=size.normal)
+        table.cell(dash,2,7,rangeStat,                          text_color=CW, bgcolor=rangeStatBg, text_size=size.small)
+
+        table.cell(dash,0,8,"SIGNALS",                          text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,8,"# "+str.tostring(sigCount)+" / "+str.tostring(megaMinSigs), text_color=cntTxt, bgcolor=cntBg, text_size=size.normal)
+        table.cell(dash,2,8,fireStr,                            text_color=fireTxt, bgcolor=fireBg, text_size=size.small)
+
+        table.cell(dash,0,9,"PROGRESS",                         text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,9,bars,                               text_color=progCol, bgcolor=CD, text_size=size.small)
+        table.cell(dash,2,9,str.tostring(prog)+"/"+str.tostring(megaMinSigs), text_color=progCol, bgcolor=CD, text_size=size.small)
+
+        string slC = isBreakoutWatch ? (buySignal?"SL < "+str.tostring(math.round(nz(rLow))):"SL > "+str.tostring(math.round(nz(rHigh)))) : ""
+        wBg = isBreakoutWatch ? (ema200_blocked ? CBlk : CO) : CD
+        table.cell(dash,0,10,"SL LEVEL",                        text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,10,slC,                               text_color=CW, bgcolor=wBg, text_size=size.small)
+        table.cell(dash,2,10,isBreakoutWatch?"⚠ WATCHING":"—", text_color=isBreakoutWatch?color.new(#ff6d00,0):CGr, bgcolor=CD, text_size=size.small)
+
+        table.cell(dash,0,11,"D CPR",                           text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,11,dPPbull?"▲ ABOVE":"▼ BELOW",      text_color=CW, bgcolor=dCPRbg, text_size=size.small)
+        table.cell(dash,2,11,"PP "+str.tostring(math.round(dPP)), text_color=CGr, bgcolor=CD, text_size=size.tiny)
+
+        table.cell(dash,0,12,"W / M CPR",                       text_color=CGr, bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,12,wPPbull?"▲ W ABV":"▼ W BLW",      text_color=CW, bgcolor=wCPRbg, text_size=size.small)
+        table.cell(dash,2,12,mPPbull?"▲ M ABV":"▼ M BLW",      text_color=CW, bgcolor=mCPRbg, text_size=size.small)
+
+        swCompact = isBottomActive ? "🟢 " + evalHtfLabel + " BOT" : isTopActive ? "🔴 " + evalHtfLabel + " TOP" : isBottomArmed ? "⏳ BOT SET" : isTopArmed ? "⏳ TOP SET" : "✓ " + evalHtfLabel + " Active"
+        table.cell(dash,0,13,swCompact, text_color=isBottomActive or isTopActive?color.new(#a5d6a7,0):color.new(#ffe082,0), bgcolor=CD, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash,1,13,"",bgcolor=CD,text_size=size.tiny)
+        table.cell(dash,2,13,"",bgcolor=CD,text_size=size.tiny)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  LEGACY ALERTCONDITIONS (Manual / Mobile Notifications)
+// ───────────────────────────────────────────────────────────────────
+
+alertcondition(buySignal,  "Buy Signal",  "EMA Buy Breakout")
+alertcondition(sellSignal, "Sell Signal", "EMA Sell Breakout")
+alertcondition(ema200_block_long,  "⚠ LONG BLOCKED — 200 EMA",  "Buy signal but 200 EMA above. Skip long.")
+alertcondition(ema200_block_short, "⚠ SHORT BLOCKED — 200 EMA", "Sell signal but 200 EMA below. Skip short.")
+alertcondition(isPrewatch, "⚠ Pre-warning — Next = Watch", "One more signal activates watch.")
+alertcondition(isBreakoutWatch and buySignal  and not ema200_blocked, "🟢 ENTER/HOLD LONG — Watch + 200 clear",    "Buy in watch. 200 EMA clear.")
+alertcondition(isBreakoutWatch and sellSignal and not ema200_blocked, "🔴 ENTER/REVERSE SHORT — Watch + 200 clear", "Sell in watch. 200 EMA clear.")
+alertcondition(isBreakoutWatch and buySignal  and ema200_blocked,     "⚠ LONG watch — 200 EMA blocking",           "Buy in watch but 200 EMA blocks.")
+alertcondition(isBreakoutWatch and sellSignal and ema200_blocked,     "⚠ SHORT watch — 200 EMA blocking",          "Sell in watch but 200 EMA blocks.")
+alertcondition(isMegaBreakout and megaUp and not (e200_15_bear or e200_5_bear), "🔥 MEGA LONG — Range broken + 200 clear",  "Range break long.")
+alertcondition(isMegaBreakout and megaDn and not (e200_15_bull or e200_5_bull), "🔥 MEGA SHORT — Range broken + 200 clear", "Range break short.")
+alertcondition(isMegaBreakout and megaBlocked,                                  "⚠ MEGA SIGNAL — 200 EMA blocking",         "Range breakout but 200 EMA in the way.")
+alertcondition(isBreakoutWatch and buySignal  and bullScore >= 7, "✅ STRONG LONG — 7+/8",  "Very high confluence long.")
+alertcondition(isBreakoutWatch and sellSignal and bearScore >= 7, "✅ STRONG SHORT — 7+/8", "Very high confluence short.")
+alertcondition(confirmBottom, "🟢 CONFIRMED SWING BOTTOM (125m / 1D)", "Swing Bottom Confirmed.")
+alertcondition(confirmTop,    "🔴 CONFIRMED SWING TOP (125m / 1D)",    "Swing Top Confirmed.")
+alertcondition(bullTrapSig,   "🚨 BULL TRAP (Smart Money Exhaustion Short)", "Bull Trap: Sweep/Rejection at Roof with Short-Covering or Call Blitz.")
+alertcondition(bearTrapSig,   "🟢 BEAR TRAP (Smart Money Absorption Buy)",   "Bear Trap: Sweep/Absorption at Floor with Long-Unwinding or Put Blitz.")
+
+
+// ───────────────────────────────────────────────────────────────────
+//  RE-ENTRY — Two Continuation Entries (Symmetric Long/Short)
+// ───────────────────────────────────────────────────────────────────
+
+GR = "Re-Entry (continuation)"
+reEnabled  = input.bool(true,  "Enable re-entry alerts", group=GR)
+reBufPct   = input.float(0.15, "34 EMA touch buffer (%)", step=0.05, group=GR)
+reAwayBars = input.int(10,     "200 EMA fresh test: min bars away", minval=1, group=GR)
+reSlBufPct = input.float(0.05, "200 EMA re-entry SL buffer (%)", step=0.05, group=GR)
+
+bool touch200 = not na(ema200_15) and low <= ema200_15 and high >= ema200_15
+var int barsAway200 = 100000
+bool fresh200 = touch200 and barsAway200 >= reAwayBars
+barsAway200 := touch200 ? 0 : barsAway200 + 1
+
+bool re200Long  = reEnabled and fresh200 and close > ema200_15 and close > (high + low) / 2
+bool re200Short = reEnabled and fresh200 and close < ema200_15 and close < (high + low) / 2
+
+var int  rbDir    = 0
+var bool re34Used = false
+
+if isMegaBreakout
+    rbDir    := megaUp ? 1 : -1
+    re34Used := false
+if (rbDir == 1 and emaBear) or (rbDir == -1 and emaBull)
+    rbDir    := 0
+    re34Used := false
+
+float reBuf       = longEma * reBufPct / 100.0
+bool touch34Long  = reEnabled and rbDir == 1  and not re34Used and low  <= longEma + reBuf
+bool touch34Short = reEnabled and rbDir == -1 and not re34Used and high >= longEma - reBuf
+bool re34Long     = touch34Long  and emaBull and close > longEma and close > cTop and close > (high + low) / 2 and not (e200_15_bear or e200_5_bear)
+bool re34Short    = touch34Short and emaBear and close < longEma and close < cBot and close < (high + low) / 2 and not (e200_15_bull or e200_5_bull)
+if touch34Long or touch34Short
+    re34Used := true
+
+bool  reLong  = re200Long or re34Long
+bool  reShort = re200Short or re34Short
+int   reType  = (re200Long or re200Short) ? 1 : (re34Long or re34Short) ? 2 : 0
+float reSL = re200Long ? math.min(low, ema200_15) * (1 - reSlBufPct / 100) :
+     re200Short ? math.max(high, ema200_15) * (1 + reSlBufPct / 100) :
+     re34Long ? low : re34Short ? high : na
+
+plotshape(reLong,  "Re-Entry Long",  shape.diamond, location.belowbar, color.new(#00e5ff, 0), size=size.small)
+plotshape(reShort, "Re-Entry Short", shape.diamond, location.abovebar, color.new(#ff4081, 0), size=size.small)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  GAP-DAY PULLBACK — 100+pt Gap (Standard Candle Close Default)
+// ───────────────────────────────────────────────────────────────────
+
+GG = "Gap-Day Pullback Entries"
+gapEnabled  = input.bool(true,  "Enable gap-day pullback entries", group=GG)
+gapMinPts   = input.float(100,  "Min gap size (pts)", minval=10, group=GG)
+gapSlBufPct = input.float(0.10, "SL buffer beyond 34 EMA (%)", step=0.05, group=GG)
+casGapFix   = input.bool(false, "CAS: measure gap vs 15:15 close (OFF = use standard candle close)", group=GG,
+     tooltip="OFF by default: uses standard TradingView candle close (`dPivC`) without interrupting CAS.")
+
+var float contCloseToday = na
+var float contClosePrev  = na
+bool isContBar = (hour(time, "Asia/Kolkata") * 100 + minute(time, "Asia/Kolkata")) < 1515
+
+if session.isfirstbar_regular
+    contClosePrev := contCloseToday
+
+if isContBar
+    contCloseToday := close
+
+var bool gapDay    = false
+var int  gapDir    = 0
+var int  gapPlan   = 0
+var bool gapT1Done = false
+var bool gapT2Done = false
+
+if session.isfirstbar_regular
+    float refClose = (casGapFix and not na(contClosePrev)) ? contClosePrev : dPivC
+    gapDay    := not na(refClose) and math.abs(open - refClose) >= gapMinPts
+    gapDir    := gapDay ? (open < refClose ? -1 : 1) : 0
+    gapPlan   := 0
+    gapT1Done := false
+    gapT2Done := false
+
+bool gapAbsorb = gapEnabled and gapDay and not isMegaBreakout and
+     ((gapDir == -1 and sellSignal) or (gapDir == 1 and buySignal))
+if gapAbsorb and gapPlan == 0
+    gapPlan := gapDir
+
+float gapZone = gapPlan == 1 ? math.max(nz(ema13_5, close), nz(ema34_5, close)) :
+     math.min(nz(ema13_5, close), nz(ema34_5, close))
+bool gapT1Long  = gapEnabled and gapPlan == 1  and not gapT1Done and low  <= gapZone
+bool gapT1Short = gapEnabled and gapPlan == -1 and not gapT1Done and high >= gapZone
+if gapT1Long or gapT1Short
+    gapT1Done := true
+
+bool gapT2Long  = gapEnabled and gapPlan == 1  and gapT1Done and not gapT2Done and low  <= shortEma
+bool gapT2Short = gapEnabled and gapPlan == -1 and gapT1Done and not gapT2Done and high >= shortEma
+if gapT2Long or gapT2Short
+    gapT2Done := true
+
+float gapSL = gapPlan == 1 ? longEma * (1 - gapSlBufPct / 100) : longEma * (1 + gapSlBufPct / 100)
+
+plotshape(gapT1Long or gapT2Long,   "Gap Pullback Long",  shape.square, location.belowbar, color.new(#ffd600, 0), size=size.small)
+plotshape(gapT1Short or gapT2Short, "Gap Pullback Short", shape.square, location.abovebar, color.new(#ff9100, 0), size=size.small)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  TREND-FLIP ENTRY (Decisive Close Through 200-EMA)
+// ───────────────────────────────────────────────────────────────────
+
+GT = "Trend-Flip entry (decisive 200-EMA break)"
+tfEnabled   = input.bool(true,  "Enable trend-flip alerts", group=GT)
+tfBreachPts = input.float(20,   "Decisive breach beyond 200 EMA (pts)", minval=1, group=GT)
+tfSlBufPct  = input.float(0.05, "SL buffer beyond base level (%)", step=0.05, group=GT)
+
+bool xTfLong  = ta.crossover(close,  ema200_15 + tfBreachPts)
+bool xTfShort = ta.crossunder(close, ema200_15 - tfBreachPts)
+bool tfLong   = tfEnabled and emaBull and not na(ema200_15) and xTfLong
+bool tfShort  = tfEnabled and emaBear and not na(ema200_15) and xTfShort
+
+float tfBaseLong = (longEma < close and stLine < close) ? math.max(longEma, stLine) :
+     longEma < close ? longEma : stLine < close ? stLine : ema200_15
+float tfBaseShort = (longEma > close and stLine > close) ? math.min(longEma, stLine) :
+     longEma > close ? longEma : stLine > close ? stLine : ema200_15
+float tfSL = tfLong ? tfBaseLong * (1 - tfSlBufPct / 100) :
+     tfShort ? tfBaseShort * (1 + tfSlBufPct / 100) : na
+
+plotshape(tfLong,  "Trend-Flip Long",  shape.triangleup,   location.belowbar, color.new(#76ff03, 0), size=size.small)
+plotshape(tfShort, "Trend-Flip Short", shape.triangledown, location.abovebar, color.new(#ff6d00, 0), size=size.small)
+
+
+// ───────────────────────────────────────────────────────────────────
+//  5m EMA-CONFLUENCE ZONE
+// ───────────────────────────────────────────────────────────────────
+
+GCF = "5m EMA Confluence Zone"
+cfShow     = input.bool(true,  "Mark 5m confluence tests", group=GCF)
+cfMaxWidth = input.float(0.60, "Max cluster width (x ATR)", step=0.05, minval=0.05, group=GCF)
+cfMinLines = input.int(2,      "Min lines in the cluster", minval=2, maxval=5, group=GCF)
+cfDrawZone = input.bool(true,  "Shade the zone", group=GCF)
+
+f_confluence(float maxW, int minL) =>
+    float e34c  = ta.ema(close, 34)
+    float e89h  = ta.ema(high, 89)
+    float e89l  = ta.ema(low, 89)
+    float e200c = ta.ema(close, 200)
+    [stc, _dc]  = ta.supertrend(3.0, 5)
+    float atrc  = ta.atr(14)
+    float tol   = maxW * atrc
+    arr = array.from(e34c, e89h, e89l, e200c, stc)
+    array.sort(arr, order.ascending)
+    int   bestN  = 1
+    float bestLo = array.get(arr, 0)
+    float bestHi = array.get(arr, 0)
+    for i = 0 to array.size(arr) - 1
+        int j = i
+        while j + 1 < array.size(arr) and array.get(arr, j + 1) - array.get(arr, i) <= tol
+            j := j + 1
+        int cnt = j - i + 1
+        if cnt > bestN or (cnt == bestN and array.get(arr, j) - array.get(arr, i) < bestHi - bestLo)
+            bestN  := cnt
+            bestLo := array.get(arr, i)
+            bestHi := array.get(arr, j)
+    bool  isConf = bestN >= minL
+    bool  tested = isConf and low <= bestHi and high >= bestLo
+    bool  sup    = tested and close > bestHi
+    bool  rej    = tested and close < bestLo
+    float strg   = tol > 0 ? math.max(0.0, math.min(1.0, 1.0 - (bestHi - bestLo) / tol)) : 0.0
+    [bestN, bestLo, bestHi, sup, rej, strg]
+
+[cfN, cfLo, cfHi, cfSup, cfRej, cfStr] = request.security(syminfo.tickerid, "5",
+     f_confluence(cfMaxWidth, cfMinLines), lookahead=barmerge.lookahead_off)
+
+plotshape(cfShow and cfSup, "5m Confluence SUPPORT", shape.cross, location.belowbar,
+     color=color.new(#00e5ff, 0), size=size.tiny, text="C")
+plotshape(cfShow and cfRej, "5m Confluence RESIST",  shape.cross, location.abovebar,
+     color=color.new(#ff3d00, 0), size=size.tiny, text="C")
+
+pLo = plot(cfShow and cfDrawZone and cfN >= cfMinLines ? cfLo : na, "Conf zone lo",
+     color=color.new(#00e5ff, 55), display=display.pane)
+pHi = plot(cfShow and cfDrawZone and cfN >= cfMinLines ? cfHi : na, "Conf zone hi",
+     color=color.new(#00e5ff, 55), display=display.pane)
+fill(pLo, pHi, color=color.new(#00e5ff, 88), title="Conf zone")
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  UNIFIED JSON ALERT (All Intraday & 125m/1D Swing Grades)
+// ═══════════════════════════════════════════════════════════════════
+
+f_json(string _grade, string _dir, float _sl, int _sig, int _reType) =>
+    int  sc  = _dir == "LONG" ? bullScore : bearScore
+    bool blk = _grade == "MEGA" ? megaBlocked : ema200_blocked
+    '{"secret":"' + webhookSecret + '","v":"4.1.0","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","swingTf":"' + evalHtfLabel + '","dir":"' + _dir + '","grade":"' + _grade +
+     '","score":' + str.tostring(sc) +
+     ',"sig":'    + str.tostring(_sig) +
+     ',"reType":' + str.tostring(_reType) +
+     ',"sl":'     + str.tostring(nz(_sl, 0), "#.##") +
+     ',"close":'  + str.tostring(close, "#.##") +
+     ',"rHigh":'  + str.tostring(nz(prevRHigh, 0), "#") +
+     ',"rLow":'   + str.tostring(nz(prevRLow, 0),  "#") +
+     ',"st":'     + str.tostring(stLine, "#") +
+     ',"ema34":'  + str.tostring(longEma, "#") +
+     ',"ema200_5":'  + str.tostring(nz(ema200_5, 0), "#") +
+     ',"ema200_15":' + str.tostring(nz(ema200_15, 0), "#") +
+     ',"cloudTop":'  + str.tostring(nz(cTop, 0), "#") +
+     ',"cloudBot":'  + str.tostring(nz(cBot, 0), "#") +
+     ',"blocked":'   + (blk ? "true" : "false") +
+     ',"swingState":'+ str.tostring(swingState) +
+     ',"swingConf":' + str.tostring(activeSwingSc) +
+     ',"futQuad":"'  + futQuadrant +
+     '","fusion":"'  + fusionScenario +
+     '","basis":'    + str.tostring(rawBasis, "#.##") +
+     ',"adjBasis":'  + str.tostring(adjustedBasisSpread, "#.##") +
+     ',"comp":'      + (compWindowActive ? "true" : "false") +
+     ',"vboUp":'     + str.tostring(nz(vboUp, 0), "#") +
+     ',"vboDn":'     + str.tostring(nz(vboDn, 0), "#") +
+     ',"vboBreak":"' + (vboBreakUp ? "UP" : vboBreakDn ? "DOWN" : "NONE") +
+     '","confTest":"'+ (cfSup ? "SUPPORT" : cfRej ? "RESIST" : "NONE") +
+     '","confN":'    + str.tostring(nz(cfN, 0)) +
+     ',"confStr":'   + str.tostring(nz(cfStr, 0), "#.##") +
+     ',"confLo":'    + str.tostring(nz(cfLo, 0), "#") +
+     ',"confHi":'    + str.tostring(nz(cfHi, 0), "#") +
+     ',"t":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm", "Asia/Kolkata") + '"}'
+
+if isMegaBreakout
+    alert(f_json("MEGA", megaUp ? "LONG" : "SHORT", 0.0, megaSigNum, 0), alert.freq_once_per_bar_close)
+else if newSig and not gapAbsorb
+    alert(f_json(isBreakoutWatch ? "WATCH" : "SIGNAL", buySignal ? "LONG" : "SHORT", 0.0, sigCount, 0), alert.freq_once_per_bar_close)
+else if vboBreakUp or vboBreakDn
+    alert(f_json("VBO_BREAK", vboBreakUp ? "LONG" : "SHORT", 0.0, sigCount, 0), alert.freq_once_per_bar_close)
+
+if reLong or reShort
+    alert(f_json("RE_ENTRY", reLong ? "LONG" : "SHORT", reSL, sigCount, reType), alert.freq_once_per_bar_close)
+if tfLong or tfShort
+    alert(f_json("TREND_FLIP", tfLong ? "LONG" : "SHORT", tfSL, sigCount, 0), alert.freq_once_per_bar_close)
+if gapT1Long or gapT1Short
+    alert(f_json("GAP_PULLBACK", gapT1Long ? "LONG" : "SHORT", gapSL, sigCount, 0), alert.freq_once_per_bar)
+if gapT2Long or gapT2Short
+    alert(f_json("GAP_ADD", gapT2Long ? "LONG" : "SHORT", gapSL, sigCount, 0), alert.freq_once_per_bar)
+
+// Swing & Smart Money Trap Alerts
+float swBotSL = nz(activeSwingLvl, low)  - (swingSlAtr * nz(activeSwingAtr, atr14))
+float swTopSL = nz(activeSwingLvl, high) + (swingSlAtr * nz(activeSwingAtr, atr14))
+if confirmBottom
+    alert(f_json("SWING_BOTTOM", "LONG", swBotSL, sigCount, activeSwingTag), alert.freq_once_per_bar_close)
+if confirmTop
+    alert(f_json("SWING_TOP", "SHORT", swTopSL, sigCount, activeSwingTag), alert.freq_once_per_bar_close)
+if bearTrapSig and not confirmBottom
+    alert(f_json("BEAR_TRAP_BUY", "LONG", bearTrapSL, sigCount, 8), alert.freq_once_per_bar_close)
+if bullTrapSig and not confirmTop
+    alert(f_json("BULL_TRAP_SELL", "SHORT", bullTrapSL, sigCount, 8), alert.freq_once_per_bar_close)
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ENGINE LEVELS ON CHART (SL + T1/T2/T3 — Including SWING & TREND_FLIP)
+// ═══════════════════════════════════════════════════════════════════
+
+GL = "Engine levels on chart (SL + T1/T2/T3)"
+lvlShow = input.bool(true,  "Draw SL + T1/T2/T3 on entry alerts", group=GL)
+lvlBars = input.int(40,     "Extend lines this many bars", minval=5, group=GL)
+t1LPct  = input.float(0.50, "Long T1 %",  step=0.01, group=GL)
+t2LPct  = input.float(0.92, "Long T2 %",  step=0.01, group=GL)
+t3LPct  = input.float(1.79, "Long T3 %",  step=0.01, group=GL)
+t1SPct  = input.float(0.50, "Short T1 %", step=0.01, group=GL)
+t2SPct  = input.float(1.12, "Short T2 %", step=0.01, group=GL)
+t3SPct  = input.float(2.12, "Short T3 %", step=0.01, group=GL)
+
+bool lvlLong = (isMegaBreakout and megaUp) or (newSig and not gapAbsorb and buySignal) or
+     vboBreakUp or reLong or tfLong or gapT1Long or gapT2Long or confirmBottom or bearTrapSig
+bool lvlShort = (isMegaBreakout and not megaUp) or (newSig and not gapAbsorb and sellSignal) or
+     vboBreakDn or reShort or tfShort or gapT1Short or gapT2Short or confirmTop or bullTrapSig
+float lvlSL = confirmBottom ? swBotSL :
+     confirmTop ? swTopSL :
+     bearTrapSig ? bearTrapSL :
+     bullTrapSig ? bullTrapSL :
+     (reLong or reShort) ? reSL :
+     (tfLong or tfShort) ? tfSL :
+     (gapT1Long or gapT1Short or gapT2Long or gapT2Short) ? gapSL : stLine
+
+var line  lnSL = na
+var line  lnT1 = na
+var line  lnT2 = na
+var line  lnT3 = na
+var label lbSL = na
+var label lbT1 = na
+var label lbT2 = na
+var label lbT3 = na
+
+f_lvl(float _y, color _c) =>
+    line.new(bar_index, _y, bar_index + lvlBars, _y, color=_c, width=1, style=line.style_dashed)
+f_tag(float _y, string _s, color _c) =>
+    label.new(bar_index + lvlBars, _y, _s, style=label.style_label_left,
+     color=color.new(_c, 85), textcolor=_c, size=size.small)
+
+if lvlShow and (lvlLong or lvlShort)
+    line.delete(lnSL)
+    line.delete(lnT1)
+    line.delete(lnT2)
+    line.delete(lnT3)
+    label.delete(lbSL)
+    label.delete(lbT1)
+    label.delete(lbT2)
+    label.delete(lbT3)
+    float lt1 = lvlLong ? close * (1 + t1LPct / 100) : close * (1 - t1SPct / 100)
+    float lt2 = lvlLong ? close * (1 + t2LPct / 100) : close * (1 - t2SPct / 100)
+    float lt3 = lvlLong ? close * (1 + t3LPct / 100) : close * (1 - t3SPct / 100)
+    lnSL := f_lvl(lvlSL, color.new(#ff1744, 0))
+    lnT1 := f_lvl(lt1,   color.new(#00c853, 0))
+    lnT2 := f_lvl(lt2,   color.new(#00c853, 30))
+    lnT3 := f_lvl(lt3,   color.new(#00c853, 50))
+    lbSL := f_tag(lvlSL, "SL " + str.tostring(lvlSL, "#"), #ff1744)
+    lbT1 := f_tag(lt1,   "T1 " + str.tostring(lt1, "#"),   #00c853)
+    lbT2 := f_tag(lt2,   "T2 " + str.tostring(lt2, "#"),   #00c853)
+    lbT3 := f_tag(lt3,   "T3 " + str.tostring(lt3, "#"),   #00c853)
