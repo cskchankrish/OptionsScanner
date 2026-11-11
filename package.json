@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test test/convictionMetrics.test.js test/eodDecision.test.js test/eodTrackRecord.test.js test/sessionPersistence.test.js test/smartMoneyFusion.test.js test/sourceHealth.test.js test/stockSort.test.js test/tvWebhook.test.js test/e2e_simulation.test.js test/criticalFixes.webhook.test.js test/criticalFixes.niftyOi.test.js test/eodDispatch.test.js test/reliablePoller.test.js test/refreshCore.test.js"
+    "test": "node --test test/convictionMetrics.test.js test/eodDecision.test.js test/eodTrackRecord.test.js test/sessionPersistence.test.js test/smartMoneyFusion.test.js test/sourceHealth.test.js test/stockSort.test.js test/tvWebhook.test.js test/e2e_simulation.test.js test/criticalFixes.webhook.test.js test/criticalFixes.niftyOi.test.js test/eodDispatch.test.js test/reliablePoller.test.js test/refreshCore.test.js test/flowBridge.test.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.41.0",

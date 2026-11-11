@@ -28,6 +28,17 @@
 
 import { Redis } from "@upstash/redis";
 import { authorizeRequest } from "../src/webhookAuth.js";
+import {
+  getFlowBridgeConfig,
+  shouldDispatch,
+  buildFlowEntry,
+  dispatchFlowEntry,
+  computeDispatchTimeoutMs,
+  newTradeId as defaultNewTradeId,
+  isBridgeOwned,
+} from "../src/flowBridge.js";
+
+export const ACTIVE_TRADE_KEY = "nifty:tv:active_trade";
 
 const REDIS_URL =
   process.env.UPSTASH_REDIS_REST_URL ||
@@ -154,6 +165,9 @@ function getWebhookDeps() {
       return refreshLiveSnapshot({ queryExpiry: "near", awaitPersist: true, source: "webhook-refresh", deadlineMs });
     },
     sendText: sendTelegramText,
+    // Flow execution bridge (src/flowBridge.js): HTTP client and trade-id generator.
+    bridgeFetch: (...args) => globalThis.fetch(...args),
+    newTradeId: defaultNewTradeId,
   };
   return { ...defaults, ...(_webhookDepsOverride || {}) };
 }
@@ -746,6 +760,8 @@ export async function sendTelegramAlert(fused) {
       `• *Stop Loss:* \`${fused.stopLoss ?? "N/A"}\` (${fused.riskPoints ? fused.riskPoints + " pts, ATR-Capped" : "N/A"})`,
       targetLine,
       `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
+      fused.tradeId ? `• *Trade ID:* \`${fused.tradeId}\`` : null,
+      fused.execution ? `• *Algo Execution:* ${describeExecution(fused.execution)}` : null,
       `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
       `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
       `• *Verdict:* ${fused.reasoning}`,
@@ -989,6 +1005,150 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Flow execution bridge (scanner side) — see docs/flow-bridge.md
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Strips Telegram-Markdown control characters from text that came from outside (Algo reasons). */
+function mdSafe(v) {
+  return String(v ?? "").replace(/[*_`[\]]/g, "").slice(0, 300);
+}
+
+/** One-line description of a trade's execution state (Telegram). */
+export function describeExecution(ex) {
+  if (!ex) return "n/a";
+  switch (ex.status) {
+    case "ACCEPTED":
+      return `✅ ACCEPTED by Algo · mode \`${mdSafe(ex.mode || "?")}\` · orderRef \`${mdSafe(ex.orderRef || "none")}\` · 1 lot`;
+    case "NOT_EXECUTED":
+      return `⚠️ NOT EXECUTED (${mdSafe(ex.outcome || "skipped")}): ${mdSafe(ex.reason || "no reason given")}`;
+    case "UNKNOWN":
+      return `🚨 UNKNOWN (${mdSafe(ex.error || "no response")}) — CHECK BROKER`;
+    case "PENDING":
+      return "⏳ dispatch pending";
+    default:
+      return mdSafe(ex.status);
+  }
+}
+
+function parseMaybeJson(v) {
+  return typeof v === "string" ? JSON.parse(v) : v;
+}
+
+/** Deletes the active-trade key only if it still holds the trade `id` (read-check-delete). */
+async function releaseActiveTradeIfOwned(redis, id) {
+  if (!redis) return false;
+  try {
+    const cur = parseMaybeJson(await redis.get(ACTIVE_TRADE_KEY));
+    if (cur && cur.id === id) {
+      await redis.del(ACTIVE_TRADE_KEY);
+      return true;
+    }
+  } catch (e) {
+    console.error("[flow-bridge] failed to release position lock:", e?.message);
+  }
+  return false;
+}
+
+/**
+ * Dispatches an already-claimed trade to the Algo and applies the outcome to the lock.
+ * Mutates `activeData.execution`; returns the execution record. Never throws.
+ */
+async function runBridgeDispatch({ redis, config, fused, activeData, activeTtl, deps, requestStartMs }) {
+  const id = activeData.id;
+  const at = () => new Date(deps.now()).toISOString();
+  let execution;
+  let dispatch = null;
+
+  const built = buildFlowEntry({ id, ts: deps.now(), fused });
+  const timeoutMs = computeDispatchTimeoutMs(config.timeoutMs, Date.now() - requestStartMs);
+  if (built.error) {
+    execution = { status: "NOT_EXECUTED", outcome: "NOT_SENT", reason: `not dispatched: ${built.error}`, mode: null, orderRef: null, at: at() };
+  } else if (timeoutMs === 0) {
+    execution = { status: "NOT_EXECUTED", outcome: "NOT_SENT", reason: "not dispatched: request time budget exhausted before dispatch", mode: null, orderRef: null, at: at() };
+  } else {
+    dispatch = await dispatchFlowEntry({ config, entry: built.entry, fetchImpl: deps.bridgeFetch, timeoutMs });
+    if (dispatch.outcome === "ACCEPTED") {
+      execution = { status: "ACCEPTED", mode: dispatch.mode, orderRef: dispatch.orderRef, at: at() };
+    } else if (dispatch.outcome === "REJECTED" || dispatch.outcome === "DUPLICATE") {
+      execution = { status: "NOT_EXECUTED", outcome: dispatch.outcome, reason: dispatch.reason, mode: dispatch.mode, orderRef: dispatch.orderRef, at: at() };
+    } else {
+      execution = { status: "UNKNOWN", error: dispatch.error, httpStatus: dispatch.httpStatus, timeoutMs, at: at() };
+    }
+    execution.dispatchMs = dispatch.durationMs;
+  }
+  activeData.execution = execution;
+
+  if (execution.status === "NOT_EXECUTED") {
+    // Nothing is held at the broker: free the single-position lock for the next signal.
+    await releaseActiveTradeIfOwned(redis, id);
+  } else if (redis) {
+    try {
+      // UNKNOWN is persisted WITHOUT expiry: only the owner (GET close_trade with tradeId) or an
+      // Algo sync-back may clear it. ACCEPTED keeps the trade's normal TTL.
+      const opts = execution.status === "UNKNOWN" ? undefined : { ex: activeTtl };
+      if (opts) await redis.set(ACTIVE_TRADE_KEY, JSON.stringify(activeData), opts);
+      else await redis.set(ACTIVE_TRADE_KEY, JSON.stringify(activeData));
+    } catch (e) {
+      // The claimed record still says PENDING, which is bridge-owned: the lock holds either way.
+      console.error("[flow-bridge] failed to record execution outcome:", e?.message);
+    }
+  }
+
+  const head = `\`${fused.grade}\` ${fused.direction} @ \`${fused.entryPrice}\` · Trade ID \`${id}\``;
+  let text;
+  if (execution.status === "ACCEPTED") {
+    text = [
+      `🤖✅ *ALGO ACCEPTED · 1 LOT* · ${head}`,
+      `• *Mode:* \`${mdSafe(execution.mode || "?")}\` | *Order Ref:* \`${mdSafe(execution.orderRef || "none")}\``,
+      `• *Levels (spot):* SL \`${fused.stopLoss}\` | T1 \`${fused.target1Price}\` | T2 \`${fused.target2Price}\``,
+      `• Exits now come from the Algo's sync-back; the scanner will not auto-manage this trade.`,
+    ].join("\n");
+  } else if (execution.status === "NOT_EXECUTED") {
+    text = [
+      `⚠️ *APPROVED BUT NOT EXECUTED* · ${head}`,
+      `• *Algo said:* \`${mdSafe(execution.outcome)}\`${execution.mode ? ` (mode \`${mdSafe(execution.mode)}\`)` : ""}`,
+      `• *Reason:* ${mdSafe(execution.reason || "no reason given")}`,
+      `• Position lock released — the next signal can be taken.`,
+    ].join("\n");
+  } else {
+    text = [
+      `🚨🚨 *ALGO OUTCOME UNKNOWN — CHECK YOUR BROKER NOW* 🚨🚨`,
+      `• ${head}`,
+      `• *Problem:* ${mdSafe(execution.error || "no response")}`,
+      `• The order MAY have been placed. Position stays LOCKED and will NOT auto-clear.`,
+      `• If no position exists at the broker, close it here with \`GET /api/tv-webhook?close_trade=1&tradeId=${id}\` (+ secret).`,
+      `• Do NOT resend blindly; a resend with the same id is safe (Algo answers duplicate).`,
+    ].join("\n");
+  }
+  try {
+    await deps.sendText(text);
+  } catch (e) {
+    console.error("[flow-bridge] Telegram send failed:", e?.message);
+  }
+  return execution;
+}
+
+/**
+ * Exit-matching rule. Returns null when the exit may proceed, or a reason string for a 409.
+ *  - an exit carrying a tradeId must match the active trade's id;
+ *  - a bridge-owned trade can only be exited with its matching tradeId.
+ */
+export function checkExitTradeMatch(activeTrade, tradeId) {
+  const hasId = tradeId !== undefined && tradeId !== null && String(tradeId) !== "";
+  if (hasId) {
+    if (!activeTrade) return `tradeId ${tradeId} does not match: no active trade`;
+    if (String(activeTrade.id || "") !== String(tradeId)) {
+      return `tradeId ${tradeId} does not match the active trade (${activeTrade.id || "no id"})`;
+    }
+    return null;
+  }
+  if (isBridgeOwned(activeTrade)) {
+    return `active trade ${activeTrade.id} is bridge-owned (${activeTrade.execution.status}); exits must carry its tradeId`;
+  }
+  return null;
+}
+
 /**
  * Automatically evaluates the active trade in Redis against live price action (T1, T2, Cost, SL, Time-Stop)
  */
@@ -1005,6 +1165,9 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
   }
 
   if (!activeTrade || !activeTrade.active) return null;
+  // A bridge-owned trade (sent to the Algo) is driven only by the Algo's sync-back exits:
+  // never auto-scale or auto-close it from scanner prices.
+  if (isBridgeOwned(activeTrade)) return null;
 
   const spot = Number(currentSpot);
   if (!spot || isNaN(spot)) return null;
@@ -1165,6 +1328,7 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
+  const requestStartMs = Date.now();
   const istDate = getIstDateString();
   const redis = getRedisClient();
 
@@ -1197,6 +1361,17 @@ export default async function handler(req, res) {
         try {
           const raw = await redis.get("nifty:tv:active_trade");
           activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+        } catch (e) {}
+      }
+      // Same matching rule as exit POSTs: a bridge-owned trade is closed here only with its
+      // tradeId (the owner's manual escape hatch for an UNKNOWN outcome checked at the broker).
+      const mismatch = checkExitTradeMatch(activeTrade, req.query?.tradeId);
+      if (mismatch) {
+        console.warn(`[tv-webhook] close_trade rejected (409): ${mismatch}`);
+        return res.status(409).json({ ok: false, error: "TRADE_ID_MISMATCH", detail: mismatch });
+      }
+      if (redis && activeTrade) {
+        try {
           await redis.del("nifty:tv:active_trade");
         } catch (e) {}
       }
@@ -1446,12 +1621,37 @@ export default async function handler(req, res) {
         } catch (e) {}
       }
 
+      // Exit matching: a tradeId must match the active trade; a bridge-owned trade needs one.
+      const mismatch = checkExitTradeMatch(activeTrade, payload.tradeId);
+      if (mismatch) {
+        console.warn(`[tv-webhook] exit ${payload.grade} rejected (409): ${mismatch} (source=${payload.source || "unknown"})`);
+        return res.status(409).json({ ok: false, error: "TRADE_ID_MISMATCH", detail: mismatch });
+      }
+
       const nowIst = new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
       const nowIso = new Date().toISOString();
-      const fillPrice = payload.close || payload.entry || (activeTrade ? (payload.grade === "TARGET_1_HIT" ? activeTrade.target1Price : payload.grade === "TARGET_2_HIT" ? activeTrade.target2Price : activeTrade.entryPrice) : 0);
+      // Fill level (NIFTY spot): TradingView sends `close`, the Algo sync-back sends `spot`.
+      const fillPrice = payload.close || payload.spot || payload.entry || (activeTrade ? (payload.grade === "TARGET_1_HIT" ? activeTrade.target1Price : payload.grade === "TARGET_2_HIT" ? activeTrade.target2Price : activeTrade.entryPrice) : 0);
+      const hasTradeId = payload.tradeId !== undefined && payload.tradeId !== null && String(payload.tradeId) !== "";
+      const sync = hasTradeId || payload.source
+        ? {
+            source: payload.source ?? null,
+            tradeId: hasTradeId ? String(payload.tradeId) : null,
+            spot: payload.spot ?? null,
+            optionFill: payload.optionFill ?? null,
+            lots: payload.lots ?? null,
+            mode: payload.mode ?? null,
+            t: payload.t ?? null,
+          }
+        : null;
 
       if (payload.grade === "TARGET_1_HIT") {
         if (activeTrade) {
+          if (sync) activeTrade.lastSync = { grade: payload.grade, ...sync };
+          // An Algo sync-back for this exact trade proves the Algo holds it: resolve UNKNOWN.
+          if (sync?.tradeId && activeTrade.execution?.status === "UNKNOWN") {
+            activeTrade.execution = { ...activeTrade.execution, status: "ACCEPTED", mode: sync.mode ?? activeTrade.execution.mode ?? null, resolvedBy: "sync-back", resolvedAt: nowIso };
+          }
           activeTrade.hitT1 = true;
           activeTrade.t1HitTime = nowIst;
           activeTrade.t1HitPrice = fillPrice;
@@ -1473,6 +1673,7 @@ export default async function handler(req, res) {
           recommendedLots: 0.4,
           netPnl: activeTrade ? Number(((activeTrade.target1Dist || 0) * 0.6).toFixed(2)) : 0,
           reasoning: `Target 1 achieved. 60% profit booked, SL moved to Cost (${activeTrade?.entryPrice || fillPrice}).`,
+          ...(sync ? { sync } : {}),
         };
         if (redis) {
           await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(t1Record));
@@ -1514,11 +1715,13 @@ export default async function handler(req, res) {
         decision: "TRADE_CLOSED_FLAT",
         recommendedLots: 0,
         reasoning: `Trade exited (${payload.grade}) at ${fillPrice}. Realized net PnL: ${netPnl >= 0 ? "+" : ""}${netPnl} pts. Market is now FLAT.`,
+        ...(sync ? { sync } : {}),
       };
 
       if (redis) {
         await Promise.all([
-          redis.del("nifty:tv:active_trade"),
+          // A trade with an id is deleted only if it is still the stored one (never a newer claim).
+          activeTrade?.id ? releaseActiveTradeIfOwned(redis, activeTrade.id) : redis.del("nifty:tv:active_trade"),
           redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
         ]);
       }
@@ -1618,7 +1821,8 @@ export default async function handler(req, res) {
       fusedVerdict.recommendedLots = 0;
       fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward paper trading executes Traps and Verified Synergy.`;
     } else {
-      // Check Single-Position Rule for Traps & Synergy
+      // Check Single-Position Rule for Traps & Synergy. The read below only shapes the BLOCKED
+      // message; the actual lock is the atomic SET NX claim further down.
       let activeTrade = null;
       if (redis) {
         try {
@@ -1626,11 +1830,16 @@ export default async function handler(req, res) {
           activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
         } catch (e) {}
       }
-
-      if (activeTrade && activeTrade.active) {
+      const blockAsActive = (t) => {
         fusedVerdict.decision = "BLOCKED_BY_ACTIVE_TRADE";
         fusedVerdict.recommendedLots = 0;
-        fusedVerdict.reasoning = `BLOCKED: Active trade already open (${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice}). The tested system strictly enforces one position at a time.`;
+        fusedVerdict.reasoning = t
+          ? `BLOCKED: Active trade already open (${t.grade} ${t.direction} @ ${t.entryPrice}${t.id ? `, id ${t.id}` : ""}). The tested system strictly enforces one position at a time.`
+          : `BLOCKED: Another trade claimed the single-position lock at the same moment. The tested system strictly enforces one position at a time.`;
+      };
+
+      if (activeTrade && activeTrade.active) {
+        blockAsActive(activeTrade);
       } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
         const isHtf = fusedVerdict.timeframe === "125" || fusedVerdict.timeframe === "D" || Number(fusedVerdict.timeframe) >= 60 || fusedVerdict.grade?.includes("SYNERGY");
         const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
@@ -1650,10 +1859,57 @@ export default async function handler(req, res) {
           timestamp: fusedVerdict.timestamp,
           istTime: fusedVerdict.istTime,
         };
+        const bridgeConfig = getFlowBridgeConfig();
+        const dispatchPlanned = shouldDispatch(bridgeConfig, fusedVerdict);
+        const tradeId = deps.newTradeId(nowMs);
+        activeData.id = tradeId;
+        if (dispatchPlanned) activeData.execution = { status: "PENDING", at: new Date(nowMs).toISOString() };
+
+        // Atomic single-position claim: exactly one of several concurrent alerts gets "OK".
+        let claim = "NO_REDIS";
         if (redis) {
           try {
-            await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { ex: activeTtl });
+            const r = await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { nx: true, ex: activeTtl });
+            claim = r === "OK" ? "CLAIMED" : "TAKEN";
+          } catch (e) {
+            claim = "ERROR";
+          }
+        }
+
+        if (claim === "TAKEN") {
+          let holder = null;
+          try {
+            holder = parseMaybeJson(await redis.get("nifty:tv:active_trade"));
           } catch (e) {}
+          blockAsActive(holder);
+        } else {
+          fusedVerdict.tradeId = tradeId;
+          if (dispatchPlanned) {
+            if (claim !== "CLAIMED") {
+              // Without a held lock a real order could double up: never dispatch.
+              fusedVerdict.execution = {
+                status: "NOT_EXECUTED",
+                outcome: "NOT_SENT",
+                reason: `not dispatched: position lock unavailable (${claim === "NO_REDIS" ? "Redis not configured" : "Redis error"})`,
+                mode: null,
+                orderRef: null,
+                at: new Date(deps.now()).toISOString(),
+              };
+              try {
+                await deps.sendText(`⚠️ *APPROVED BUT NOT EXECUTED* · \`${fusedVerdict.grade}\` · Trade ID \`${tradeId}\`\n• *Reason:* ${fusedVerdict.execution.reason}`);
+              } catch (e) {}
+            } else {
+              fusedVerdict.execution = await runBridgeDispatch({
+                redis,
+                config: bridgeConfig,
+                fused: fusedVerdict,
+                activeData,
+                activeTtl,
+                deps,
+                requestStartMs,
+              });
+            }
+          }
         }
       }
     }
