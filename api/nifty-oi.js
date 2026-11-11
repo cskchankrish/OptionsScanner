@@ -376,16 +376,20 @@ export async function getRedisSessionPayload() {
 
 /**
  * @param {object} payload
- * @param {{ snapshotAt?: number }} [opts] snapshotAt (epoch ms) must only be supplied by
- *   the live NSE fetch path; it is what the webhook uses to reject stale snapshots.
+ * @param {{ snapshotAt?: number, source?: string }} [opts] snapshotAt (epoch ms) must only be
+ *   supplied by the live NSE fetch path; it is what the webhook uses to reject stale snapshots.
+ *   source (browser|cron|poller|webhook-refresh) is stamped as `snapshotSource` for provenance.
+ * @returns {Promise<{ ok: boolean, error: string|null }>} ok reflects the `nifty:flow:latest` write.
  */
-export async function saveRedisSessionPayload(payload, opts = {}) {
-  if (!REDIS_URL || !REDIS_TOKEN || !payload) return false;
+export async function saveRedisSessionPayloadDetailed(payload, opts = {}) {
+  if (!REDIS_URL || !REDIS_TOKEN) return { ok: false, error: "Redis not configured" };
+  if (!payload) return { ok: false, error: "No payload to persist" };
   try {
-    const { snapshotAt: _ignoredSnapshotAt, ...payloadWithoutStamp } = payload;
+    const { snapshotAt: _ignoredSnapshotAt, snapshotSource: _ignoredSource, ...payloadWithoutStamp } = payload;
     const bridgeSnapshot = {
       ...payloadWithoutStamp,
       ...(Number.isFinite(opts.snapshotAt) && opts.snapshotAt > 0 ? { snapshotAt: opts.snapshotAt } : {}),
+      ...(typeof opts.source === "string" && opts.source ? { snapshotSource: opts.source } : {}),
       corridor: {
         deltaPCR: payload.deltaPcr,
         floorStrike: payload.floor,
@@ -422,12 +426,32 @@ export async function saveRedisSessionPayload(payload, opts = {}) {
       signal: AbortSignal.timeout(2500),
     });
 
-    await Promise.allSettled([p1, p2]);
-    return true;
+    const [r1, r2] = await Promise.allSettled([p1, p2]);
+    const describe = (r) => {
+      if (r.status !== "fulfilled") return r.reason?.message || String(r.reason);
+      if (!r.value.ok) return `HTTP ${r.value.status}`;
+      return null;
+    };
+    const sessionErr = describe(r1);
+    if (sessionErr) console.warn("Redis session payload (v2) write failed:", sessionErr);
+    // nifty:flow:latest is what the webhook verifies against, so it decides success.
+    const flowErr = describe(r2);
+    if (flowErr) return { ok: false, error: `Redis write of nifty:flow:latest failed: ${flowErr}` };
+    return { ok: true, error: null };
   } catch (e) {
     console.warn("Redis session payload save error:", e.message);
-    return false;
+    return { ok: false, error: `Redis write failed: ${e.message}` };
   }
+}
+
+/**
+ * @param {object} payload
+ * @param {{ snapshotAt?: number, source?: string }} [opts]
+ * @returns {Promise<boolean>} true only when the `nifty:flow:latest` write succeeded.
+ */
+export async function saveRedisSessionPayload(payload, opts = {}) {
+  const r = await saveRedisSessionPayloadDetailed(payload, opts);
+  return r.ok;
 }
 
 export async function getRedisEodHistory() {
@@ -1943,10 +1967,128 @@ export default async function handler(req, res) {
     return res.status(200).json(cachedForExpiry.data);
   }
 
-  // Preload history from Redis if memory is empty
-  await syncRedisHistory(today);
+  // Live fetch → compute → payload → persist runs through the shared refresh core.
+  // The browser path keeps the fire-and-forget Redis write so response latency is unchanged.
+  const refresh = await refreshLiveSnapshot({
+    now,
+    sessionInfo,
+    queryExpiry,
+    rolloverRequested: req.query?.rollover === "true",
+    isEodTest: req.query?.test === "eod_alert", // authorised above
+    awaitPersist: false,
+    source: isCronRequest ? "cron" : "browser",
+  });
+  if (refresh.ok) {
+    const payload = refresh.payload;
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "LIVE_POLL_SUCCESS",
+        timestamp: payload.timestamp,
+        spot: payload.spotPrice,
+        pcr: payload.pcr,
+        ticks: intradayHistory.length
+      });
+    }
+    return res.status(200).json(payload);
+  }
+  {
+    const err = refresh.errorObject || new Error(refresh.error);
+    console.error("NSE Live fetch error, falling back to cached state:", err);
+    if (isCronRequest) {
+      return res.status(200).json({
+        ok: true,
+        cron: true,
+        status: "FALLBACK_CACHED",
+        spot: cache.data?.spotPrice || 25030.35
+      });
+    }
 
+    if (isSpecificExpiry) {
+      const cachedExpiry = cacheByExpiry.get(queryExpiry);
+      if (cachedExpiry) {
+        return res.status(200).json({
+          ...cachedExpiry.data,
+          isLive: false,
+          isSettledSession: true,
+          fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
+        });
+      }
+    }
+
+    if (!isSpecificExpiry && cache.data) {
+      return res.status(200).json({
+        ...cache.data,
+        isLive: false,
+        isSettledSession: true,
+        fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
+      });
+    }
+
+    if (!isSpecificExpiry && REDIS_URL) {
+      const persisted = await getRedisSessionPayload();
+      if (persisted) {
+        return res.status(200).json({
+          ...persisted,
+          isLive: false,
+          isSettledSession: true,
+          fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
+        });
+      }
+    }
+
+    // High fidelity default fallback based on real Friday settled session
+    const fallbackPayload = getFallbackData(queryExpiry);
+    return res.status(200).json(fallbackPayload);
+  }
+}
+
+/**
+ * Shared live refresh core: NSE fetch → compute → payload → in-memory cache → Redis snapshot.
+ * Used by the browser handler (awaitPersist=false, unchanged fire-and-forget write), the
+ * authenticated poller and the webhook's on-demand refresh (awaitPersist=true: the
+ * `nifty:flow:latest` write is awaited and a failure is reported, never swallowed).
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.now] epoch ms used for cache timestamps and snapshotAt
+ * @param {object} [opts.sessionInfo] getMarketSessionInfo() result
+ * @param {string|null} [opts.queryExpiry] lower-cased expiry selector (null = default selection)
+ * @param {boolean} [opts.rolloverRequested] mirrors `?rollover=true`
+ * @param {boolean} [opts.isEodTest] mirrors the authorised `?test=eod_alert`
+ * @param {boolean} [opts.awaitPersist] await the Redis snapshot write and fail on error
+ * @param {string} [opts.source] provenance stamped on the snapshot (browser|cron|poller|webhook-refresh)
+ * @param {number|null} [opts.deadlineMs] absolute epoch-ms deadline; NSE fetch timeouts shrink to fit
+ * @returns {Promise<{ ok: boolean, payload?: object, error?: string, stage?: "nse"|"redis",
+ *   persisted?: boolean|null, snapshotAt?: number, ticks?: number, targetExpiry?: string, nearExpiry?: string }>}
+ */
+export async function refreshLiveSnapshot({
+  now = Date.now(),
+  sessionInfo = getMarketSessionInfo(),
+  queryExpiry = null,
+  rolloverRequested = false,
+  isEodTest = false,
+  awaitPersist = false,
+  source = "browser",
+  deadlineMs = null,
+} = {}) {
+  const today = getISTDateStr();
+  // Keep ~2.5s for the awaited Redis write when a deadline is set.
+  const fetchDeadline = Number.isFinite(deadlineMs) ? deadlineMs - (awaitPersist ? 2500 : 0) : null;
+  const fetchSignal = (ms) => {
+    if (fetchDeadline === null) return AbortSignal.timeout(ms);
+    const remaining = fetchDeadline - Date.now();
+    if (remaining <= 0) throw new Error("refresh deadline exceeded before NSE fetch");
+    return AbortSignal.timeout(Math.max(200, Math.min(ms, remaining)));
+  };
+
+  let payload = null;
+  let targetExpiry = null;
+  let nearExpiry = null;
   try {
+    // Preload history from Redis if memory is empty
+    await syncRedisHistory(today);
+
     const headers = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       "Accept-Language": "en-US,en;q=0.9",
@@ -1957,7 +2099,7 @@ export default async function handler(req, res) {
     // 1. Session warmup with 6.5s timeout (resilient against busy closing NSE traffic)
     const warmup = await fetch("https://www.nseindia.com/option-chain", {
       headers,
-      signal: AbortSignal.timeout(6500),
+      signal: fetchSignal(6500),
     });
     const rawCookies = warmup.headers.get("set-cookie") || "";
     const cookieHeader = rawCookies
@@ -1975,7 +2117,7 @@ export default async function handler(req, res) {
     try {
       const contractRes = await fetch("https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY", {
         headers: sessionHeaders,
-        signal: AbortSignal.timeout(6500),
+        signal: fetchSignal(6500),
       });
       if (contractRes.ok) {
         const contractData = await contractRes.json();
@@ -1989,7 +2131,7 @@ export default async function handler(req, res) {
     }
 
     const activeWeekly = getActiveExpiryDate();
-    const nearExpiry = getActiveExpiryDate(expiryDates[0]) || activeWeekly;
+    nearExpiry = getActiveExpiryDate(expiryDates[0]) || activeWeekly;
     const nextExpiry = expiryDates.find(e => {
       const d = new Date(e);
       const nd = new Date(nearExpiry);
@@ -1998,9 +2140,9 @@ export default async function handler(req, res) {
     const monthlyExpiry = getActiveMonthlyExpiry(expiryDates);
     const isExpiryDay = isTodayExpiryDate(nearExpiry);
     const currentMinutes = getISTMinutes();
-    const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || req.query?.rollover === "true"));
+    const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || rolloverRequested));
 
-    let targetExpiry = nearExpiry;
+    targetExpiry = nearExpiry;
     if (queryExpiry === "next" && nextExpiry) {
       targetExpiry = nextExpiry;
     } else if (queryExpiry === "today" || queryExpiry === "near") {
@@ -2019,14 +2161,14 @@ export default async function handler(req, res) {
     const futUrl = "https://www.nseindia.com/api/liveEquity-derivatives?index=nse50_fut";
 
     const fetchPromises = [
-      fetch(v3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }),
-      fetch(futUrl, { headers: sessionHeaders, signal: AbortSignal.timeout(4500) }),
+      fetch(v3Url, { headers: sessionHeaders, signal: fetchSignal(6500) }),
+      fetch(futUrl, { headers: sessionHeaders, signal: fetchSignal(4500) }),
     ];
 
     const shouldFetchSecondaryChain = isAfternoonRollover && targetExpiry === nearExpiry && nextExpiry;
     if (shouldFetchSecondaryChain) {
       const nextV3Url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(nextExpiry)}`;
-      fetchPromises.push(fetch(nextV3Url, { headers: sessionHeaders, signal: AbortSignal.timeout(6500) }));
+      fetchPromises.push(fetch(nextV3Url, { headers: sessionHeaders, signal: fetchSignal(6500) }));
     }
 
     const settledResults = await Promise.allSettled(fetchPromises);
@@ -2318,7 +2460,6 @@ export default async function handler(req, res) {
     // Automatic 15-Minute BTST / STBT Carry Radar & Final EOD Dispatcher (14:00 to 15:30 IST)
     const istMinutes = getISTMinutes();
     const istDateStr = getISTIsoDateStr();
-    const isEodTest = req.query?.test === "eod_alert"; // authorised above
     try {
       await dispatchEodRadarAlert({
         istMinutes,
@@ -2333,7 +2474,7 @@ export default async function handler(req, res) {
       console.error("Error dispatching 15-minute EOD radar alert:", err);
     }
 
-    const payload = {
+    payload = {
       success: true,
       isLive: true,
       isSettledSession: false,
@@ -2410,71 +2551,29 @@ export default async function handler(req, res) {
       cacheByExpiry.set("near", { data: payload, timestamp: now });
       cacheByExpiry.set("default", { data: payload, timestamp: now });
       cache = { data: payload, timestamp: now };
-      if (REDIS_URL) {
-        // snapshotAt marks this as a live NSE fetch; the webhook rejects snapshots older than FLOW_MAX_AGE_SEC.
-        saveRedisSessionPayload(payload, { snapshotAt: now }).catch(() => {});
-      }
     }
-    if (isCronRequest) {
-      return res.status(200).json({
-        ok: true,
-        cron: true,
-        status: "LIVE_POLL_SUCCESS",
-        timestamp: payload.timestamp,
-        spot: payload.spotPrice,
-        pcr: payload.pcr,
-        ticks: intradayHistory.length
-      });
-    }
-    return res.status(200).json(payload);
   } catch (err) {
-    console.error("NSE Live fetch error, falling back to cached state:", err);
-    if (isCronRequest) {
-      return res.status(200).json({
-        ok: true,
-        cron: true,
-        status: "FALLBACK_CACHED",
-        spot: cache.data?.spotPrice || 25030.35
-      });
-    }
-
-    if (isSpecificExpiry) {
-      const cachedExpiry = cacheByExpiry.get(queryExpiry);
-      if (cachedExpiry) {
-        return res.status(200).json({
-          ...cachedExpiry.data,
-          isLive: false,
-          isSettledSession: true,
-          fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
-        });
-      }
-    }
-
-    if (!isSpecificExpiry && cache.data) {
-      return res.status(200).json({
-        ...cache.data,
-        isLive: false,
-        isSettledSession: true,
-        fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
-      });
-    }
-
-    if (!isSpecificExpiry && REDIS_URL) {
-      const persisted = await getRedisSessionPayload();
-      if (persisted) {
-        return res.status(200).json({
-          ...persisted,
-          isLive: false,
-          isSettledSession: true,
-          fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
-        });
-      }
-    }
-
-    // High fidelity default fallback based on real Friday settled session
-    const fallbackPayload = getFallbackData(queryExpiry);
-    return res.status(200).json(fallbackPayload);
+    return { ok: false, stage: "nse", error: err?.message || String(err), errorObject: err };
   }
+
+  const ticks = Array.isArray(intradayHistory) ? intradayHistory.length : 0;
+  const base = { payload, ticks, targetExpiry, nearExpiry };
+  if (targetExpiry !== nearExpiry) {
+    // Unchanged rule: only the near-expiry payload is written to the shared snapshot.
+    return { ok: true, ...base, persisted: false, persistSkippedReason: "NON_NEAR_EXPIRY_TARGET" };
+  }
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    if (awaitPersist) return { ok: false, stage: "redis", error: "Redis not configured; snapshot not persisted", ...base };
+    return { ok: true, ...base, persisted: false };
+  }
+  if (!awaitPersist) {
+    // snapshotAt marks this as a live NSE fetch; the webhook rejects snapshots older than FLOW_MAX_AGE_SEC.
+    saveRedisSessionPayload(payload, { snapshotAt: now, source }).catch(() => {});
+    return { ok: true, ...base, persisted: null, snapshotAt: now };
+  }
+  const write = await saveRedisSessionPayloadDetailed(payload, { snapshotAt: now, source });
+  if (!write.ok) return { ok: false, stage: "redis", error: write.error, ...base };
+  return { ok: true, ...base, persisted: true, snapshotAt: now };
 }
 
 export function getFallbackExpirySchedule() {

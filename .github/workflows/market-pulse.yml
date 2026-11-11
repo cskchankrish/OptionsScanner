@@ -1,8 +1,14 @@
 name: Market Hours OI Pulse
 
+# Backup poller. The primary schedule is Upstash QStash -> /api/poll (see docs/poller-setup.md);
+# GitHub's scheduler is best-effort and often skips runs, so this only fills gaps.
+#
+# Requires the repository secret POLL_SECRET (same value as the Vercel env var TV_WEBHOOK_SECRET).
+# It is sent as the x-webhook-secret header, never in the URL.
+
 on:
   schedule:
-    # Run every 5 minutes:
+    # Every 5 minutes:
     # Mon-Fri: 03:45 - 10:15 UTC (09:15 - 15:45 IST)
     # Sunday (Diwali Muhurat Trading): 08:30 - 10:30 UTC (14:00 - 16:00 IST)
     - cron: "*/5 3-11 * * 0-5"
@@ -10,10 +16,12 @@ on:
 
 jobs:
   ping-nifty-oi:
-    name: Ping Nifty OI API & Record Timeline Tick
+    name: Poll Nifty option chain (authenticated /api/poll)
     runs-on: ubuntu-latest
     steps:
-      - name: Hit Nifty OI Endpoint within Market Window
+      - name: Hit poll endpoint within market window
+        env:
+          POLL_SECRET: ${{ secrets.POLL_SECRET }}
         run: |
           IST_DOW=$(TZ='Asia/Kolkata' date +%w)
           IST_TIME=$(TZ='Asia/Kolkata' date +%H%M)
@@ -33,18 +41,28 @@ jobs:
             fi
           fi
 
-          if [ "$IS_ACTIVE" = true ]; then
-            echo "Within active market window. Pinging API..."
-            URL="https://niftyninjaa.vercel.app/api/nifty-oi?cron=1"
-            # -L follows redirects; non-2xx (or a network error) fails the step visibly.
-            HTTP_CODE=$(curl -sS -L -m 20 --retry 2 --retry-delay 3 -o response.json -w "%{http_code}" "$URL") || HTTP_CODE="000"
-            echo "HTTP status: $HTTP_CODE"
-            head -c 600 response.json 2>/dev/null || true
-            echo
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Nifty OI ping failed with HTTP $HTTP_CODE"
-              exit 1
-            fi
-          else
-            echo "Outside market window. Skipping ping to protect EOD settlement integrity."
+          if [ "$IS_ACTIVE" != true ]; then
+            echo "Outside market window. Skipping poll to protect EOD settlement integrity."
+            exit 0
+          fi
+
+          if [ -z "$POLL_SECRET" ]; then
+            echo "::error::Repository secret POLL_SECRET is not set (see docs/poller-setup.md)"
+            exit 1
+          fi
+
+          echo "Within active market window. Polling /api/poll..."
+          URL="https://niftyninjaa.vercel.app/api/poll"
+          # -L follows redirects; non-2xx (or a network error) fails the step visibly.
+          # The endpoint returns 502/503 when the NSE fetch or the Redis snapshot write fails.
+          HTTP_CODE=$(curl -sS -L -m 20 --retry 2 --retry-delay 3 \
+            -H "x-webhook-secret: ${POLL_SECRET}" \
+            -H "x-poll-source: github-actions" \
+            -o response.json -w "%{http_code}" "$URL") || HTTP_CODE="000"
+          echo "HTTP status: $HTTP_CODE"
+          head -c 600 response.json 2>/dev/null || true
+          echo
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Poll failed with HTTP $HTTP_CODE"
+            exit 1
           fi

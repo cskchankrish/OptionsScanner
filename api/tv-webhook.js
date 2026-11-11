@@ -107,6 +107,138 @@ export function getFlowMaxAgeSec() {
 
 export const ACTIONABLE_GRADES = ["BEAR_TRAP_BUY", "BULL_TRAP_SELL", "SYNERGY_BULL", "SYNERGY_BEAR"];
 
+/**
+ * Budget (ms) for the webhook's one on-demand option-chain refresh. Vercel caps the function at
+ * 15s (vercel.json maxDuration). Before the refresh the handler spends <~1s (auth + one Redis
+ * GET); after it, up to ~5s more (Redis re-read, active-trade GET/SET, 5 list writes, Telegram
+ * send, watchdog). 8s for the refresh leaves ~6s of headroom for that tail. Inside the refresh
+ * the NSE fetch timeouts shrink to the deadline and ~2.5s is reserved for the awaited Redis
+ * write. Override with FLOW_REFRESH_TIMEOUT_MS (clamped to 1000..10000).
+ */
+export function getFlowRefreshTimeoutMs() {
+  const v = Number(process.env.FLOW_REFRESH_TIMEOUT_MS);
+  if (!Number.isFinite(v) || v <= 0) return 8000;
+  return Math.min(10000, Math.max(1000, v));
+}
+
+const SNAPSHOT_SOURCE_LABELS = {
+  poller: "poller",
+  "webhook-refresh": "on-demand refresh (earlier webhook)",
+  browser: "browser view",
+  cron: "legacy cron ping",
+};
+
+function describeSnapshotSource(liveScanner, refreshedNow) {
+  if (refreshedNow) return "on-demand refresh (this alert)";
+  const s = liveScanner?.snapshotSource;
+  return SNAPSHOT_SOURCE_LABELS[s] || (s ? String(s) : "unknown writer");
+}
+
+let _webhookDepsOverride = null;
+/** Test hook: override the refresh / session / clock / Telegram-text dependencies (null clears). */
+export function setWebhookDepsForTesting(deps) {
+  _webhookDepsOverride = deps || null;
+}
+
+function getWebhookDeps() {
+  const defaults = {
+    now: () => Date.now(),
+    isLiveMarket: async () => {
+      const { getMarketSessionInfo } = await import("./nifty-oi.js");
+      return Boolean(getMarketSessionInfo().isLiveMarket);
+    },
+    refresh: async ({ deadlineMs }) => {
+      // Without Redis the refreshed snapshot could not be persisted or re-read: fail fast, no NSE call.
+      if (!REDIS_URL || !REDIS_TOKEN) return { ok: false, stage: "redis", error: "Redis not configured" };
+      const { refreshLiveSnapshot } = await import("./nifty-oi.js");
+      return refreshLiveSnapshot({ queryExpiry: "near", awaitPersist: true, source: "webhook-refresh", deadlineMs });
+    },
+    sendText: sendTelegramText,
+  };
+  return { ...defaults, ...(_webhookDepsOverride || {}) };
+}
+
+/** Runs the refresh core once, bounded by timeoutMs. Never throws. */
+export async function attemptOnDemandRefresh({ refresh, timeoutMs, nowMs = Date.now() }) {
+  const started = Date.now();
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ ok: false, stage: "timeout", error: `refresh timed out after ${timeoutMs}ms` }),
+      timeoutMs
+    );
+  });
+  let result;
+  try {
+    result = await Promise.race([
+      Promise.resolve()
+        .then(() => refresh({ deadlineMs: nowMs + timeoutMs }))
+        .catch((e) => ({ ok: false, stage: "exception", error: e?.message || String(e) })),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  return {
+    attempted: true,
+    ok: Boolean(result?.ok),
+    stage: result?.ok ? null : result?.stage || "unknown",
+    error: result?.ok ? null : result?.error || "refresh failed",
+    durationMs: Date.now() - started,
+  };
+}
+
+async function readFlowSnapshot(redis, { allowSessionFallback = false } = {}) {
+  const parseMaybe = (v) => (typeof v === "string" ? JSON.parse(v) : v);
+  let snap = null;
+  if (redis) {
+    try {
+      snap = parseMaybe(await redis.get("nifty:flow:latest"));
+      if (!snap && allowSessionFallback) snap = parseMaybe(await redis.get("nifty_latest_session_payload_v2"));
+      return snap;
+    } catch (e) {
+      // fall through to REST
+    }
+  }
+  snap = await redisRestGet("nifty:flow:latest");
+  if (!snap && allowSessionFallback) snap = await redisRestGet("nifty_latest_session_payload_v2");
+  return snap;
+}
+
+/** Watchdog adapter for the @upstash/redis client used by the webhook. Never throws. */
+async function runWebhookWatchdog({ redis, snapshotAt, isLiveMarket, lastError, deps }) {
+  if (!isLiveMarket) return { status: "OUTSIDE_SESSION", sent: false };
+  try {
+    const { checkFlowWatchdog } = await import("../src/flowWatchdog.js");
+    let at = snapshotAt;
+    if (at === undefined) {
+      const snap = await readFlowSnapshot(redis);
+      at = snap?.snapshotAt ?? null;
+    }
+    return await checkFlowWatchdog({
+      snapshotAt: at,
+      isLiveMarket,
+      nowMs: deps.now(),
+      trigger: "webhook",
+      lastError,
+      deps: {
+        setNx: async (k, v, ttl) => {
+          if (!redis) throw new Error("Redis not configured");
+          const r = await redis.set(k, JSON.stringify(v), { nx: true, ex: ttl });
+          return r === "OK";
+        },
+        del: async (k) => {
+          if (!redis) throw new Error("Redis not configured");
+          return Number(await redis.del(k)) || 0;
+        },
+        send: deps.sendText,
+      },
+    });
+  } catch (e) {
+    return { status: "WATCHDOG_ERROR", sent: false, error: e?.message };
+  }
+}
+
 /** Age of a snapshot in whole seconds, or null when it carries no usable `snapshotAt`. */
 export function getSnapshotAgeSec(liveScanner, nowMs = Date.now()) {
   const at = Number(liveScanner?.snapshotAt);
@@ -511,6 +643,27 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
 }
 
 /**
+ * Plain Telegram text sender (watchdog / operational alerts). Returns true only on HTTP 2xx.
+ */
+export async function sendTelegramText(text) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId) return false;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return r.ok;
+  } catch (err) {
+    console.error("Telegram text send error:", err.message);
+    return false;
+  }
+}
+
+/**
  * Telegram Notification Helper
  */
 export async function sendTelegramAlert(fused) {
@@ -614,6 +767,10 @@ export async function sendTelegramAlert(fused) {
         `3. *Single-Position Rule:* Strictly one trade at a time.`
       );
     }
+  }
+
+  if (fused.snapshotProvenance && fused.decision !== "LOG_ONLY") {
+    lines.splice(Math.min(3, lines.length), 0, `• *Option-Chain Snapshot:* ${fused.snapshotProvenance}`);
   }
 
   const msg = lines.join("\n");
@@ -1242,6 +1399,12 @@ export default async function handler(req, res) {
     // 1b. Handle Trade Exit / T1 Scale-Out Webhooks directly from TradingView or Execution Bridge
     const exitGrades = ["TARGET_1_HIT", "TARGET_2_HIT", "BREAKEVEN_STOP", "STOP_LOSS_HIT", "TIME_STOP_EXIT", "MANUAL_CLOSE"];
     if (exitGrades.includes(payload?.grade)) {
+      const runExitWatchdog = async () => {
+        const wdDeps = getWebhookDeps();
+        let live = false;
+        try { live = await wdDeps.isLiveMarket(); } catch (e) { live = false; }
+        return runWebhookWatchdog({ redis, snapshotAt: undefined, isLiveMarket: live, lastError: null, deps: wdDeps });
+      };
       let activeTrade = null;
       if (redis) {
         try {
@@ -1282,6 +1445,7 @@ export default async function handler(req, res) {
           await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(t1Record));
         }
         await sendTelegramT1Alert(activeTrade || t1Record.trade, fillPrice);
+        await runExitWatchdog();
         return res.status(200).json({ ok: true, event: "TARGET_1_HIT", record: t1Record });
       }
 
@@ -1326,6 +1490,7 @@ export default async function handler(req, res) {
         ]);
       }
       await sendTelegramExitAlert(exitRecord);
+      await runExitWatchdog();
       return res.status(200).json({ ok: true, event: "TRADE_CLOSED", exitRecord });
     }
 
@@ -1335,36 +1500,68 @@ export default async function handler(req, res) {
     const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
     const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
     const isActionable = isTrap || isSynergy;
-    const parseMaybe = (v) => (typeof v === "string" ? JSON.parse(v) : v);
+    const deps = getWebhookDeps();
+    const maxAgeSec = getFlowMaxAgeSec();
+    const isStale = (snap, atMs) => {
+      const age = getSnapshotAgeSec(snap, atMs);
+      return !snap || age === null || age > maxAgeSec;
+    };
 
-    let liveScanner = null;
-    if (redis) {
+    let liveScanner = await readFlowSnapshot(redis, { allowSessionFallback: !isActionable });
+
+    // 2b. Self-refresh: an actionable alert against a missing/stale snapshot triggers ONE bounded
+    //     on-demand refresh (live market hours only), then the snapshot is re-read and re-validated.
+    let isLiveMarket = null;
+    let refreshInfo = null;
+    if (isActionable && isStale(liveScanner, deps.now())) {
       try {
-        liveScanner = parseMaybe(await redis.get("nifty:flow:latest"));
-        if (!liveScanner && !isActionable) {
-          liveScanner = parseMaybe(await redis.get("nifty_latest_session_payload_v2"));
-        }
+        isLiveMarket = await deps.isLiveMarket();
       } catch (e) {
-        liveScanner = await redisRestGet("nifty:flow:latest");
-        if (!liveScanner && !isActionable) {
-          liveScanner = await redisRestGet("nifty_latest_session_payload_v2");
-        }
+        isLiveMarket = false;
       }
-    } else {
-      liveScanner = await redisRestGet("nifty:flow:latest");
-      if (!liveScanner && !isActionable) {
-        liveScanner = await redisRestGet("nifty_latest_session_payload_v2");
+      if (!isLiveMarket) {
+        refreshInfo = { attempted: false, ok: false, error: "outside live market hours" };
+      } else {
+        refreshInfo = await attemptOnDemandRefresh({
+          refresh: deps.refresh,
+          timeoutMs: getFlowRefreshTimeoutMs(),
+          nowMs: deps.now(),
+        });
+        if (refreshInfo.ok) {
+          liveScanner = await readFlowSnapshot(redis);
+          if (isStale(liveScanner, deps.now())) {
+            refreshInfo.ok = false;
+            refreshInfo.stage = "reread";
+            refreshInfo.error = liveScanner
+              ? "refresh reported success but the re-read snapshot is still not fresh"
+              : "refresh reported success but nifty:flow:latest could not be re-read";
+          }
+        }
       }
     }
+    const refreshedNow = Boolean(refreshInfo?.attempted && refreshInfo.ok);
 
     // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
-    const nowMs = Date.now();
+    const nowMs = deps.now();
     const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner, nowMs);
 
     // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
-    const maxAgeSec = getFlowMaxAgeSec();
     const snapshotAgeSec = fusedVerdict.liveOptionChainMetrics.snapshotAgeSec;
     const isSnapshotStale = !liveScanner || snapshotAgeSec === null || snapshotAgeSec > maxAgeSec;
+
+    if (isActionable) {
+      const sourceLabel = liveScanner ? describeSnapshotSource(liveScanner, refreshedNow) : "none";
+      fusedVerdict.liveOptionChainMetrics.snapshotSource = liveScanner?.snapshotSource || null;
+      fusedVerdict.snapshotProvenance = liveScanner
+        ? `${sourceLabel} · age ${snapshotAgeSec === null ? "unknown" : `${snapshotAgeSec}s`}`
+        : "missing";
+      if (refreshInfo) {
+        fusedVerdict.snapshotRefresh = refreshInfo;
+        if (refreshInfo.attempted && !refreshInfo.ok) {
+          fusedVerdict.snapshotProvenance += ` · on-demand refresh failed (${refreshInfo.error})`;
+        }
+      }
+    }
 
     if (isActionable && isSnapshotStale) {
       // Fail closed: never open a position without a fresh, live option-chain snapshot.
@@ -1377,6 +1574,11 @@ export default async function handler(req, res) {
         : snapshotAgeSec === null
         ? `VETOED: Option-chain snapshot has no snapshotAt timestamp, so its freshness cannot be verified for ${payload.grade}. Snapshot age: unknown. 0 Lots.`
         : `VETOED: Option-chain snapshot is stale (age ${snapshotAgeSec}s > max ${maxAgeSec}s); cannot verify ${payload.grade}. 0 Lots.`;
+      if (refreshInfo?.attempted) {
+        fusedVerdict.reasoning += ` On-demand refresh attempted (${refreshInfo.durationMs}ms) and failed: ${refreshInfo.error}.`;
+      } else if (refreshInfo) {
+        fusedVerdict.reasoning += ` No on-demand refresh attempted (${refreshInfo.error}).`;
+      }
     } else if (!isActionable) {
       // Non-actionable signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
       fusedVerdict.decision = "LOG_ONLY";
@@ -1445,11 +1647,30 @@ export default async function handler(req, res) {
     // 6. Fire Telegram Notification
     await sendTelegramAlert(fusedVerdict);
 
+    // 7. Scanner-blind watchdog (live market hours only; deduped once per outage).
+    if (isLiveMarket === null) {
+      try {
+        isLiveMarket = await deps.isLiveMarket();
+      } catch (e) {
+        isLiveMarket = false;
+      }
+    }
+    const watchdog = await runWebhookWatchdog({
+      redis,
+      // Actionable alerts only ever read nifty:flow:latest; for others the snapshot may be the
+      // un-stamped session payload, so let the watchdog re-read nifty:flow:latest itself.
+      snapshotAt: Number(liveScanner?.snapshotAt) > 0 ? liveScanner.snapshotAt : (isActionable ? null : undefined),
+      isLiveMarket,
+      lastError: refreshInfo?.attempted && !refreshInfo.ok ? refreshInfo.error : null,
+      deps,
+    });
+
     return res.status(200).json({
       ok: true,
       decision: fusedVerdict.decision,
       recommendedLots: fusedVerdict.recommendedLots,
       fusedVerdict,
+      watchdog: watchdog.status,
     });
   } catch (err) {
     console.error("[tv-webhook] Error processing TradingView alert:", err);
