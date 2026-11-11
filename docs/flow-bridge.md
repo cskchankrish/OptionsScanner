@@ -220,3 +220,70 @@ changed, and no scheduler was added. The alert fires only when one of those code
 
 `PENDING` trades keep the claim TTL, unlike `UNKNOWN`. A function killed mid-dispatch therefore
 unlocks after 8 h or 7 d.
+
+## Bridge status readout: `GET /api/bridge-status`
+
+The status readout checks the Vercel-side bridge settings and the link to the Algo without waiting
+for a live signal. It is **read-only**:
+- it never sends a `FLOW_ENTRY`;
+- it never touches `nifty:tv:active_trade`;
+- it never sends Telegram.
+
+Code: `api/bridge-status.js`, plus `inspectFlowBridgeConfig` and `pingAlgo` in `src/flowBridge.js`.
+Tests: `test/bridgeStatus.test.js`.
+
+### What it does
+
+1. **Config check.** It reads the flag, whether the URL is present and parses as http(s), and
+   whether the secret is present. Values are never returned or logged.
+2. **Ping.** It sends one signed `FLOW_PING`, bounded at 4 s, to the origin of
+   `FLOW_BRIDGE_URL` + `/flow-ping`. The path and query of the configured URL are replaced.
+   - Body: `{"v":1,"type":"FLOW_PING","ts":<ms>}`
+   - Headers: `Content-Type`, `X-Flow-Timestamp`, `X-Flow-Signature`, signed with `signFlowBody`
+     exactly as for `FLOW_ENTRY`.
+
+### States
+
+| `state` | Meaning |
+|---|---|
+| `OFF` | `FLOW_BRIDGE_ENABLED` is not `true`. No ping. |
+| `MISCONFIGURED` | Enabled, but the URL is missing or invalid, or the secret is missing. `detail.config.problems` says which. No ping. |
+| `UNREACHABLE` | Timeout, network error, or any reply other than 200/401/404 or a recognised 200 body (`detail.ping.error`) |
+| `ALGO_OUTDATED` | 404: the Algo build has no `/flow-ping` |
+| `SIGNATURE_REJECTED` | 401: `FLOW_BRIDGE_SECRET` differs between the two sides |
+| `ALGO_REJECTED` | 200 `{status:"rejected"}`. The reason is in `detail.reason` (e.g. clock skew) |
+| `ALGO_BRIDGE_OFF` | 200 ok, but the Algo reports `flowBridgeEnabled` other than `true` |
+| `OK` | Everything lines up |
+
+### Response
+
+- **Public:** `{ ok, state, checkedAt, cached }`, where `ok` is true only for `OK`.
+- **Authenticated** with the webhook secret through `authorizeRequest` (`x-webhook-secret` header
+  or `?key=`): adds `detail`:
+  - `config`: `enabledFlag`, `urlPresent`, `urlValid`, `secretPresent`, `problems`, `target`
+    (scheme + host only), the `decisions` allow-list in effect, `dispatchTimeoutMs`, `fillWaitSec`;
+  - `ping`: `httpStatus`, `latencyMs`, `error`;
+  - `algo`: `mode`, `flowBridgeEnabled`, `accounts[{account, position}]`, `feed{feed, quotes, down}`,
+    `serverTime`, `clockDiffMs` (Algo `serverTime` minus the midpoint of the scanner's round trip;
+    epoch ms, epoch s or ISO accepted);
+  - `reason`, and `guard`, which says how the rate limit was enforced.
+- A credential that is presented but wrong gets 401/503. No credential gets the public view.
+
+### Rate guard
+
+- At most one real ping per 60 s. The guard is an atomic `SET NX EX 60` on
+  `nifty:bridge:status:lock`, and the last result is stored in `nifty:bridge:status:last` for 1 h.
+- Inside the window, callers get the stored result with `cached: true`.
+- Without Redis, a per-instance in-memory guard is used instead.
+- An authenticated `fresh=1` bypasses the cache and restarts the window. `fresh=1` from a public
+  caller is ignored.
+- In the rare case where the window is held but no result is stored yet (a ping still in flight),
+  the response is 429.
+- Error strings keep only error codes, and every response is scrubbed of the bridge secret, the
+  webhook secret and the full URL.
+
+### Example
+
+```bash
+curl -s -H "x-webhook-secret: $TV_WEBHOOK_SECRET" "https://niftyninjaa.vercel.app/api/bridge-status?fresh=1"
+```

@@ -208,3 +208,123 @@ export async function dispatchFlowEntry({ config, entry, fetchImpl = globalThis.
     clearTimeout(timer);
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Bridge status ping (FLOW_PING) — read-only health check, never places anything
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const PING_TIMEOUT_MS = 4000;
+
+/**
+ * Config check without exposing values. `target` is scheme + host only; `pingUrl` is internal
+ * (never put it in a response or a log).
+ */
+export function inspectFlowBridgeConfig(env = process.env) {
+  const enabledFlag = String(env.FLOW_BRIDGE_ENABLED || "").trim().toLowerCase() === "true";
+  const rawUrl = typeof env.FLOW_BRIDGE_URL === "string" ? env.FLOW_BRIDGE_URL.trim() : "";
+  const secretPresent = typeof env.FLOW_BRIDGE_SECRET === "string" && env.FLOW_BRIDGE_SECRET.length > 0;
+  let urlValid = false;
+  let target = null;
+  let pingUrl = null;
+  if (rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      if ((u.protocol === "https:" || u.protocol === "http:") && u.hostname) {
+        urlValid = true;
+        target = `${u.protocol}//${u.host}`;
+        pingUrl = `${u.protocol}//${u.host}/flow-ping`;
+      }
+    } catch (e) {
+      urlValid = false;
+    }
+  }
+  const problems = [];
+  if (!rawUrl) problems.push("FLOW_BRIDGE_URL missing");
+  else if (!urlValid) problems.push("FLOW_BRIDGE_URL is not a valid http(s) URL");
+  if (!secretPresent) problems.push("FLOW_BRIDGE_SECRET missing");
+  const cfg = getFlowBridgeConfig(env);
+  return {
+    enabledFlag,
+    urlPresent: rawUrl.length > 0,
+    urlValid,
+    secretPresent,
+    problems,
+    target,
+    pingUrl,
+    decisions: cfg.decisions,
+    dispatchTimeoutMs: cfg.timeoutMs,
+    fillWaitSec: getFillWaitSec(env),
+  };
+}
+
+function toEpochMs(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return n < 1e12 ? n * 1000 : n; // accept epoch seconds too
+  const p = Date.parse(String(v));
+  return Number.isFinite(p) ? p : null;
+}
+
+/**
+ * Sends one signed FLOW_PING and maps the reply to a bridge state. Never throws, never retries.
+ * @returns {Promise<{ state: string, httpStatus: number|null, latencyMs: number, error: string|null,
+ *   reason: string|null, algo: object|null }>}
+ */
+export async function pingAlgo({ pingUrl, secret, fetchImpl = globalThis.fetch, nowMs = Date.now(), timeoutMs = PING_TIMEOUT_MS }) {
+  const ts = Math.round(nowMs);
+  const body = JSON.stringify({ v: 1, type: "FLOW_PING", ts });
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Flow-Timestamp": String(ts),
+    "X-Flow-Signature": signFlowBody(secret, String(ts), body),
+  };
+  const started = Date.now();
+  const out = (state, extra = {}) => ({
+    state, httpStatus: null, error: null, reason: null, algo: null, ...extra, latencyMs: Date.now() - started,
+  });
+  const ctrl = new AbortController();
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => { ctrl.abort(); resolve({ timedOut: true }); }, timeoutMs);
+  });
+  try {
+    const call = (async () => {
+      const res = await fetchImpl(pingUrl, { method: "POST", headers, body, signal: ctrl.signal });
+      let text = "";
+      try { text = await res.text(); } catch (e) { text = ""; }
+      return { status: Number(res?.status), text, receivedAt: Date.now() };
+    })().catch((e) => ({ networkError: e?.name === "AbortError" ? "aborted" : (e?.code || "network error") }));
+    const r = await Promise.race([call, timeout]);
+    if (r.timedOut) return out("UNREACHABLE", { error: `timeout after ${timeoutMs}ms` });
+    // Only the error code is kept: raw messages can carry the host name or URL.
+    if (r.networkError) return out("UNREACHABLE", { error: `network error (${String(r.networkError).slice(0, 40)})` });
+    if (r.status === 401) return out("SIGNATURE_REJECTED", { httpStatus: 401 });
+    if (r.status === 404) return out("ALGO_OUTDATED", { httpStatus: 404 });
+    if (r.status !== 200) return out("UNREACHABLE", { httpStatus: r.status, error: `unexpected HTTP ${r.status}` });
+    let json = null;
+    try { json = JSON.parse(r.text); } catch (e) { json = null; }
+    const st = String(json?.status || "").toLowerCase();
+    if (st === "rejected") {
+      return out("ALGO_REJECTED", { httpStatus: 200, reason: json?.reason == null ? null : String(json.reason).slice(0, 300) });
+    }
+    if (st !== "ok") return out("UNREACHABLE", { httpStatus: 200, error: json ? "unexpected ping status" : "ping response is not JSON" });
+    const serverMs = toEpochMs(json.serverTime);
+    // Compare against the midpoint of the round trip.
+    const mid = (ts + (r.receivedAt - started) / 2);
+    const algo = {
+      mode: typeof json.mode === "string" ? json.mode : null,
+      flowBridgeEnabled: json.flowBridgeEnabled === true,
+      accounts: Array.isArray(json.accounts)
+        ? json.accounts.slice(0, 20).map((a) => ({ account: a?.account ?? null, position: a?.position ?? null }))
+        : [],
+      feed: json.feed && typeof json.feed === "object"
+        ? { feed: json.feed.feed ?? null, quotes: json.feed.quotes ?? null, down: json.feed.down ?? null }
+        : null,
+      serverTime: json.serverTime ?? null,
+      clockDiffMs: serverMs === null ? null : Math.round(serverMs - mid),
+    };
+    return out(algo.flowBridgeEnabled ? "OK" : "ALGO_BRIDGE_OFF", { httpStatus: 200, algo });
+  } finally {
+    clearTimeout(timer);
+  }
+}
