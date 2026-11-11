@@ -310,6 +310,7 @@ function NiftyIntradayLineChart({
   eodHistory = [],
   rollover = null,
   activeExpiry = null,
+  selectedExpiry = null,
   onSelectExpiry = null,
 }) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
@@ -1076,8 +1077,8 @@ function NiftyIntradayLineChart({
                 <button
                   onClick={() => onSelectExpiry && onSelectExpiry("near")}
                   style={{
-                    background: (activeExpiry === rollover.nearExpiry) ? "#3b82f6" : "transparent",
-                    color: (activeExpiry === rollover.nearExpiry) ? "#fff" : t.textMuted,
+                    background: (selectedExpiry === "near" || (selectedExpiry === "auto" && activeExpiry === rollover.nearExpiry)) ? "#3b82f6" : "transparent",
+                    color: (selectedExpiry === "near" || (selectedExpiry === "auto" && activeExpiry === rollover.nearExpiry)) ? "#fff" : t.textMuted,
                     border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
                     fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
                     WebkitTapHighlightColor: "transparent"
@@ -1090,8 +1091,8 @@ function NiftyIntradayLineChart({
                   <button
                     onClick={() => onSelectExpiry && onSelectExpiry("next")}
                     style={{
-                      background: (activeExpiry === rollover.nextExpiry) ? "#10b981" : "transparent",
-                      color: (activeExpiry === rollover.nextExpiry) ? "#fff" : t.textMuted,
+                      background: (selectedExpiry === "next" || (selectedExpiry !== "near" && activeExpiry === rollover.nextExpiry)) ? "#10b981" : "transparent",
+                      color: (selectedExpiry === "next" || (selectedExpiry !== "near" && activeExpiry === rollover.nextExpiry)) ? "#fff" : t.textMuted,
                       border: "none", borderRadius: 6, padding: isMobile ? "5px 8px" : "6px 12px",
                       fontSize: isMobile ? 10.5 : 12, fontWeight: 800, cursor: "pointer",
                       WebkitTapHighlightColor: "transparent"
@@ -1572,33 +1573,36 @@ export function NiftyFlowView({ t, isDark }) {
         const openMins = isSunday ? 840 : 555;
         let finalTimeline = data.intradayTimeline || [];
 
-        // Check local storage to merge past points collected during the day
-        try {
-          const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
-          if (stored) {
-            const localArr = JSON.parse(stored);
-            if (Array.isArray(localArr) && localArr.length > 0) {
-              const prevLen = finalTimeline.length;
-              finalTimeline = mergeTimelineArrays(localArr, finalTimeline);
+        // Check local storage to merge past points collected during the day (ONLY for default/near expiry)
+        const isNearOrAuto = activeTab === "auto" || activeTab === "near" || activeTab === "today" || !activeTab || data.expiryDate === data.rollover?.nearExpiry;
+        if (isNearOrAuto) {
+          try {
+            const stored = localStorage.getItem(`nifty_timeline_v2_${todayKey}`);
+            if (stored) {
+              const localArr = JSON.parse(stored);
+              if (Array.isArray(localArr) && localArr.length > 0) {
+                const prevLen = finalTimeline.length;
+                finalTimeline = mergeTimelineArrays(localArr, finalTimeline);
 
-              // If client has more points than server (e.g. serverless cold start), sync back to server ONLY during active market and never with future ticks
-              if (sessionStatus.isAutoActive && localArr.length > prevLen + 5) {
-                const livePayload = finalTimeline.filter(pt => pt && pt.minutes >= openMins && pt.minutes <= nowMins);
-                if (livePayload.length > 0) {
-                  fetch("/api/nifty-oi", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ timeline: livePayload })
-                  }).catch(() => {});
+                // If client has more points than server (e.g. serverless cold start), sync back to server ONLY during active market and never with future ticks
+                if (sessionStatus.isAutoActive && localArr.length > prevLen + 5) {
+                  const livePayload = finalTimeline.filter(pt => pt && pt.minutes >= openMins && pt.minutes <= nowMins);
+                  if (livePayload.length > 0) {
+                    fetch("/api/nifty-oi", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ timeline: livePayload })
+                    }).catch(() => {});
+                  }
                 }
               }
             }
+            if (finalTimeline.length > 0) {
+              localStorage.setItem(`nifty_timeline_v2_${todayKey}`, JSON.stringify(finalTimeline));
+            }
+          } catch (e) {
+            // ignore localStorage errors (e.g. incognito)
           }
-          if (finalTimeline.length > 0) {
-            localStorage.setItem(`nifty_timeline_v2_${todayKey}`, JSON.stringify(finalTimeline));
-          }
-        } catch (e) {
-          // ignore localStorage errors (e.g. incognito)
         }
 
         const fullData = { ...data, intradayTimeline: finalTimeline };
@@ -3114,6 +3118,7 @@ export function NiftyFlowView({ t, isDark }) {
         eodHistory={oiData?.eodHistory}
         rollover={oiData?.rollover}
         activeExpiry={oiData?.expiryDate}
+        selectedExpiry={selectedExpiryTab}
         onSelectExpiry={(exp) => {
           setSelectedExpiryTab(exp);
           fetchNiftyOi(exp);
@@ -3246,9 +3251,9 @@ export function NiftyFlowView({ t, isDark }) {
                       fontWeight: 700,
                       cursor: "pointer",
                       border: "1px solid",
-                      borderColor: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "#3b82f6" : t.border,
-                      background: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "rgba(59, 130, 246, 0.2)" : "transparent",
-                      color: (oiData?.expiryDate === oiData?.rollover?.nearExpiry) ? "#3b82f6" : t.textMuted,
+                      borderColor: (selectedExpiryTab === "near" || (selectedExpiryTab === "auto" && oiData?.expiryDate === oiData?.rollover?.nearExpiry)) ? "#3b82f6" : t.border,
+                      background: (selectedExpiryTab === "near" || (selectedExpiryTab === "auto" && oiData?.expiryDate === oiData?.rollover?.nearExpiry)) ? "rgba(59, 130, 246, 0.2)" : "transparent",
+                      color: (selectedExpiryTab === "near" || (selectedExpiryTab === "auto" && oiData?.expiryDate === oiData?.rollover?.nearExpiry)) ? "#3b82f6" : t.textMuted,
                     }}
                     title="View expiring contracts (0DTE)"
                   >
@@ -3267,9 +3272,9 @@ export function NiftyFlowView({ t, isDark }) {
                         fontWeight: 700,
                         cursor: "pointer",
                         border: "1px solid",
-                        borderColor: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "#10b981" : t.border,
-                        background: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "rgba(16, 185, 129, 0.2)" : "transparent",
-                        color: (oiData?.expiryDate === oiData?.rollover?.nextExpiry) ? "#10b981" : t.textMuted,
+                        borderColor: (selectedExpiryTab === "next" || (selectedExpiryTab !== "near" && selectedExpiryTab !== "monthly" && oiData?.expiryDate === oiData?.rollover?.nextExpiry)) ? "#10b981" : t.border,
+                        background: (selectedExpiryTab === "next" || (selectedExpiryTab !== "near" && selectedExpiryTab !== "monthly" && oiData?.expiryDate === oiData?.rollover?.nextExpiry)) ? "rgba(16, 185, 129, 0.2)" : "transparent",
+                        color: (selectedExpiryTab === "next" || (selectedExpiryTab !== "near" && selectedExpiryTab !== "monthly" && oiData?.expiryDate === oiData?.rollover?.nextExpiry)) ? "#10b981" : t.textMuted,
                       }}
                       title="View next week contracts for forward/overnight positioning"
                     >
@@ -3289,9 +3294,9 @@ export function NiftyFlowView({ t, isDark }) {
                         fontWeight: 700,
                         cursor: "pointer",
                         border: "1px solid",
-                        borderColor: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.border,
-                        background: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "rgba(139, 92, 246, 0.2)" : "transparent",
-                        color: (oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.textMuted,
+                        borderColor: (selectedExpiryTab === "monthly" || oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.border,
+                        background: (selectedExpiryTab === "monthly" || oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "rgba(139, 92, 246, 0.2)" : "transparent",
+                        color: (selectedExpiryTab === "monthly" || oiData?.expiryDate === oiData?.rollover?.monthlyExpiry) ? "#8b5cf6" : t.textMuted,
                       }}
                       title="View active month-end swing contracts"
                     >

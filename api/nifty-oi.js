@@ -14,6 +14,15 @@ let cache = {
   timestamp: 0,
 };
 
+let cacheByExpiry = new Map();
+let lastKnownExpiryDates = [
+  "09-Nov-2026",
+  "17-Nov-2026",
+  "23-Nov-2026",
+  "01-Dec-2026",
+  "08-Dec-2026"
+];
+
 let previousState = {
   floor: 22600,
   roof: 22800,
@@ -1694,9 +1703,12 @@ export default async function handler(req, res) {
                         req.query?.compact === "true" ||
                         /cron|uptime|ping|curl/i.test(req.headers?.["user-agent"] || "");
 
+  const queryExpiry = req.query?.expiry ? String(req.query.expiry).trim().toLowerCase() : null;
+  const isSpecificExpiry = Boolean(queryExpiry && queryExpiry !== "auto");
+
   // 1. Outside live market hours (Weekends, Evenings, Nights, Pre-market)
-  // Serve the settled session state without querying NSE (which is closed)
-  if (!sessionInfo.isLiveMarket && !force) {
+  // If specific expiry is NOT requested, serve the settled session state without querying NSE (which is closed)
+  if (!sessionInfo.isLiveMarket && !force && !isSpecificExpiry) {
     if (isCronRequest) {
       return res.status(200).json({
         ok: true,
@@ -1706,9 +1718,10 @@ export default async function handler(req, res) {
         nextOpen: sessionInfo.nextOpenDescription
       });
     }
-    if (cache.data && (cache.data.isSettledSession || now - cache.timestamp < 3600000)) {
+    const nearCached = cacheByExpiry.get("near") || cacheByExpiry.get("default") || (cache.data?.expiryDate ? cache : null);
+    if (nearCached && (nearCached.data.isSettledSession || now - nearCached.timestamp < 3600000)) {
       return res.status(200).json({
-        ...cache.data,
+        ...nearCached.data,
         isLive: false,
         isSettledSession: true,
         fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
@@ -1725,28 +1738,46 @@ export default async function handler(req, res) {
           fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
         };
         cache = { data: enriched, timestamp: now };
+        cacheByExpiry.set("near", { data: enriched, timestamp: now });
+        cacheByExpiry.set("default", { data: enriched, timestamp: now });
         return res.status(200).json(enriched);
       }
     }
 
     const fallbackPayload = getFallbackData();
     cache = { data: fallbackPayload, timestamp: now };
+    cacheByExpiry.set("near", { data: fallbackPayload, timestamp: now });
+    cacheByExpiry.set("default", { data: fallbackPayload, timestamp: now });
     return res.status(200).json(fallbackPayload);
   }
 
-  // 2. During Live Market Hours: serve memory cache if fresh (< 5 seconds)
-  const cacheAge = now - cache.timestamp;
-  if (!force && cache.data && cache.data.isLive && cacheAge < 5000) {
+  // Outside live market hours with a specific expiry requested: serve from cache if available (valid for 1 hr)
+  if (!sessionInfo.isLiveMarket && !force && isSpecificExpiry) {
+    const cached = cacheByExpiry.get(queryExpiry);
+    if (cached && (cached.data.isSettledSession || now - cached.timestamp < 3600000)) {
+      return res.status(200).json({
+        ...cached.data,
+        isLive: false,
+        isSettledSession: true,
+        fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
+      });
+    }
+  }
+
+  // 2. During Live Market Hours: serve memory cache if fresh (< 5 seconds) for this specific expiry
+  const cacheKey = queryExpiry || "near";
+  const cachedForExpiry = cacheByExpiry.get(cacheKey) || (queryExpiry ? null : (cache.data ? cache : null));
+  if (!force && cachedForExpiry?.data && cachedForExpiry.data.isLive && (now - cachedForExpiry.timestamp < 5000)) {
     if (isCronRequest) {
       return res.status(200).json({
         ok: true,
         cron: true,
         status: "CACHED_FRESH",
-        timestamp: cache.data.timestamp,
-        spot: cache.data.spotPrice
+        timestamp: cachedForExpiry.data.timestamp,
+        spot: cachedForExpiry.data.spotPrice
       });
     }
-    return res.status(200).json(cache.data);
+    return res.status(200).json(cachedForExpiry.data);
   }
 
   // Preload history from Redis if memory is empty
@@ -1777,29 +1808,44 @@ export default async function handler(req, res) {
     };
 
     // 2. Fetch contract info to identify current expiry with 6.5s timeout
-    const contractRes = await fetch("https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY", {
-      headers: sessionHeaders,
-      signal: AbortSignal.timeout(6500),
-    });
-    if (!contractRes.ok) throw new Error(`contract-info status ${contractRes.status}`);
-    const contractData = await contractRes.json();
-    const expiryDates = contractData.expiryDates || [];
-    const nearExpiry = expiryDates[0] || "";
-    const nextExpiry = expiryDates[1] || "";
+    let expiryDates = lastKnownExpiryDates;
+    try {
+      const contractRes = await fetch("https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY", {
+        headers: sessionHeaders,
+        signal: AbortSignal.timeout(6500),
+      });
+      if (contractRes.ok) {
+        const contractData = await contractRes.json();
+        if (Array.isArray(contractData.expiryDates) && contractData.expiryDates.length > 0) {
+          expiryDates = contractData.expiryDates;
+          lastKnownExpiryDates = expiryDates;
+        }
+      }
+    } catch (e) {
+      console.warn("Contract info fetch warning, using last known expiry dates:", e.message);
+    }
+
+    const activeWeekly = getActiveExpiryDate();
+    const nearExpiry = getActiveExpiryDate(expiryDates[0]) || activeWeekly;
+    const nextExpiry = expiryDates.find(e => {
+      const d = new Date(e);
+      const nd = new Date(nearExpiry);
+      return !isNaN(d.getTime()) && d > nd;
+    }) || expiryDates[1] || "";
     const monthlyExpiry = getActiveMonthlyExpiry(expiryDates);
     const isExpiryDay = isTodayExpiryDate(nearExpiry);
     const currentMinutes = getISTMinutes();
     const isAfternoonRollover = (isExpiryDay && nextExpiry && (currentMinutes >= 840 || req.query?.rollover === "true"));
 
     let targetExpiry = nearExpiry;
-    if (req.query?.expiry === "next" && nextExpiry) {
+    if (queryExpiry === "next" && nextExpiry) {
       targetExpiry = nextExpiry;
-    } else if (req.query?.expiry === "today" || req.query?.expiry === "near") {
+    } else if (queryExpiry === "today" || queryExpiry === "near") {
       targetExpiry = nearExpiry;
-    } else if (req.query?.expiry === "monthly" && monthlyExpiry) {
+    } else if (queryExpiry === "monthly" && monthlyExpiry) {
       targetExpiry = monthlyExpiry;
-    } else if (req.query?.expiry && expiryDates.includes(req.query.expiry)) {
-      targetExpiry = req.query.expiry;
+    } else if (queryExpiry && expiryDates.some(e => e.toLowerCase() === queryExpiry)) {
+      targetExpiry = expiryDates.find(e => e.toLowerCase() === queryExpiry);
     } else if (isAfternoonRollover && nextExpiry) {
       // Default to next week's expiry on expiry day afternoon (after 14:00 IST)
       targetExpiry = nextExpiry;
@@ -2052,7 +2098,9 @@ export default async function handler(req, res) {
 
     const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics);
 
-    const timeline = buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics);
+    const timeline = (targetExpiry === nearExpiry && Array.isArray(intradayHistory) && intradayHistory.length > 0)
+      ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics)
+      : getCanonicalSettledTimeline(totPutWriting, totCallWriting, spot, futuresMetrics);
 
     // Compute Smart Money / Institutional Analysis
     const smartMoney = analyzeSmartMoney({
@@ -2193,9 +2241,17 @@ export default async function handler(req, res) {
       },
     };
 
-    cache = { data: payload, timestamp: now };
-    if (REDIS_URL) {
-      saveRedisSessionPayload(payload).catch(() => {});
+    cacheByExpiry.set(targetExpiry.toLowerCase(), { data: payload, timestamp: now });
+    if (queryExpiry) {
+      cacheByExpiry.set(queryExpiry, { data: payload, timestamp: now });
+    }
+    if (targetExpiry === nearExpiry) {
+      cacheByExpiry.set("near", { data: payload, timestamp: now });
+      cacheByExpiry.set("default", { data: payload, timestamp: now });
+      cache = { data: payload, timestamp: now };
+      if (REDIS_URL) {
+        saveRedisSessionPayload(payload).catch(() => {});
+      }
     }
     if (isCronRequest) {
       return res.status(200).json({
@@ -2219,7 +2275,20 @@ export default async function handler(req, res) {
         spot: cache.data?.spotPrice || 25030.35
       });
     }
-    if (cache.data) {
+
+    if (isSpecificExpiry) {
+      const cachedExpiry = cacheByExpiry.get(queryExpiry);
+      if (cachedExpiry) {
+        return res.status(200).json({
+          ...cachedExpiry.data,
+          isLive: false,
+          isSettledSession: true,
+          fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
+        });
+      }
+    }
+
+    if (!isSpecificExpiry && cache.data) {
       return res.status(200).json({
         ...cache.data,
         isLive: false,
@@ -2228,7 +2297,7 @@ export default async function handler(req, res) {
       });
     }
 
-    if (REDIS_URL) {
+    if (!isSpecificExpiry && REDIS_URL) {
       const persisted = await getRedisSessionPayload();
       if (persisted) {
         return res.status(200).json({
@@ -2241,14 +2310,50 @@ export default async function handler(req, res) {
     }
 
     // High fidelity default fallback based on real Friday settled session
-    const fallbackPayload = getFallbackData();
+    const fallbackPayload = getFallbackData(queryExpiry);
     return res.status(200).json(fallbackPayload);
   }
 }
 
-function getFallbackData() {
+export function getFallbackExpirySchedule() {
+  const nearExpiry = getActiveExpiryDate();
+  if (Array.isArray(lastKnownExpiryDates) && lastKnownExpiryDates.length >= 2) {
+    const near = lastKnownExpiryDates[0] || nearExpiry;
+    const next = lastKnownExpiryDates[1] || "17-Nov-2026";
+    const monthly = getActiveMonthlyExpiry(lastKnownExpiryDates) || "26-Nov-2026";
+    return { nearExpiry: near, nextExpiry: next, monthlyExpiry: monthly };
+  }
+  const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const nearDateObj = new Date(nearExpiry);
+  let nextDateObj = !isNaN(nearDateObj.getTime())
+    ? new Date(nearDateObj.getTime() + 7 * 86400000)
+    : new Date(istDate.getTime() + 7 * 86400000);
+  const d = String(nextDateObj.getDate()).padStart(2, "0");
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const m = monthNames[nextDateObj.getMonth()];
+  const y = nextDateObj.getFullYear();
+  const nextExpiry = `${d}-${m}-${y}`;
+  const monthlyExpiry = getActiveMonthlyExpiry([nearExpiry, nextExpiry, "26-Nov-2026"]) || "26-Nov-2026";
+  return { nearExpiry, nextExpiry, monthlyExpiry };
+}
+
+function getFallbackData(requestedExpiry = null) {
   const spot = 25030.35;
-  const expiryDate = getActiveExpiryDate();
+  const { nearExpiry, nextExpiry, monthlyExpiry } = getFallbackExpirySchedule();
+
+  let targetExpiry = nearExpiry;
+  const reqLower = requestedExpiry ? String(requestedExpiry).trim().toLowerCase() : null;
+  if (reqLower === "next") {
+    targetExpiry = nextExpiry;
+  } else if (reqLower === "monthly") {
+    targetExpiry = monthlyExpiry;
+  } else if (reqLower === "near" || reqLower === "today") {
+    targetExpiry = nearExpiry;
+  } else if (requestedExpiry && typeof requestedExpiry === "string" && reqLower !== "auto") {
+    targetExpiry = requestedExpiry;
+  }
+
+  const expiryDate = targetExpiry;
   const sessionInfo = getMarketSessionInfo();
 
   const strikesData = [
@@ -2377,6 +2482,16 @@ function getFallbackData() {
     eodHistory: CANONICAL_EOD_SEED_HISTORY,
     intradayTimeline: timeline,
     hasRedis: Boolean(REDIS_URL),
+    rollover: {
+      isExpiryDay: isTodayExpiryDate(nearExpiry),
+      nearExpiry,
+      nextExpiry,
+      monthlyExpiry,
+      activeContract: targetExpiry,
+      isAfternoonRollover: false,
+      isEvaluatingNextExpiry: Boolean(targetExpiry === nextExpiry),
+      nextExpiryMetrics: null,
+    },
     sessionWindow: {
       isSundayDiwali: sessionInfo.isSunday,
       isSaturday: sessionInfo.isSaturday,
