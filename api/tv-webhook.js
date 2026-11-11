@@ -863,14 +863,25 @@ export async function sendTelegramExitAlert(exitRecord) {
 }
 
 /**
- * Telegram EOD 15:15 Decision Helper & 15-Minute Radar Updates (14:00 - 15:30 IST)
+ * Telegram EOD 15:15 Decision Helper, Radar Updates (14:15 - 15:35 IST slots) & Flip Alerts
  */
-export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr = "15:15") {
+const EOD_CATEGORY_LABELS = { BTST: "BTST (BUY CE)", STBT: "STBT (BUY PE)", NO_CARRY: "NO CARRY (CASH)" };
+const fmtEodScore = (s) => (Number.isFinite(Number(s)) && s !== null ? (Number(s) >= 0 ? `+${Number(s)}` : `${Number(s)}`) : "n/a");
+
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.isScheduledSlot=true] false for an immediate flip alert sent between slots
+ * @param {boolean} [opts.isLastScheduled] the 15:35 slot: last scheduled update before the 15:40 close
+ * @param {object|null} [opts.flip] { fromCategory, toCategory, fromScore, toScore, fromTime, toTime }
+ */
+export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr = "15:15", opts = {}) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId || !eodDecision) return;
 
-  const isFinalDirective = (slotTimeStr === "15:15");
+  const isScheduledSlot = opts?.isScheduledSlot !== false;
+  const flip = opts?.flip || null;
+  const isFinalDirective = (slotTimeStr === "15:15") && isScheduledSlot;
   const isBTST = eodDecision.verdict?.includes("BTST") || eodDecision.bias === "BULLISH";
   const isSTBT = eodDecision.verdict?.includes("STBT") || eodDecision.bias === "BEARISH";
 
@@ -889,13 +900,25 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
       : `📡 *EOD CARRY RADAR (${slotTimeStr} IST UPDATE) · NEUTRAL / CASH BIAS*`;
   }
 
-  const lines = [
+  if (opts?.isLastScheduled && isScheduledSlot) {
+    header = header.replace(`(${slotTimeStr} IST UPDATE)`, `(${slotTimeStr} IST · LAST SCHEDULED UPDATE BEFORE 15:40 CLOSE)`);
+  }
+
+  const lines = [];
+  if (flip) {
+    const fromLabel = EOD_CATEGORY_LABELS[flip.fromCategory] || flip.fromCategory;
+    const toLabel = EOD_CATEGORY_LABELS[flip.toCategory] || flip.toCategory;
+    lines.push(`🔀🚨 *EOD CARRY DECISION FLIP (${flip.toTime || slotTimeStr} IST) · ${fromLabel} → ${toLabel}*`);
+    lines.push(`• *Decision Changed:* \`${fromLabel}\` (Score \`${fmtEodScore(flip.fromScore)}\`${flip.fromTime ? `, sent ${flip.fromTime} IST` : ""}) → \`${toLabel}\` (Score \`${fmtEodScore(flip.toScore)}\`)`);
+    lines.push("");
+  }
+  lines.push(
     header,
     `• *${isFinalDirective ? "Official Verdict" : "Interim Verdict"}:* \`${eodDecision.verdict}\``,
     `• *Bias & Conviction:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Conviction: \`${eodDecision.conviction}%\`)`,
     `• *Recommended Sizing:* \`${eodDecision.sizing}\``,
     `• *Spot Index:* \`₹${Math.round(spot)}\` | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
-  ];
+  );
 
   if (eodDecision.targetContract) {
     const rolloverNotice = eodDecision.isRollover ? " 🔄 *(Next-Week Rollover)*" : "";
@@ -916,8 +939,18 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
     });
   }
 
-  if (!isFinalDirective) {
-    lines.push(`• *Notice:* ⏳ *Evolving 15-min pulse. Final carry directive finalized at 15:15 IST.*`);
+  if (!isScheduledSlot) {
+    lines.push(`• *Notice:* ⚡ *Immediate flip alert (between scheduled slots). Decision can keep changing until the 15:40 IST close.*`);
+  } else if (opts?.isLastScheduled) {
+    lines.push(`• *Notice:* 🔔 *LAST SCHEDULED UPDATE before the 15:40 IST close. Only a decision flip will trigger another alert.*`);
+  } else if (!isFinalDirective) {
+    if (slotTimeStr > "15:15") {
+      lines.push(`• *Notice:* ⏳ *Post-directive 5-min pulse. Flow can still flip the carry until the 15:40 IST close; flips are alerted immediately.*`);
+    } else if (slotTimeStr >= "15:05") {
+      lines.push(`• *Notice:* ⏳ *Evolving 5-min pulse. Final carry directive finalized at 15:15 IST.*`);
+    } else {
+      lines.push(`• *Notice:* ⏳ *Evolving 15-min pulse. Final carry directive finalized at 15:15 IST.*`);
+    }
   }
 
   lines.push(`• *Time Finalized:* ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST`);

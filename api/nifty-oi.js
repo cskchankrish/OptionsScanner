@@ -97,13 +97,59 @@ export async function redisRestDel(key) {
   }
 }
 
+// ── EOD carry radar schedule ──
+// Scheduled alerts run 14:15–15:38 IST: 15-minute slots 14:15, 14:30, 14:45, 15:00, then
+// 5-minute slots 15:05 … 15:35 (15:35 = last scheduled update before the 15:40 close).
+export const EOD_WINDOW_START_MINS = 855; // 14:15 IST
+export const EOD_WINDOW_END_MINS = 938; // 15:38 IST
+export const EOD_FIVE_MIN_SLOTS_FROM = 905; // 15:05 IST
+export const EOD_LAST_SLOT_MINS = 935; // 15:35 IST
+
+/** Slot start (IST minutes) for a minute inside the EOD window, or null outside it. */
+export function getEodSlotMinutes(istMinutes) {
+  if (!Number.isFinite(istMinutes)) return null;
+  if (istMinutes < EOD_WINDOW_START_MINS || istMinutes > EOD_WINDOW_END_MINS) return null;
+  if (istMinutes < EOD_FIVE_MIN_SLOTS_FROM) return Math.floor(istMinutes / 15) * 15;
+  return Math.min(EOD_LAST_SLOT_MINS, Math.floor(istMinutes / 5) * 5);
+}
+
+function minsToHHMM(mins) {
+  return `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
+}
+
 /**
- * 15-minute BTST/STBT carry radar dispatcher.
- * Dedupe is an atomic SET NX claim on the slot key taken BEFORE sending, so two
- * concurrent requests in the same slot cannot both send. If the send fails, the
- * claim is released so a later poll in the same slot can retry.
- * Without Redis (or if the claim errors) nothing is sent, except for the explicit
- * authenticated `test=eod_alert` path which bypasses dedupe.
+ * Carry category of an eodDecision, keyed on `bias` as set by calculateEODDecision:
+ * "BULLISH" (verdict "CARRY NIFTY CE (BTST)") → BTST, "BEARISH" ("CARRY NIFTY PE (STBT)") → STBT,
+ * anything else ("NEUTRAL", verdict "EXIT TO CASH / DO NOT CARRY") → NO_CARRY.
+ */
+export function getEodCarryCategory(eodDecision) {
+  const bias = eodDecision?.bias;
+  if (bias === "BULLISH") return "BTST";
+  if (bias === "BEARISH") return "STBT";
+  return "NO_CARRY";
+}
+
+export function getEodFlipMinGapSeconds() {
+  const v = Number(process.env.EOD_FLIP_MIN_GAP_SECONDS);
+  return Number.isFinite(v) && v > 0 ? v : 120;
+}
+
+/**
+ * BTST/STBT carry radar dispatcher (scheduled slots + immediate flip alerts).
+ *
+ * Slots: atomic SET NX claim on `nifty:eod_slot_dispatched:<date>:<HH:MM>` BEFORE sending,
+ * released on send failure so a later poll in the same slot can retry.
+ *
+ * Flips: when the carry category (see getEodCarryCategory) differs from the category of the
+ * last EOD message actually sent today (`nifty:eod_last_sent:<date>`, written only after a
+ * successful send), an alert is sent immediately. Concurrency: atomic claim on
+ * `nifty:eod_flip_claim:<date>:<FROM>-<TO>:<bucket>` (bucket = flip-gap-sized time bucket),
+ * released on failure. Throttle: at most one flip alert per EOD_FLIP_MIN_GAP_SECONDS (default
+ * 120s); because the throttle is purely time-since-last-flip, a flip is never held back longer
+ * than that gap (plus one poll interval). If a slot is also due, ONE merged message is sent.
+ *
+ * Without Redis (or if a claim errors) nothing is sent, except for the explicit authenticated
+ * `test=eod_alert` path which bypasses dedupe.
  */
 export async function dispatchEodRadarAlert({
   istMinutes,
@@ -118,49 +164,127 @@ export async function dispatchEodRadarAlert({
   const hasRedis = deps.hasRedis !== undefined ? deps.hasRedis : Boolean(REDIS_URL && REDIS_TOKEN);
   const setNx = deps.setNx || redisRestSetNx;
   const set = deps.set || redisRestSet;
+  const get = deps.get || redisRestGet;
   const del = deps.del || redisRestDel;
+  const nowMs = deps.now ? deps.now() : Date.now();
+  const flipGapSec = deps.flipGapSeconds || getEodFlipMinGapSeconds();
+  const flipClaimTtl = Math.max(60, Math.ceil(flipGapSec * 2));
   const sendAlert = deps.sendAlert || (async (...args) => {
     const { sendTelegramEODAlert } = await import("./tv-webhook.js");
     return sendTelegramEODAlert(...args);
   });
 
-  const inWindow = istMinutes >= 855 && istMinutes <= 930;
-  if (!inWindow && !isEodTest) return { status: "OUTSIDE_WINDOW", sent: false };
-
-  // Identify current 15-minute slot (14:15, 14:30, 14:45, 15:00, 15:15, 15:30)
-  const slotMins = isEodTest ? 915 : Math.floor(istMinutes / 15) * 15;
-  const slotTimeStr = `${String(Math.floor(slotMins / 60)).padStart(2, "0")}:${String(slotMins % 60).padStart(2, "0")}`;
-  const dispatchedKey = `nifty:eod_slot_dispatched:${istDateStr}:${slotTimeStr}`;
-
   if (isEodTest) {
+    const slotTimeStr = "15:15";
     const sent = await sendAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
     return { status: "TEST_SENT", sent: Boolean(sent), slotTimeStr };
   }
 
+  const slotMins = getEodSlotMinutes(istMinutes);
+  if (slotMins === null) return { status: "OUTSIDE_WINDOW", sent: false };
+  const slotTimeStr = minsToHHMM(slotMins);
+  const nowTimeStr = minsToHHMM(Math.floor(istMinutes));
+  const slotKey = `nifty:eod_slot_dispatched:${istDateStr}:${slotTimeStr}`;
+  const lastSentKey = `nifty:eod_last_sent:${istDateStr}`;
+
   if (!hasRedis) return { status: "NO_REDIS_SKIPPED", sent: false, slotTimeStr };
 
-  let claimed = false;
+  const category = getEodCarryCategory(eodDecision);
+  let lastSent = null;
   try {
-    claimed = await setNx(dispatchedKey, { claimedAt: new Date().toISOString(), state: "SENDING" }, 86400);
+    lastSent = await get(lastSentKey);
+  } catch (e) {
+    lastSent = null;
+  }
+  if (lastSent && typeof lastSent !== "object") lastSent = null;
+  const flipDue = Boolean(lastSent && lastSent.category && lastSent.category !== category);
+
+  // 1. Flip claim first, so the poll that owns the flip also owns any slot due right now
+  //    (one merged message instead of a flip + a slot from two concurrent polls).
+  let flipKey = null;
+  let flipThrottled = false;
+  if (flipDue) {
+    const lastFlipMs = lastSent.lastFlipAt ? Date.parse(lastSent.lastFlipAt) : NaN;
+    flipThrottled = Number.isFinite(lastFlipMs) && nowMs - lastFlipMs < flipGapSec * 1000;
+    if (!flipThrottled) {
+      const bucket = Math.floor(nowMs / (flipGapSec * 1000));
+      const candidate = `nifty:eod_flip_claim:${istDateStr}:${lastSent.category}-${category}:${bucket}`;
+      let flipClaimed = false;
+      try {
+        flipClaimed = await setNx(candidate, { claimedAt: new Date(nowMs).toISOString(), state: "SENDING" }, flipClaimTtl);
+      } catch (e) {
+        console.error("EOD flip dedupe claim failed; not sending:", e.message);
+        return { status: "CLAIM_ERROR", sent: false, slotTimeStr };
+      }
+      // Another poll owns this flip (and will also take any due slot): stay quiet.
+      if (!flipClaimed) return { status: "FLIP_ALREADY_CLAIMED", sent: false, slotTimeStr, flip: true };
+      flipKey = candidate;
+    }
+  }
+
+  // 2. Slot claim.
+  let slotClaimed = false;
+  try {
+    slotClaimed = await setNx(slotKey, { claimedAt: new Date(nowMs).toISOString(), state: "SENDING" }, 86400);
   } catch (e) {
     console.error("EOD radar dedupe claim failed; not sending:", e.message);
+    if (flipKey) await del(flipKey);
     return { status: "CLAIM_ERROR", sent: false, slotTimeStr };
   }
-  if (!claimed) return { status: "ALREADY_CLAIMED", sent: false, slotTimeStr };
+
+  if (!flipKey && !slotClaimed) {
+    return { status: flipThrottled ? "FLIP_THROTTLED" : "ALREADY_CLAIMED", sent: false, slotTimeStr, flip: flipDue };
+  }
+
+  // Whenever the category changed and we send at all, the message is flip-labelled
+  // (a throttled flip may still ride along with a due slot: still one message).
+  const isFlipMessage = flipDue;
+  const opts = {
+    isScheduledSlot: slotClaimed,
+    isLastScheduled: slotClaimed && slotMins === EOD_LAST_SLOT_MINS,
+    flip: isFlipMessage
+      ? {
+          fromCategory: lastSent.category,
+          toCategory: category,
+          fromScore: lastSent.score,
+          toScore: eodDecision?.score,
+          fromVerdict: lastSent.verdict,
+          fromTime: lastSent.time,
+          toTime: nowTimeStr,
+        }
+      : null,
+  };
+  const msgTimeStr = slotClaimed ? slotTimeStr : nowTimeStr;
 
   let sent = false;
   try {
-    sent = await sendAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
+    sent = await sendAlert(eodDecision, spot, floorStrike, roofStrike, msgTimeStr, opts);
   } catch (e) {
     console.error("EOD radar send failed:", e.message);
     sent = false;
   }
-  if (sent) {
-    await set(dispatchedKey, { sentAt: new Date().toISOString(), state: "SENT" }, 86400);
-    return { status: "SENT", sent: true, slotTimeStr };
+
+  if (!sent) {
+    if (slotClaimed) await del(slotKey);
+    if (flipKey) await del(flipKey);
+    return { status: "SEND_FAILED_RELEASED", sent: false, slotTimeStr, flip: isFlipMessage };
   }
-  await del(dispatchedKey);
-  return { status: "SEND_FAILED_RELEASED", sent: false, slotTimeStr };
+
+  const sentAtIso = new Date(nowMs).toISOString();
+  if (slotClaimed) await set(slotKey, { sentAt: sentAtIso, state: "SENT", flip: isFlipMessage }, 86400);
+  if (flipKey) await set(flipKey, { sentAt: sentAtIso, state: "SENT" }, flipClaimTtl);
+  await set(lastSentKey, {
+    category,
+    score: eodDecision?.score ?? null,
+    verdict: eodDecision?.verdict ?? null,
+    time: nowTimeStr,
+    sentAt: sentAtIso,
+    kind: slotClaimed ? (isFlipMessage ? "SLOT_FLIP" : "SLOT") : "FLIP",
+    lastFlipAt: isFlipMessage ? sentAtIso : (lastSent?.lastFlipAt || null),
+  }, 86400);
+
+  const status = slotClaimed ? (isFlipMessage ? "SENT_SLOT_WITH_FLIP" : "SENT") : "FLIP_SENT";
+  return { status, sent: true, slotTimeStr, flip: isFlipMessage, category };
 }
 
 // ── Test hooks for module-level session state ──
@@ -341,7 +465,7 @@ export function getMarketSessionInfo() {
     isLiveMarket = (mins >= 555 && mins <= 940);
     isPostMarketSettled = (mins > 940);
     isPreMarket = (mins < 555);
-    tradingWindow = "09:15 - 15:30 IST";
+    tradingWindow = "09:15 - 15:40 IST";
     nextOpenDescription = mins < 555 ? "Opens Today 09:15 IST" : "Next Trading Day 09:15 IST";
   }
 
@@ -2457,7 +2581,7 @@ export async function refreshLiveSnapshot({
       await evaluateActiveTradeLifecycle(spot);
     } catch (e) {}
 
-    // Automatic 15-Minute BTST / STBT Carry Radar & Final EOD Dispatcher (14:00 to 15:30 IST)
+    // Automatic BTST / STBT Carry Radar + flip alerts (14:15 to 15:38 IST; see dispatchEodRadarAlert)
     const istMinutes = getISTMinutes();
     const istDateStr = getISTIsoDateStr();
     try {

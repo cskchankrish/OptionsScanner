@@ -1050,7 +1050,7 @@ function NiftyIntradayLineChart({
               </span>
             </div>
             <div style={{ fontSize: isMobile ? 10.5 : 12, color: t.textMuted, marginTop: 3, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-              <span>09:15 → 15:30 IST · Drag timeline to inspect live 5-minute cumulative writing delta</span>
+              <span>09:15 → 15:40 IST · Drag timeline to inspect live 5-minute cumulative writing delta</span>
               {hasRedis && (
                 <span style={{
                   fontSize: isMobile ? 9.5 : 10.5,
@@ -1326,7 +1326,7 @@ function NiftyIntradayLineChart({
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
             <div>
               <div style={{ fontSize: 16, fontWeight: 900, color: t.text }}>
-                📈 Fullscreen Intraday Line Graph (09:15 → 15:30)
+                📈 Fullscreen Intraday Line Graph (09:15 → 15:40)
               </div>
               <div style={{ fontSize: 11, color: t.textMuted }}>
                 Spot: ₹{spot.toLocaleString("en-IN")} · Swipe horizontally to pan
