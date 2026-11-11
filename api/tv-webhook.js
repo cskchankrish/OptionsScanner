@@ -28,6 +28,7 @@
 
 import { Redis } from "@upstash/redis";
 import { authorizeRequest } from "../src/webhookAuth.js";
+import { isSpotFrozenAt } from "../src/flowCalc.js";
 import {
   getFlowBridgeConfig,
   shouldDispatch,
@@ -347,6 +348,9 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
   const serverFutQuadRaw =
     liveScanner?.futures?.quadrant ?? liveScanner?.fusion?.quadrantInfo?.quadrant ?? null;
   const liveFutQuad = !serverFutQuadRaw || futuresStale ? "UNAVAILABLE" : String(serverFutQuadRaw);
+  // Which quadrant the server published: "INTRADAY" (rolling window) or "DAY" (vs prev close/open).
+  const liveFutQuadSource = liveScanner?.futures?.quadrantSource ?? liveScanner?.fusion?.quadrantSource ?? null;
+  const liveFutQuadSourceLabel = liveScanner?.futures?.quadrantSourceLabel ?? liveScanner?.fusion?.quadrantSourceLabel ?? null;
   const chartFutQuad = tv.futQuad ?? null;
 
   // Distance to real Option Chain walls
@@ -374,7 +378,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
       decision = "VETO_SIGNAL";
       recommendedLots = 0;
       reason.push(
-        `VETOED: Chart flagged Bear Trap Buy, but real 22-strike Option Chain shows heavy Call Writing (ΔPCR=${deltaPCR?.toFixed(2)}) + Futures Short Buildup.`
+        `VETOED: Chart flagged Bear Trap Buy, but real 22-strike Option Chain shows heavy Call Writing (ΔPCR=${deltaPCR?.toFixed(2)}) + Futures Short Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}.`
       );
     } else {
       decision = "EXECUTE_TIER1_SCOUT";
@@ -394,7 +398,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
       decision = "VETO_SIGNAL";
       recommendedLots = 0;
       reason.push(
-        `VETOED: Chart flagged Bull Trap Sell, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR?.toFixed(2)}) + Futures Long Buildup.`
+        `VETOED: Chart flagged Bull Trap Sell, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR?.toFixed(2)}) + Futures Long Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}.`
       );
     } else {
       decision = "EXECUTE_TIER1_SCOUT";
@@ -428,7 +432,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
         recommendedLots = 0;
         tier = "VETOED_DIVERGENT";
         reason.push(
-          `VETOED: Chart flagged Bull Synergy, but real 22-strike Option Chain shows Call Writing resistance (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Futures Short Buildup. Fake bull flow.`
+          `VETOED: Chart flagged Bull Synergy, but real 22-strike Option Chain shows Call Writing resistance (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Futures Short Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}. Fake bull flow.`
         );
       } else if (distToRoof !== null && distToRoof < 50 && deltaPCR !== null && deltaPCR < 1.30) {
         decision = "DOWNGRADE_TO_SCALP";
@@ -466,7 +470,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
         recommendedLots = 0;
         tier = "VETOED_DIVERGENT";
         reason.push(
-          `VETOED: Chart flagged Bear Synergy, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Floor defense near ${floorStrike}. High risk of bounce.`
+          `VETOED: Chart flagged Bear Synergy, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Floor defense near ${floorStrike}${liveFutQuad === "LONG_BUILDUP" ? ` or Futures Long Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}` : ""}. High risk of bounce.`
         );
       } else if (distToFloor !== null && distToFloor < 50 && deltaPCR !== null && deltaPCR > 0.70) {
         decision = "DOWNGRADE_TO_SCALP";
@@ -649,6 +653,8 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
       scannerAction,
       liveFutQuad,
       serverFutQuad: liveFutQuad,
+      serverFutQuadSource: liveFutQuadSource,
+      serverFutQuadSourceLabel: liveFutQuadSourceLabel,
       chartFutQuad,
       futuresStale,
       snapshotAt,
@@ -658,6 +664,12 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
     },
     reasoning: reason.join(" "),
   };
+}
+
+/** "HH:MM" → IST minutes (NaN when unparsable). */
+function slotClockMins(hhmm) {
+  const m = /^(d{1,2}):(d{2})/.exec(String(hhmm || ""));
+  return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
 }
 
 /**
@@ -935,9 +947,9 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
   lines.push(
     header,
     `• *${isFinalDirective ? "Official Verdict" : "Interim Verdict"}:* \`${eodDecision.verdict}\``,
-    `• *Bias & Conviction:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Conviction: \`${eodDecision.conviction}%\`)`,
+    `• *Bias & Agreement:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Agreement: \`${eodDecision.conviction}/100\` — rule-based, not a probability${eodDecision.agreement ? `; ${eodDecision.agreement.groupsAgreeing.length}/3 evidence groups agree` : ""})`,
     `• *Recommended Sizing:* \`${eodDecision.sizing}\``,
-    `• *Spot Index:* \`₹${Math.round(spot)}\` | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
+    `• *Spot Index:* \`₹${Math.round(spot)}\`${isSpotFrozenAt(slotClockMins(slotTimeStr)) ? " ❄ _(frozen 15:15–15:30 for the NSE closing auction)_" : ""} | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
   );
 
   if (eodDecision.targetContract) {
@@ -954,9 +966,13 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
 
   if (eodDecision.audit && eodDecision.audit.length > 0) {
     lines.push(`• *Institutional Evidence:*`);
-    eodDecision.audit.slice(0, 4).forEach(a => {
+    // Grouped audit: one line per independent evidence group, then any veto guardrails.
+    const grouped = eodDecision.audit.filter(a => a.isGroupSummary || a.group === "GUARD");
+    (grouped.length > 0 ? grouped : eodDecision.audit.slice(0, 4)).forEach(a => {
       lines.push(`  - ${a.label}: \`${a.status}\` (${a.impact})`);
     });
+    const closingGroup = eodDecision.audit.find(a => a.isGroupSummary && a.group === "B");
+    if (closingGroup?.detail) lines.push(`  - Closing flow: ${closingGroup.detail}`);
   }
 
   if (!isScheduledSlot) {

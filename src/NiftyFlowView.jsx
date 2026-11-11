@@ -9,6 +9,7 @@ import {
 import {
   classifyFuturesQuadrant,
 } from "./smartMoneyFusion.js";
+import { isSpotFrozenAt } from "./flowCalc.js";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -1249,6 +1250,11 @@ function NiftyIntradayLineChart({
             {hovered?.spot && (
               <span>
                 <strong style={{ color: t.text }}>Spot:</strong> <span style={{ fontFamily: "monospace", fontWeight: 700 }}>₹{hovered.spot.toLocaleString("en-IN")}</span>
+                {(hovered.spotFrozen || isSpotFrozenAt(hovered.minutes)) && (
+                  <span style={{ marginLeft: 4, fontSize: 9.5, fontWeight: 800, color: "#d97706" }} title="NSE closing auction: the NIFTY spot index does not update 15:15–15:30 IST; futures and options keep trading until 15:40.">
+                    ❄ frozen · closing auction
+                  </span>
+                )}
               </span>
             )}
             <span>
@@ -1296,7 +1302,7 @@ function NiftyIntradayLineChart({
                 background: isDark ? "rgba(56, 189, 248, 0.15)" : "#e0f2fe",
                 color: isDark ? "#38bdf8" : "#0284c7"
               }}>
-                {String(hovered.futQuadrant).replace(/_/g, " ")}
+                {String(hovered.futQuadrant).replace(/_/g, " ")}{hovered.futQuadrantSource ? ` · ${hovered.futQuadrantSource === "INTRADAY" ? "30m" : "day"}` : ""}
               </span>
             )}
           </div>
@@ -2040,8 +2046,8 @@ export function NiftyFlowView({ t, isDark }) {
                   <span style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
                     Nifty Futures (LTP)
                   </span>
-                  <span style={{ fontSize: 9.5, fontWeight: 800, color: (fut?.priceChange || 0) >= 0 ? "#16a34a" : "#ef4444" }}>
-                    {(fut?.priceChange || 0) >= 0 ? "+" : ""}{fut?.priceChange ?? "0"} ({(fut?.priceChangePct || 0) >= 0 ? "+" : ""}{fut?.priceChangePct ?? "0"}%)
+                  <span style={{ fontSize: 9.5, fontWeight: 800, color: (fut?.priceChange || 0) >= 0 ? "#16a34a" : "#ef4444" }} title={fut?.priceChangeBase === "SESSION_OPEN" ? "Change vs today's session open" : "Change vs previous close"}>
+                    {(fut?.priceChange || 0) >= 0 ? "+" : ""}{fut?.priceChange ?? "0"} ({(fut?.priceChangePct || 0) >= 0 ? "+" : ""}{fut?.priceChangePct ?? "0"}%) {fut?.priceChangeBase === "SESSION_OPEN" ? "vs open" : "vs prev close"}
                   </span>
                 </div>
                 <div style={{ fontFamily: "monospace", fontSize: isMobile ? 15 : 18, fontWeight: 900, color: t.text, margin: "2px 0" }}>
@@ -2078,6 +2084,15 @@ export function NiftyFlowView({ t, isDark }) {
                 </div>
                 <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
                   Combined ΔOI: <strong>{fut?.combinedChgOI >= 0 ? `+${formatLotsAbs(fut?.combinedChgOI)}` : `-${formatLotsAbs(fut?.combinedChgOI || 0)}`}</strong> ({fut?.combinedOiChangePct >= 0 ? `+${fut?.combinedOiChangePct}` : `${fut?.combinedOiChangePct || 0}`}%) · DTE: <strong>{fut?.dte ?? "—"}d</strong>
+                </div>
+                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3, marginTop: 3 }}>
+                  Used by fusion: <strong>{fusion?.quadrantSourceLabel || (fusion?.quadrantSource === "INTRADAY" ? "30m intraday" : "day")}</strong>
+                  {fusion?.quadrantSource === "INTRADAY" && fusion?.quadrantDay?.label && (
+                    <span> · Day ({fusion.quadrantDay.base || "prev close"}): {fusion.quadrantDay.label}</span>
+                  )}
+                  {fusion?.quadrantSource === "DAY" && fusion?.quadrantSourceReason && (
+                    <span> · {fusion.quadrantSourceReason}</span>
+                  )}
                 </div>
               </div>
 
@@ -2549,7 +2564,9 @@ export function NiftyFlowView({ t, isDark }) {
                     color: color,
                     border: `1px solid ${borderTint}`,
                   }}>
-                    {eod.conviction}% Conviction · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
+                    <span title={eod.convictionLabel || "Agreement score (rule-based, not a probability)"}>
+                      Agreement {eod.conviction}/100{eod.agreement ? ` (${eod.agreement.groupsAgreeing.length}/3 groups)` : ""} · rule-based, not a probability
+                    </span> · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
                   </span>
                 </div>
 
@@ -2947,8 +2964,8 @@ export function NiftyFlowView({ t, isDark }) {
                           <div style={{ textAlign: isMobile ? "left" : "right" }}>
                             <span style={{ color: t.textMuted }}>Score: </span>
                             <strong>{item.score > 0 ? `+${item.score}` : item.score}</strong>
-                            <span style={{ color: t.textMuted }}> · Conviction: </span>
-                            <strong>{item.conviction}%</strong>
+                            <span style={{ color: t.textMuted }}> · Agreement (rule-based): </span>
+                            <strong>{item.conviction}/100</strong>
                             <span style={{ color: t.textMuted }}> · PCR: </span>
                             <strong>{item.pcr || "—"}</strong>
                           </div>

@@ -11,6 +11,8 @@ export const ANNUALIZED_RISK_FREE_RATE = 0.068; // 6.8% RBI Repo / T-Bill benchm
 export const PRICE_DEADBAND_PCT = 0.08;        // ~20 pts on Nifty 25,000
 export const OI_DEADBAND_PCT = 0.25;           // 0.25% OI fluctuation threshold
 
+import { getFusionQuadrantMode } from "./flowCalc.js";
+
 /**
  * Extracts and normalizes Nifty Futures contracts from NSE liveEquity-derivatives payload.
  * Filters for Instrument: FUTIDX / Symbol: NIFTY and sorts by expiryDate ascending.
@@ -43,6 +45,9 @@ export function parseNseFuturesPayload(
   const spotPrice = Number(near.underlyingValue ?? spotPriceFallback ?? 0);
   let priceChange = Number(near.change ?? near.ptsChange ?? 0);
   let priceChangePct = Number(near.pChange ?? (spotPrice > 0 ? (priceChange / spotPrice) * 100 : 0));
+  // Reference of the day-level price change (shown with quadrantDay): NSE's change vs the
+  // previous close, unless the session-open move is larger (override below).
+  let priceChangeBase = "PREV_CLOSE";
 
   // If opening price baseline is available and intraday session moved while NSE change relative to prev close is flat
   if (openPriceBaseline !== null && Number.isFinite(Number(openPriceBaseline)) && Number(openPriceBaseline) > 0) {
@@ -51,6 +56,7 @@ export function parseNseFuturesPayload(
     if (Math.abs(sessionPts) > Math.abs(priceChange) || Math.abs(priceChange) < 5) {
       priceChange = sessionPts;
       priceChangePct = sessionPct;
+      priceChangeBase = "SESSION_OPEN";
     }
   }
 
@@ -96,6 +102,7 @@ export function parseNseFuturesPayload(
     spotPrice,
     priceChange: Number(priceChange.toFixed(2)),
     priceChangePct: Number(priceChangePct.toFixed(2)),
+    priceChangeBase,
     nearOI,
     nearChgOI,
     nextOI,
@@ -188,8 +195,64 @@ export function classifyFuturesQuadrant(futuresMetrics) {
  * 3. Bull Trap: Price Up on Short-Covering + Call Blitz at Roof -> Veto Longs / Short with Tight SL
  * 4. Bear Trap: Price Down on Long Unwinding + Put Blitz at Floor -> Veto Shorts / Buy Dips at Support
  */
-export function evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics) {
-  const quadrantInfo = classifyFuturesQuadrant(futuresMetrics);
+/**
+ * Picks the quadrant that drives fusion (and, via futures.quadrant, the webhook):
+ * the rolling intraday window when FUSION_QUADRANT_MODE=intraday (default) and the window
+ * is available, else the day-level quadrant (vs previous close / session open).
+ */
+export function selectFusionQuadrant(futuresMetrics, intradayQuadrant = null, mode = getFusionQuadrantMode()) {
+  const day = classifyFuturesQuadrant(futuresMetrics);
+  const dayBase = futuresMetrics?.priceChangeBase === "SESSION_OPEN" ? "session open" : "previous close";
+  const quadrantDay = {
+    ...day,
+    window: "DAY",
+    base: futuresMetrics ? dayBase : null,
+    priceChange: futuresMetrics?.priceChange ?? null,
+    priceChangePct: futuresMetrics?.priceChangePct ?? null,
+    oiChangePct: futuresMetrics?.combinedOiChangePct ?? null,
+  };
+  const intradayOk = Boolean(intradayQuadrant?.available) && futuresMetrics && !futuresMetrics.isStale;
+  if (mode !== "day" && intradayOk) {
+    const sourceLabel = `${intradayQuadrant.windowMins}m intraday ${intradayQuadrant.window}`;
+    return {
+      quadrantInfo: { ...intradayQuadrant, source: "INTRADAY", sourceLabel },
+      quadrantSource: "INTRADAY",
+      quadrantSourceLabel: sourceLabel,
+      quadrantSourceReason: `FUSION_QUADRANT_MODE=${mode}; ${intradayQuadrant.windowMins}m window available`,
+      quadrantDay,
+      quadrantIntraday: intradayQuadrant,
+    };
+  }
+  const reason = mode === "day"
+    ? "FUSION_QUADRANT_MODE=day"
+    : `intraday window unavailable (${intradayQuadrant?.reason || (futuresMetrics?.isStale ? "futures snapshot stale" : "not computed")})`;
+  const sourceLabel = futuresMetrics ? `day vs ${dayBase}` : "day (futures unavailable)";
+  return {
+    quadrantInfo: { ...quadrantDay, source: "DAY", sourceLabel },
+    quadrantSource: "DAY",
+    quadrantSourceLabel: sourceLabel,
+    quadrantSourceReason: reason,
+    quadrantDay,
+    quadrantIntraday: intradayQuadrant || null,
+  };
+}
+
+export function evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics, opts = {}) {
+  const selection = selectFusionQuadrant(futuresMetrics, opts.intradayQuadrant ?? null, opts.mode ?? getFusionQuadrantMode());
+  const scenario = evaluateFusionScenario(futuresMetrics, optionsMetrics, selection.quadrantInfo);
+  const tag = ` [quadrant: ${selection.quadrantSourceLabel}]`;
+  return {
+    ...scenario,
+    headline: `${scenario.headline}${tag}`,
+    quadrantSource: selection.quadrantSource,
+    quadrantSourceLabel: selection.quadrantSourceLabel,
+    quadrantSourceReason: selection.quadrantSourceReason,
+    quadrantDay: selection.quadrantDay,
+    quadrantIntraday: selection.quadrantIntraday,
+  };
+}
+
+function evaluateFusionScenario(futuresMetrics, optionsMetrics, quadrantInfo) {
   const quadrant = quadrantInfo.quadrant;
 
   const deltaPcr = Number(optionsMetrics?.deltaPcr ?? 1.0);

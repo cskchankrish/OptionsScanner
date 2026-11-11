@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  calculateEODDecision,
+  calculateEODDecision as calculateEODDecisionRaw,
   calculateDeltaPcr,
   isTodayExpiryDate,
   getActiveMonthlyExpiry,
@@ -9,6 +9,19 @@ import {
   extractOptionChainMetrics,
   DEFAULT_EOD_SEED_HISTORY
 } from "../api/nifty-oi.js";
+
+// These scenarios were written when the closing flow was scored from netDiff alone. Real ticks
+// always carry both corridor legs, and the scorer now requires them to tell fresh writing from
+// unwinding. Fill missing legs so that every netDiff move is carried by WRITING on its own side
+// (put writing up for +netDiff, call writing up for -netDiff) — i.e. the flow these scenarios
+// describe. Ticks that already carry legs are left untouched.
+const LEG_BASE = 300000;
+const withLegs = (timeline) => (Array.isArray(timeline) ? timeline : []).map(pt =>
+  pt && pt.putWriting === undefined && pt.callWriting === undefined && Number.isFinite(pt.netDiff)
+    ? { ...pt, putWriting: LEG_BASE + Math.max(0, pt.netDiff), callWriting: LEG_BASE + Math.max(0, -pt.netDiff) }
+    : pt
+);
+const calculateEODDecision = (args) => calculateEODDecisionRaw({ ...args, timeline: withLegs(args.timeline) });
 
 test("calculateDeltaPcr handles normal, negative, and zero call writing safely", () => {
   // Normal writing

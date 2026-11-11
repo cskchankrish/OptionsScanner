@@ -9,6 +9,17 @@ import {
   evaluateSmartMoneyFusion,
 } from "../src/smartMoneyFusion.js";
 import { authorizeRequest } from "../src/webhookAuth.js";
+import {
+  SPOT_FREEZE_START_MINS,
+  SPOT_FREEZE_END_MINS,
+  FNO_CLOSE_MINS,
+  CLOSING_AUCTION_NOTE,
+  isSpotFrozenAt,
+  spotWindowTouchesAuction,
+  decomposeWritingDelta,
+  classifyIntradayFuturesQuadrant,
+  getFusionQuadrantMode,
+} from "../src/flowCalc.js";
 
 let cache = {
   data: null,
@@ -1063,6 +1074,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
     futChgOI: Number(futuresMetrics.combinedChgOI) || undefined,
     futBasis: Number(futuresMetrics.adjustedBasisSpread != null ? futuresMetrics.adjustedBasisSpread : futuresMetrics.rawBasis) || undefined,
     futQuadrant: futuresMetrics.quadrant || undefined,
+    futQuadrantSource: futuresMetrics.quadrantSource || undefined,
   } : {};
 
   // 1. Outside Live Market Hours (Weekends, Evenings, Nights, Pre-market)
@@ -1141,6 +1153,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
       netDiff: totPut - totCall,
       spot: spot,
       isLiveTick: true,
+      ...(isSpotFrozenAt(capMins) && !isSunday ? { spotFrozen: true } : {}),
       ...fut,
     });
     didUpdate = true;
@@ -1151,6 +1164,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
     last.spot = spot;
     last.time = tickTime;
     last.isLiveTick = true;
+    if (isSpotFrozenAt(capMins) && !isSunday) last.spotFrozen = true;
     if (fut.futPrice !== undefined) Object.assign(last, fut);
     didUpdate = true;
   }
@@ -1186,8 +1200,35 @@ function toClockTimeStr(m) {
   return `${String(h).padStart(2, "0")}:${String(mn).padStart(2, "0")}`;
 }
 
-function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPainStrike }) {
-  if (!timeline || timeline.length < 12) {
+// Minimum live ticks inside EACH 15-minute candle before the macro engine may declare a turn.
+// The poller targets one tick a minute; 3 ticks = at least one print per ~5 minutes, enough to
+// show the move is not a single print while tolerating normal feed gaps. On 11-Nov the
+// 15:30–15:45 candle had a single tick (15:36) and must not produce a verdict.
+export const MACRO_MIN_TICKS_PER_CANDLE = 3;
+// Start/end anchor ticks must sit within this many minutes of the candle boundary.
+const MACRO_ANCHOR_TOLERANCE_MINS = 5;
+
+function fmtPts(n) {
+  return `${n >= 0 ? "+" : ""}${Number(n).toFixed(1)}`;
+}
+
+/**
+ * 30-minute macro turn engine (2 × 15-minute clock candles).
+ * - Candles never end after the current tick or after the 15:40 F&O close.
+ * - Each candle needs ≥ MACRO_MIN_TICKS_PER_CANDLE live ticks.
+ * - If the 30-minute window touches the 15:15–15:30 closing-auction freeze (or straddles the
+ *   15:30 auction print), price is measured with FUTURES (futPrice) instead of spot; if
+ *   futures ticks are missing, no turn is declared.
+ * - A trap is declared only when the opposing writing flow is WRITING-driven (call writing up
+ *   for a bull trap, put writing up for a bear trap). Unwinding-driven or mixed flow is
+ *   described honestly and does not trigger.
+ */
+export function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike }) {
+  const ticks = (Array.isArray(timeline) ? timeline : [])
+    .filter(pt => pt && Number.isFinite(Number(pt.minutes)))
+    .slice()
+    .sort((a, b) => a.minutes - b.minutes);
+  if (ticks.length < 12) {
     return {
       isTriggered: false,
       status: "BUILDING",
@@ -1195,128 +1236,160 @@ function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike, maxPain
     };
   }
 
-  const tNow = timeline[timeline.length - 1];
-  const nowMins = tNow.minutes || 0;
+  const tNow = ticks[ticks.length - 1];
+  const nowMins = Math.min(tNow.minutes || 0, FNO_CLOSE_MINS);
 
-  // Standard NSE 15-minute clock slots (:00, :15, :30, :45)
-  // Market starts at 09:15 IST (555 mins)
   const currentSlotStart = Math.floor(nowMins / 15) * 15;
-  const currentSlotEnd = currentSlotStart + 15;
   const minsIntoSlot = nowMins - currentSlotStart;
 
   let c1Start, c1End, c2Start, c2End;
-
-  // If current slot has just started (< 3 mins), use the two previously completed 15m candles
   if (minsIntoSlot < 3) {
+    // Use the two previously completed candles.
     c2Start = currentSlotStart - 15;
     c2End = currentSlotStart;
     c1Start = c2Start - 15;
     c1End = c2Start;
   } else {
-    // C1 is the prior completed 15m candle (e.g. 13:00 - 13:15)
-    // C2 is the currently forming 15m candle (e.g. 13:15 - 13:30)
+    // C1 = prior completed candle; C2 = the forming candle, which ends at the current tick.
     c1Start = currentSlotStart - 15;
     c1End = currentSlotStart;
     c2Start = currentSlotStart;
-    c2End = currentSlotEnd;
+    c2End = currentSlotStart + 15;
   }
-
-  // Find timeline points matching exact clock boundaries
-  let p0 = timeline[0];
-  let minDiff0 = Infinity;
-  let p1 = timeline[0];
-  let minDiff1 = Infinity;
-  let p2 = timeline[timeline.length - 1];
-
-  for (const pt of timeline) {
-    const m = pt.minutes || 0;
-    const d0 = Math.abs(m - c1Start);
-    const d1 = Math.abs(m - c1End);
-    if (d0 < minDiff0) {
-      minDiff0 = d0;
-      p0 = pt;
-    }
-    if (d1 < minDiff1) {
-      minDiff1 = d1;
-      p1 = pt;
-    }
-    if (m <= c2End) {
-      p2 = pt;
-    }
-  }
-
-  const spanMins = (p2.minutes || nowMins) - (p0.minutes || 0);
-  if (spanMins < 18) {
-    return {
-      isTriggered: false,
-      status: "ACCUMULATING",
-      message: `● 30-Min Macro Engine: ${spanMins}m recorded. Waiting for complete 2x 15m window.`,
-    };
-  }
-
-  // Candle 1 (Clock aligned: e.g. 13:00 - 13:15)
-  const c1SpotDelta = p1.spot - p0.spot;
-  const c1NetDelta = p1.netDiff - p0.netDiff;
-
-  // Candle 2 (Clock aligned: e.g. 13:15 - 13:30)
-  const c2SpotDelta = p2.spot - p1.spot;
-  const c2NetDelta = p2.netDiff - p1.netDiff;
-
-  // 30-Minute Cumulative Total
-  const totalSpotDelta = p2.spot - p0.spot;
-  const totalNetDelta = p2.netDiff - p0.netDiff;
+  // Never build a candle that ends after the current tick or after the 15:40 close.
+  c2End = Math.min(c2End, nowMins, FNO_CLOSE_MINS);
 
   const c1Label = `C1 (${toClockTimeStr(c1Start)}-${toClockTimeStr(c1End)})`;
   const c2Label = `C2 (${toClockTimeStr(c2Start)}-${toClockTimeStr(c2End)})`;
+  const windowStr = `${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}`;
 
-  // Criteria for Concrete Macro Bull Trap (50–100 pt reversal down):
-  if (totalSpotDelta >= 22 && totalNetDelta <= -26000 && (c1NetDelta < -7000 || c2NetDelta < -14000)) {
-    const targetDrop = Math.max(50, Math.min(100, Math.round(spot - floorStrike)));
-    const targetPrice = Math.round(spot - targetDrop);
-    const invPrice = Math.round(Math.max(p2.spot, p1.spot, p0.spot) + 15);
+  const touchesAuction = spotWindowTouchesAuction(c1Start, c2End);
+  const priceKey = touchesAuction ? "futPrice" : "spot";
+  const priceName = touchesAuction ? "Futures" : "Spot";
+  const auctionNote = touchesAuction ? ` (${CLOSING_AUCTION_NOTE}; price measured on NIFTY futures)` : "";
+
+  const hasPrice = pt => Number(pt?.[priceKey]) > 0;
+  const anchorAtOrBefore = (m) => {
+    let best = null;
+    for (const pt of ticks) {
+      if (pt.minutes <= m && hasPrice(pt)) best = pt;
+    }
+    return best && m - best.minutes <= MACRO_ANCHOR_TOLERANCE_MINS ? best : null;
+  };
+  const liveTicksIn = (s, e) => ticks.filter(pt => pt.minutes > s && pt.minutes <= e && pt.isLiveTick !== false && hasPrice(pt)).length;
+
+  const p0 = anchorAtOrBefore(c1Start);
+  const p1 = anchorAtOrBefore(c1End);
+  const p2 = anchorAtOrBefore(c2End);
+  const c1Ticks = liveTicksIn(c1Start, c1End);
+  const c2Ticks = liveTicksIn(c2Start, c2End);
+
+  const insufficient = [];
+  if (!p0 || !p1 || !p2) insufficient.push(`missing ${priceName.toLowerCase()} anchor tick within ${MACRO_ANCHOR_TOLERANCE_MINS}m of a candle boundary`);
+  if (c1Ticks < MACRO_MIN_TICKS_PER_CANDLE) insufficient.push(`${c1Label} has ${c1Ticks} live tick(s)`);
+  if (c2Ticks < MACRO_MIN_TICKS_PER_CANDLE) insufficient.push(`${c2Label} has ${c2Ticks} live tick(s)`);
+  if (insufficient.length > 0) {
     return {
-      isTriggered: true,
-      type: "BULL_TRAP_REVERSAL",
-      direction: "BEARISH_TURN",
-      title: `🚨 30-MIN MACRO BULL TRAP CONFIRMED (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)})`,
-      action: "High-Probability 50–100 pt Reversal Down. Smart money heavily shorted the 30m rally with Call writing.",
-      targetMove: `50–80 pts (Target: ~${targetPrice})`,
-      invalidation: `Above ${invPrice} (30m high + 15 pts)`,
-      candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
-      candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
-      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot +${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
-      message: `🚨 30-MIN MACRO BULL TRAP (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot pushed +${totalSpotDelta.toFixed(1)} pts, but Net Writing Delta plunged ${formatLots(totalNetDelta)}. High-probability 50–80 pt drop toward ~${targetPrice}. Invalidation: Above ${invPrice}.`,
+      isTriggered: false,
+      status: "INSUFFICIENT_TICKS",
+      priceSource: touchesAuction ? "FUTURES" : "SPOT",
+      message: `● 30-Min Macro Engine (${windowStr}): no turn declared — ${insufficient.join("; ")} (need ≥${MACRO_MIN_TICKS_PER_CANDLE} per candle)${auctionNote}.`,
     };
   }
 
-  // Criteria for Concrete Macro Bear Trap (50–100 pt bounce up):
-  if (totalSpotDelta <= -22 && totalNetDelta >= 28000 && (c1NetDelta > 7000 || c2NetDelta > 14000)) {
+  const c1PriceDelta = p1[priceKey] - p0[priceKey];
+  const c2PriceDelta = p2[priceKey] - p1[priceKey];
+  const totalPriceDelta = p2[priceKey] - p0[priceKey];
+
+  const c1Flow = decomposeWritingDelta(p0, p1);
+  const c2Flow = decomposeWritingDelta(p1, p2);
+  const totalFlow = decomposeWritingDelta(p0, p2);
+  const c1NetDelta = c1Flow.netDelta;
+  const c2NetDelta = c2Flow.netDelta;
+  const totalNetDelta = totalFlow.netDelta;
+
+  const candleText = (label, d, f) =>
+    `${label}: ${priceName} ${fmtPts(d)} pts | Net ${formatLots(f.netDelta)} (P ${formatLots(f.putLegDelta)} / C ${formatLots(f.callLegDelta)})`;
+  const candle1 = candleText(c1Label, c1PriceDelta, c1Flow);
+  const candle2 = candleText(c2Label, c2PriceDelta, c2Flow);
+  const legsSummary = `put writing ${formatLots(totalFlow.putLegDelta)}, call writing ${formatLots(totalFlow.callLegDelta)}`;
+  const base = {
+    priceSource: touchesAuction ? "FUTURES" : "SPOT",
+    window: windowStr,
+    candle1,
+    candle2,
+    flow: {
+      netDelta: Math.round(totalNetDelta),
+      putLegDelta: totalFlow.putLegDelta,
+      callLegDelta: totalFlow.callLegDelta,
+      driver: totalFlow.driver,
+      dominantLeg: totalFlow.dominantLeg,
+      dominantShare: totalFlow.dominantShare,
+    },
+    totalPriceDelta: Number(totalPriceDelta.toFixed(1)),
+    totalNetDelta: Math.round(totalNetDelta),
+    // kept for older readers of this object
+    totalSpotDelta: touchesAuction ? null : Number(totalPriceDelta.toFixed(1)),
+  };
+
+  const bullCriteria = totalPriceDelta >= 22 && totalNetDelta <= -26000 && (c1NetDelta < -7000 || c2NetDelta < -14000);
+  const bearCriteria = totalPriceDelta <= -22 && totalNetDelta >= 28000 && (c1NetDelta > 7000 || c2NetDelta > 14000);
+
+  // Bull trap requires CALL WRITING to drive the bearish flow.
+  if (bullCriteria && totalFlow.driver === "WRITING" && totalFlow.dominantLeg === "CALL") {
+    const targetDrop = Math.max(50, Math.min(100, Math.round(spot - floorStrike)));
+    const targetPrice = Math.round(spot - targetDrop);
+    const invPrice = Math.round(Math.max(p2[priceKey], p1[priceKey], p0[priceKey]) + 15);
+    return {
+      ...base,
+      isTriggered: true,
+      type: "BULL_TRAP_REVERSAL",
+      direction: "BEARISH_TURN",
+      title: `🚨 30-MIN MACRO BULL TRAP CONFIRMED (${windowStr})`,
+      action: `High-Probability 50–100 pt Reversal Down. Call writers sold into the 30m rally (${legsSummary}).`,
+      targetMove: `50–80 pts (Target: ~${targetPrice})`,
+      invalidation: `Above ${invPrice} (30m ${priceName.toLowerCase()} high + 15 pts)`,
+      summary: `30m Total (${windowStr}): ${priceName} ${fmtPts(totalPriceDelta)} pts, Net Writing Delta ${formatLots(totalNetDelta)} (${legsSummary})`,
+      message: `🚨 30-MIN MACRO BULL TRAP (${windowStr}): ${priceName} pushed ${fmtPts(totalPriceDelta)} pts while call writing rose (${legsSummary}; net ${formatLots(totalNetDelta)}). High-probability 50–80 pt drop toward ~${targetPrice}. Invalidation: Above ${invPrice}.${auctionNote}`,
+    };
+  }
+
+  // Bear trap requires PUT WRITING to drive the bullish flow.
+  if (bearCriteria && totalFlow.driver === "WRITING" && totalFlow.dominantLeg === "PUT") {
     const targetBounce = Math.max(50, Math.min(100, Math.round(roofStrike - spot)));
     const targetPrice = Math.round(spot + targetBounce);
-    const invPrice = Math.round(Math.min(p2.spot, p1.spot, p0.spot) - 15);
+    const invPrice = Math.round(Math.min(p2[priceKey], p1[priceKey], p0[priceKey]) - 15);
     return {
+      ...base,
       isTriggered: true,
       type: "BEAR_TRAP_REVERSAL",
       direction: "BULLISH_TURN",
-      title: `🟢 30-MIN MACRO BEAR TRAP / ABSORPTION CONFIRMED (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)})`,
-      action: "High-Probability 50–100 pt Reversal Up. Smart money heavily absorbed the 30m dip with Put writing.",
+      title: `🟢 30-MIN MACRO BEAR TRAP / ABSORPTION CONFIRMED (${windowStr})`,
+      action: `High-Probability 50–100 pt Reversal Up. Put writers absorbed the 30m dip (${legsSummary}).`,
       targetMove: `50–80 pts (Target: ~${targetPrice})`,
-      invalidation: `Below ${invPrice} (30m low - 15 pts)`,
-      candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} pts | Delta ${formatLots(c1NetDelta)}`,
-      candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} pts | Delta ${formatLots(c2NetDelta)}`,
-      summary: `30m Total (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts, Net Writing Delta ${formatLots(totalNetDelta)}`,
-      message: `🟢 30-MIN MACRO BEAR TRAP (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot dipped ${totalSpotDelta.toFixed(1)} pts, but Put writers absorbed ${formatLots(totalNetDelta)}. High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.`,
+      invalidation: `Below ${invPrice} (30m ${priceName.toLowerCase()} low - 15 pts)`,
+      summary: `30m Total (${windowStr}): ${priceName} ${fmtPts(totalPriceDelta)} pts, Net Writing Delta ${formatLots(totalNetDelta)} (${legsSummary})`,
+      message: `🟢 30-MIN MACRO BEAR TRAP (${windowStr}): ${priceName} dipped ${fmtPts(totalPriceDelta)} pts while put writing rose (${legsSummary}; net ${formatLots(totalNetDelta)}). High-probability 50–80 pt bounce toward ~${targetPrice}. Invalidation: Below ${invPrice}.${auctionNote}`,
+    };
+  }
+
+  if (bullCriteria || bearCriteria) {
+    // The net numbers diverge from price, but the flow is not fresh writing on the opposing side.
+    const dirWord = bullCriteria ? "rose" : "fell";
+    return {
+      ...base,
+      isTriggered: false,
+      type: totalFlow.driver === "UNWINDING" ? "UNWINDING_DIVERGENCE" : "MIXED_DIVERGENCE",
+      direction: bullCriteria ? "BEARISH_LEAN" : "BULLISH_LEAN",
+      message: `● 30-Min Divergence, not a trap (${windowStr}): ${priceName} ${dirWord} ${fmtPts(totalPriceDelta)} pts with net writing ${formatLots(totalNetDelta)}, but the flow is ${totalFlow.driver === "UNWINDING" ? "UNWINDING-driven" : totalFlow.driver.toLowerCase()} — ${totalFlow.wording}.${auctionNote}`,
     };
   }
 
   return {
+    ...base,
     isTriggered: false,
     type: "IN_SYNC",
-    message: `● 30-Min Flow In-Sync (${toClockTimeStr(c1Start)}-${toClockTimeStr(c2End)}): Spot ${totalSpotDelta >= 0 ? "+" : ""}${totalSpotDelta.toFixed(1)} pts | Net Delta ${formatLots(totalNetDelta)}. Price & writing delta aligned.`,
-    candle1: `${c1Label}: Spot ${c1SpotDelta >= 0 ? "+" : ""}${c1SpotDelta.toFixed(1)} | Delta ${formatLots(c1NetDelta)}`,
-    candle2: `${c2Label}: Spot ${c2SpotDelta >= 0 ? "+" : ""}${c2SpotDelta.toFixed(1)} | Delta ${formatLots(c2NetDelta)}`,
-    totalSpotDelta: Number(totalSpotDelta.toFixed(1)),
-    totalNetDelta: Math.round(totalNetDelta),
+    message: `● 30-Min Flow (${windowStr}): ${priceName} ${fmtPts(totalPriceDelta)} pts | Net Delta ${formatLots(totalNetDelta)} — ${totalFlow.driver === "FLAT" ? "flat" : `${totalFlow.driver.toLowerCase()}-driven`}: ${totalFlow.wording}. No trap / divergence trigger.${auctionNote}`,
   };
 }
 
@@ -1470,6 +1543,31 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
   };
 }
 
+// ── EOD carry decision: three independent evidence groups ──
+// A · Options positioning level (full-day writing ratio, PCR/ΔPCR, spot vs walls). The full-day
+//     writing ratio IS ΔPCR (calculateDeltaPcr = put writing / call writing) and the walls come
+//     from the same per-strike ΔOI, so these are one source and the group is capped at ±2.
+// B · Closing options flow (14:15+ change in netDiff, decomposed into put/call legs): ±3.
+// C · Futures (quadrant used by fusion + basis): ±2.
+// The fusion scenario adds NO points (its quadrant is scored in C and its options leg in A);
+// its trap vetoes stay as guardrails that can only block the opposite carry. The 30-min macro
+// turn adds no points either: after 14:15 its window lies inside group B's window, so the same
+// closing delta would be counted twice.
+// Old scale: fusion ±1 + full-day ±2 + closing ±3 + PCR ±1 + levels ±1 = ±8, carry at ±3 (±4 Fri).
+// New scale: A ±2 + B ±3 + C ±2 = ±7. The carry thresholds stay ±3 (±4 Friday): every old
+// path to ±3 that did not rely on double counting still reaches it (e.g. B blitz alone = 3,
+// or A 2 + B 1), so the intent "≥3 net points of evidence" is unchanged.
+export const EOD_GROUP_CAPS = { A: 2, B: 3, C: 2 };
+// Agreement score caps by number of independent groups agreeing with a carry verdict.
+// One group can be wrong for one reason (60); each further independent confirmation adds 15;
+// never above 90 because these are hand-set rules, not a calibrated hit rate.
+export const EOD_AGREEMENT_CAPS = { 0: 30, 1: 60, 2: 75, 3: 90 };
+export const EOD_AGREEMENT_LABEL = "Agreement score (rule-based, not a probability)";
+const OPPOSING_GROUP_PENALTY = 10;
+
+const clampAbs = (v, cap) => Math.max(-cap, Math.min(cap, v));
+const signedPts = (v) => `${v > 0 ? "+" : ""}${v} pt${Math.abs(v) === 1 ? "" : "s"}`;
+
 export function calculateEODDecision({
   spot = 22696.65,
   floorStrike = 22600,
@@ -1484,23 +1582,22 @@ export function calculateEODDecision({
   fusion = null,
   targetContract = null,
   isRollover = false,
+  futuresQuadrant = null,
+  futuresMetrics = null,
+  macroTurn = null,
 }) {
-  let score = 0;
   const audit = [];
+  const detailAudit = [];
 
   // Expiry Day Rollover Protocol Audit
   if (isRollover && targetContract) {
     audit.push({
       label: "Expiry Day Rollover Protocol",
+      group: "INFO",
       status: "NEXT_WEEK_EVALUATED",
       detail: `Expiry Day active. Evaluated Next Week contract (${targetContract}) for overnight carry instead of expiring 0DTE contracts.`,
       impact: "Active",
     });
-  }
-
-  // Apply Smart Money Futures Fusion Score Boost (+1 on Bullish Synergy, -1 on Bearish Synergy, -1 on Bull Trap, +1 on Bear Trap)
-  if (fusion?.scoreBoost && Number.isFinite(fusion.scoreBoost)) {
-    score += fusion.scoreBoost;
   }
 
   const isSunday = (dayOfWeek === 0);
@@ -1514,28 +1611,126 @@ export function calculateEODDecision({
   const flowAnchorStr = isSunday ? "14:20" : "14:15";
   const flowLabel = isSunday ? "Diwali Muhurat Closing Flow (14:20+)" : "Closing Hour Flow (14:15+)";
   const isSettledReview = isSaturday || (isSunday && (nowMins < 840 || nowMins > 960)) || (nowMins > closeMins);
+  // The weekday spot index is frozen 15:15–15:30 for the NSE closing auction.
+  const spotFrozenNow = !isSunday && isSpotFrozenAt(nowMins);
 
-  // 1. Full Day Writing Ratio
+  // ═════════════ GROUP A · Options positioning level ═════════════
+  let rawA = 0;
+
+  // A1. Full Day Writing Ratio
+  let fullDayPts = 0;
   let fullDayStatus = "NEUTRAL";
   let fullDayDetail = "Balanced / non-directional writing";
   if (totPutWriting > 1.35 * totCallWriting) {
-    score += 2;
+    fullDayPts = 2;
     fullDayStatus = "BULLISH";
     fullDayDetail = `Put writing dominates full day (${formatLots(totPutWriting)} P vs ${formatLots(totCallWriting)} C)`;
   } else if (totCallWriting > 1.35 * totPutWriting) {
-    score -= 2;
+    fullDayPts = -2;
     fullDayStatus = "BEARISH";
     fullDayDetail = `Call writing dominates full day (${formatLots(totCallWriting)} C vs ${formatLots(totPutWriting)} P)`;
   }
-  audit.push({
+  rawA += fullDayPts;
+  detailAudit.push({
     label: "Full Day Writing",
+    group: "A",
     status: fullDayStatus,
     detail: fullDayDetail,
-    impact: fullDayStatus === "BULLISH" ? "+2 pts" : fullDayStatus === "BEARISH" ? "-2 pts" : "0 pts",
+    impact: fullDayPts > 0 ? "+2 pts" : fullDayPts < 0 ? "-2 pts" : "0 pts",
   });
 
-  // 2. Final Hour Flow (14:15+ weekdays / 14:20+ Sunday) - Tiered Institutional Weighting (Up to ±3 pts)
-  // Data Integrity Validation: verify presence and continuity of closing window ticks
+  // A2. PCR & Delta PCR with 2-Tier 5-Year Historical Boundary Guardrails
+  let pcrPts = 0;
+  let pcrStatus = "NEUTRAL";
+  let pcrDetail = `PCR ${Number(pcr).toFixed(2)} · ΔPCR ${Number(deltaPcr).toFixed(2)}`;
+  let pcrWarning = null;
+
+  const numPcr = Number(pcr);
+  const numDelta = Number(deltaPcr);
+
+  if (numPcr >= 1.65) {
+    pcrPts = -1; // Active contrarian penalty
+    pcrStatus = "HISTORICAL_PEAK_OVERBOUGHT";
+    pcrWarning = `🚨 HISTORICAL PEAK OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.65 — 5-Yr Extreme Exhaustion)`;
+    pcrDetail = `5-Year Historical Extreme (98th %ile). Severe put-writing crowding (>165 Puts / 100 Calls). Statistically precedes violent downward mean-reversion within 24-48h. Penalty (-1 pt) applied.`;
+  } else if (numPcr >= 1.40) {
+    pcrStatus = "EXTREME_OVERBOUGHT";
+    pcrWarning = `⚠️ OVERBOUGHT EXTENSION / EXTREME OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.40)`;
+    pcrDetail = `Overbought territory (${numPcr.toFixed(2)}). Put underwriting saturated. Bullish points frozen (0 pts) to prevent chasing extended tops.`;
+  } else if (numPcr <= 0.52) {
+    pcrPts = 1; // Active contrarian bounce bonus
+    pcrStatus = "HISTORICAL_CAPITULATION_FLOOR";
+    pcrWarning = `🚀 HISTORICAL CAPITULATION FLOOR (PCR ${numPcr.toFixed(2)} ≤ 0.52 — 5-Yr Contrarian Bounce Zone)`;
+    pcrDetail = `5-Year Historical Panic Floor (<2nd %ile). Severe call-writing crowding (>190 Calls / 100 Puts). Statistically precedes violent short-covering squeezes (+150-300 pts). Contrarian bonus (+1 pt) applied.`;
+  } else if (numPcr <= 0.65) {
+    pcrStatus = "EXTREME_OVERSOLD";
+    pcrWarning = `⚠️ OVERSOLD EXTENSION / DEEPLY OVERSOLD (PCR ${numPcr.toFixed(2)} ≤ 0.65)`;
+    pcrDetail = `Deeply oversold (${numPcr.toFixed(2)}). Call underwriting saturated. Bearish points frozen (0 pts) to prevent shorting into support.`;
+  } else if ((numDelta >= 1.25 && numPcr >= 0.98) || (numPcr >= 1.15 && numDelta >= 1.10) || (totCallWriting <= 0 && totPutWriting > 20000)) {
+    pcrPts = 1;
+    pcrStatus = "BULLISH";
+    pcrDetail = `Bullish PCR expansion (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy put writing without overbought crowding`;
+  } else if ((numDelta <= 0.80 && numPcr <= 1.02) || (numPcr <= 0.88 && numDelta <= 0.90) || (totPutWriting <= 0 && totCallWriting > 20000)) {
+    pcrPts = -1;
+    pcrStatus = "BEARISH";
+    pcrDetail = `Bearish PCR compression (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy call writing without oversold exhaustion`;
+  } else {
+    pcrStatus = "NEUTRAL";
+    pcrDetail = `Balanced PCR structure (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Non-directional options OI`;
+  }
+  rawA += pcrPts;
+
+  detailAudit.push({
+    label: "PCR Structure",
+    group: "A",
+    status: pcrStatus,
+    detail: pcrDetail,
+    warning: pcrWarning,
+    impact: pcrStatus === "HISTORICAL_PEAK_OVERBOUGHT"
+      ? "🚨 Penalty (-1 pt Reversal Risk)"
+      : pcrStatus === "HISTORICAL_CAPITULATION_FLOOR"
+      ? "🚀 Bonus (+1 pt Squeeze Potential)"
+      : pcrWarning
+      ? "⚠️ Warning (0 pts)"
+      : pcrStatus === "BULLISH"
+      ? "+1 pt"
+      : pcrStatus === "BEARISH"
+      ? "-1 pt"
+      : "0 pts",
+  });
+
+  // A3. Spot Price vs Floor / Roof (a level, not a price path)
+  let levelPts = 0;
+  let levelStatus = "NEUTRAL";
+  let levelDetail = `Spot ${Number(spot).toFixed(0)} between ${floorStrike} and ${roofStrike}`;
+  if (spot >= floorStrike + 30 && spot <= roofStrike - 15) {
+    levelPts = 1;
+    levelStatus = "BULLISH";
+    levelDetail = `Spot holding firmly above Floor support (${floorStrike})`;
+  } else if (spot <= floorStrike + 15) {
+    levelPts = -1;
+    levelStatus = "BEARISH";
+    levelDetail = `Spot breaking down near Floor support (${floorStrike})`;
+  } else if (spot >= roofStrike - 10) {
+    levelPts = -1;
+    levelStatus = "BEARISH";
+    levelDetail = `Spot pinned at Roof resistance (${roofStrike})`;
+  }
+  if (spotFrozenNow) levelDetail += ` [${CLOSING_AUCTION_NOTE}: last pre-auction spot]`;
+  rawA += levelPts;
+  detailAudit.push({
+    label: "Spot vs Levels",
+    group: "A",
+    status: levelStatus,
+    detail: levelDetail,
+    impact: levelPts > 0 ? "+1 pt" : levelPts < 0 ? "-1 pt" : "0 pts",
+  });
+  const groupA = clampAbs(rawA, EOD_GROUP_CAPS.A);
+
+  // ═════════════ GROUP B · Closing options flow ═════════════
+  // Tiers on |Δ netDiff| since 14:15: ≥75k → 3, ≥30k → 2, ≥10k → 1. Full weight only when the
+  // move is WRITING-driven (opposing-side writing up). UNWINDING-driven, MIXED or leg-less
+  // flow is one tier lower and never labelled a blitz.
   const validTimeline = (Array.isArray(timeline) ? timeline : []).filter(
     pt => pt && Number.isFinite(pt.minutes) && pt.minutes >= openMins && pt.minutes <= closeMins && Number.isFinite(pt.netDiff)
   );
@@ -1544,6 +1739,8 @@ export function calculateEODDecision({
   let p1415 = null;
   let pClose = null;
   let lastHourNetDelta = 0;
+  let closingFlow = null;
+  let groupB = 0;
   let closingFlowStatus = "NEUTRAL";
   let closingFlowDetail = isSunday ? "Neutral Diwali Muhurat flow" : "Neutral closing hour flow";
   let closingImpact = "0 pts";
@@ -1578,43 +1775,41 @@ export function calculateEODDecision({
         closingImpact = "0 pts (Data Pending)";
       } else {
         isClosingDataValid = true;
-        lastHourNetDelta = (pClose.netDiff || 0) - (p1415.netDiff || 0);
+        closingFlow = decomposeWritingDelta(p1415, pClose);
+        lastHourNetDelta = closingFlow.netDelta;
         const windowStr = `(${p1415.time || flowAnchorStr} to ${pClose.time || closeTimeStr})`;
+        const absNet = Math.abs(lastHourNetDelta);
+        const fullTier = absNet >= 75000 ? 3 : absNet >= 30000 ? 2 : absNet >= 10000 ? 1 : 0;
+        const isWriting = closingFlow.driver === "WRITING";
+        const tier = isWriting ? fullTier : Math.max(0, fullTier - 1);
+        const sign = lastHourNetDelta > 0 ? 1 : -1;
+        groupB = fullTier === 0 ? 0 : sign * tier;
+        const legs = `P ${formatLots(closingFlow.putLegDelta)} / C ${formatLots(closingFlow.callLegDelta)}`;
+        const netTxt = `net ${formatLots(lastHourNetDelta)}`;
 
-        if (lastHourNetDelta >= 75000) {
-          score += 3;
-          closingFlowStatus = "INSTITUTIONAL_PUT_BLITZ";
-          closingFlowDetail = `Massive late Put accumulation (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}). Aggressive institutional floor defense.`;
-          closingImpact = "+3 pts (Institutional Blitz)";
-        } else if (lastHourNetDelta >= 30000) {
-          score += 2;
-          closingFlowStatus = "BULLISH";
-          closingFlowDetail = `Strong late Put writing (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
-          closingImpact = "+2 pts";
-        } else if (lastHourNetDelta >= 10000) {
-          score += 1;
-          closingFlowStatus = "MILD_BULLISH";
-          closingFlowDetail = `Moderate late Put addition (+${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
-          closingImpact = "+1 pt";
-        } else if (lastHourNetDelta <= -75000) {
-          score -= 3;
-          closingFlowStatus = "INSTITUTIONAL_CALL_BLITZ";
-          closingFlowDetail = `Massive late Call distribution (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}). Aggressive institutional ceiling hedge.`;
-          closingImpact = "-3 pts (Institutional Blitz)";
-        } else if (lastHourNetDelta <= -30000) {
-          score -= 2;
-          closingFlowStatus = "BEARISH";
-          closingFlowDetail = `Heavy late Call writing (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
-          closingImpact = "-2 pts";
-        } else if (lastHourNetDelta <= -10000) {
-          score -= 1;
-          closingFlowStatus = "MILD_BEARISH";
-          closingFlowDetail = `Moderate late Call addition (-${formatLotsAbs(lastHourNetDelta)} lots ${windowStr}).`;
-          closingImpact = "-1 pt";
+        if (fullTier === 0) {
+          closingFlowDetail = `Closing flow steady (${netTxt}, ${closingFlow.legsText} ${windowStr})`;
+        } else if (isWriting) {
+          if (sign > 0) {
+            closingFlowStatus = fullTier === 3 ? "INSTITUTIONAL_PUT_BLITZ" : fullTier === 2 ? "BULLISH" : "MILD_BULLISH";
+            closingFlowDetail = `${fullTier === 3 ? "Massive late Put writing" : fullTier === 2 ? "Strong late Put writing" : "Moderate late Put addition"} — WRITING-driven (${netTxt}: ${closingFlow.legsText} ${windowStr}).${fullTier === 3 ? " Aggressive institutional floor defense." : ""}`;
+          } else {
+            closingFlowStatus = fullTier === 3 ? "INSTITUTIONAL_CALL_BLITZ" : fullTier === 2 ? "BEARISH" : "MILD_BEARISH";
+            closingFlowDetail = `${fullTier === 3 ? "Massive late Call writing" : fullTier === 2 ? "Heavy late Call writing" : "Moderate late Call addition"} — WRITING-driven (${netTxt}: ${closingFlow.legsText} ${windowStr}).${fullTier === 3 ? " Aggressive institutional ceiling." : ""}`;
+          }
+        } else if (closingFlow.driver === "UNWINDING") {
+          closingFlowStatus = sign > 0 ? "BULLISH_CALL_UNWINDING" : "BEARISH_PUT_UNWINDING";
+          closingFlowDetail = sign > 0
+            ? `Call writers closing / resistance withdrawn — UNWINDING-driven, not fresh put writing (${netTxt}: ${closingFlow.legsText} ${windowStr}). Weighted one tier lower.`
+            : `Put writers closing / support withdrawn — UNWINDING-driven, not fresh call writing (${netTxt}: ${closingFlow.legsText} ${windowStr}). Weighted one tier lower.`;
+        } else if (closingFlow.driver === "MIXED") {
+          closingFlowStatus = sign > 0 ? "MIXED_BULLISH" : "MIXED_BEARISH";
+          closingFlowDetail = `Mixed closing flow (${netTxt}: ${closingFlow.legsText} ${windowStr}) — neither leg dominates. Weighted one tier lower.`;
         } else {
-          closingFlowDetail = `Closing flow steady (${formatLots(lastHourNetDelta)} lots ${windowStr})`;
-          closingImpact = "0 pts";
+          closingFlowStatus = sign > 0 ? "BULLISH_UNCONFIRMED" : "BEARISH_UNCONFIRMED";
+          closingFlowDetail = `Closing flow ${netTxt} ${windowStr}; put/call legs unavailable, driver unknown. Weighted one tier lower.`;
         }
+        closingImpact = groupB === 0 ? "0 pts" : `${signedPts(groupB)}${closingFlowStatus.includes("BLITZ") ? " (Institutional Blitz)" : ""}${!isWriting && fullTier > 0 ? ` (${legs}, one tier lower)` : ""}`;
       }
     }
   } else {
@@ -1623,97 +1818,163 @@ export function calculateEODDecision({
     closingImpact = "0 pts (Data Pending)";
   }
 
-  audit.push({
+  detailAudit.push({
     label: flowLabel,
+    group: "B",
     status: closingFlowStatus,
     detail: closingFlowDetail,
     impact: closingImpact,
+    flow: closingFlow ? {
+      netDelta: closingFlow.netDelta,
+      putLegDelta: closingFlow.putLegDelta,
+      callLegDelta: closingFlow.callLegDelta,
+      driver: closingFlow.driver,
+      dominantLeg: closingFlow.dominantLeg,
+      dominantShare: closingFlow.dominantShare,
+    } : null,
   });
 
-  // 3. PCR & Delta PCR with 2-Tier 5-Year Historical Boundary Guardrails
-  let pcrStatus = "NEUTRAL";
-  let pcrDetail = `PCR ${Number(pcr).toFixed(2)} · ΔPCR ${Number(deltaPcr).toFixed(2)}`;
-  let pcrWarning = null;
-
-  const numPcr = Number(pcr);
-  const numDelta = Number(deltaPcr);
-
-  // Check 5-Year Calibrated Historical Extremes
-  if (numPcr >= 1.65) {
-    // Tier 2: 5-Year Historical Peak Overbought (98th percentile blow-off ceiling)
-    score -= 1; // Active contrarian penalty
-    pcrStatus = "HISTORICAL_PEAK_OVERBOUGHT";
-    pcrWarning = `🚨 HISTORICAL PEAK OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.65 — 5-Yr Extreme Exhaustion)`;
-    pcrDetail = `5-Year Historical Extreme (98th %ile). Severe put-writing crowding (>165 Puts / 100 Calls). Statistically precedes violent downward mean-reversion within 24-48h. Penalty (-1 pt) applied.`;
-  } else if (numPcr >= 1.40) {
-    // Tier 1: Overbought Extension
-    pcrStatus = "EXTREME_OVERBOUGHT";
-    pcrWarning = `⚠️ OVERBOUGHT EXTENSION / EXTREME OVERBOUGHT (PCR ${numPcr.toFixed(2)} ≥ 1.40)`;
-    pcrDetail = `Overbought territory (${numPcr.toFixed(2)}). Put underwriting saturated. Bullish points frozen (0 pts) to prevent chasing extended tops.`;
-  } else if (numPcr <= 0.52) {
-    // Tier 2: 5-Year Historical Capitulation Floor (Sub-2nd percentile panic bottom)
-    score += 1; // Active contrarian bounce bonus
-    pcrStatus = "HISTORICAL_CAPITULATION_FLOOR";
-    pcrWarning = `🚀 HISTORICAL CAPITULATION FLOOR (PCR ${numPcr.toFixed(2)} ≤ 0.52 — 5-Yr Contrarian Bounce Zone)`;
-    pcrDetail = `5-Year Historical Panic Floor (<2nd %ile). Severe call-writing crowding (>190 Calls / 100 Puts). Statistically precedes violent short-covering squeezes (+150-300 pts). Contrarian bonus (+1 pt) applied.`;
-  } else if (numPcr <= 0.65) {
-    // Tier 1: Oversold Extension
-    pcrStatus = "EXTREME_OVERSOLD";
-    pcrWarning = `⚠️ OVERSOLD EXTENSION / DEEPLY OVERSOLD (PCR ${numPcr.toFixed(2)} ≤ 0.65)`;
-    pcrDetail = `Deeply oversold (${numPcr.toFixed(2)}). Call underwriting saturated. Bearish points frozen (0 pts) to prevent shorting into support.`;
-  } else if ((numDelta >= 1.25 && numPcr >= 0.98) || (numPcr >= 1.15 && numDelta >= 1.10) || (totCallWriting <= 0 && totPutWriting > 20000)) {
-    score += 1;
-    pcrStatus = "BULLISH";
-    pcrDetail = `Bullish PCR expansion (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy put writing without overbought crowding`;
-  } else if ((numDelta <= 0.80 && numPcr <= 1.02) || (numPcr <= 0.88 && numDelta <= 0.90) || (totPutWriting <= 0 && totCallWriting > 20000)) {
-    score -= 1;
-    pcrStatus = "BEARISH";
-    pcrDetail = `Bearish PCR compression (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Healthy call writing without oversold exhaustion`;
-  } else {
-    pcrStatus = "NEUTRAL";
-    pcrDetail = `Balanced PCR structure (PCR ${numPcr.toFixed(2)}, ΔPCR ${numDelta.toFixed(2)}) — Non-directional options OI`;
+  if (macroTurn && macroTurn.message) {
+    detailAudit.push({
+      label: "30-Min Macro Turn",
+      group: "INFO",
+      status: macroTurn.type || macroTurn.status || "INFO",
+      detail: `${macroTurn.message} Not scored: its window overlaps the ${flowAnchorStr}+ closing window already scored in Group B (same closing delta counted once).`,
+      impact: "0 pts (counted in Group B)",
+    });
   }
 
-  audit.push({
-    label: "PCR Structure",
-    status: pcrStatus,
-    detail: pcrDetail,
-    warning: pcrWarning,
-    impact: pcrStatus === "HISTORICAL_PEAK_OVERBOUGHT"
-      ? "🚨 Penalty (-1 pt Reversal Risk)"
-      : pcrStatus === "HISTORICAL_CAPITULATION_FLOOR"
-      ? "🚀 Bonus (+1 pt Squeeze Potential)"
-      : pcrWarning
-      ? "⚠️ Warning (0 pts)"
-      : pcrStatus === "BULLISH"
-      ? "+1 pt"
-      : pcrStatus === "BEARISH"
-      ? "-1 pt"
-      : "0 pts",
+  // ═════════════ GROUP C · Futures (quadrant + basis) ═════════════
+  const quadInfo = futuresQuadrant || fusion?.quadrantInfo || null;
+  const quadrant = quadInfo?.quadrant || "UNAVAILABLE";
+  const quadSource = quadInfo?.sourceLabel || fusion?.quadrantSourceLabel || null;
+  let quadPts = 0;
+  if (quadrant === "LONG_BUILDUP") quadPts = 1;
+  else if (quadrant === "SHORT_BUILDUP") quadPts = -1;
+  const quadDir = ["LONG_BUILDUP", "SHORT_COVERING"].includes(quadrant) ? 1
+    : ["SHORT_BUILDUP", "LONG_UNWINDING"].includes(quadrant) ? -1 : 0;
+
+  let basisPts = 0;
+  let basisDetail = "basis unavailable";
+  if (futuresMetrics && Number.isFinite(Number(futuresMetrics.rawBasis))) {
+    if (spotFrozenNow) {
+      basisDetail = `basis not scored (${CLOSING_AUCTION_NOTE}; futures − frozen spot is not a basis)`;
+    } else {
+      const adj = Number(futuresMetrics.adjustedBasisSpread ?? 0);
+      const intra = Number(futuresMetrics.intradayBasisDelta ?? 0);
+      const raw = Number(futuresMetrics.rawBasis ?? 0);
+      const basisBull = adj >= -5 || intra >= 5;
+      const basisBear = raw < 0 || adj <= -10 || intra <= -5;
+      const basisDir = basisBull && !basisBear ? 1 : basisBear && !basisBull ? -1 : 0;
+      basisPts = quadDir !== 0 && basisDir === quadDir ? basisDir : 0;
+      basisDetail = `basis raw ${raw}, adj ${adj}, Δ ${intra} → ${basisDir > 0 ? "bullish" : basisDir < 0 ? "bearish" : "mixed"}${basisPts !== 0 ? " (confirms quadrant)" : quadDir !== 0 && basisDir !== 0 ? " (contradicts quadrant, 0 pts)" : ""}`;
+    }
+  }
+  const groupC = clampAbs(quadPts + basisPts, EOD_GROUP_CAPS.C);
+  detailAudit.push({
+    label: "Futures Quadrant & Basis",
+    group: "C",
+    status: quadrant,
+    detail: `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""}: ${signedPts(quadPts)}; ${basisDetail}${basisPts ? `: ${signedPts(basisPts)}` : ""}.`,
+    impact: groupC === 0 ? "0 pts" : signedPts(groupC),
   });
 
-  // 4. Spot Price vs Floor / Roof
-  let levelStatus = "NEUTRAL";
-  let levelDetail = `Spot ${Number(spot).toFixed(0)} between ${floorStrike} and ${roofStrike}`;
-  if (spot >= floorStrike + 30 && spot <= roofStrike - 15) {
-    score += 1;
-    levelStatus = "BULLISH";
-    levelDetail = `Spot holding firmly above Floor support (${floorStrike})`;
-  } else if (spot <= floorStrike + 15) {
-    score -= 1;
-    levelStatus = "BEARISH";
-    levelDetail = `Spot breaking down near Floor support (${floorStrike})`;
-  } else if (spot >= roofStrike - 10) {
-    score -= 1;
-    levelStatus = "BEARISH";
-    levelDetail = `Spot pinned at Roof resistance (${roofStrike})`;
+  // ═════════════ Guardrails (no points) ═════════════
+  let score = groupA + groupB + groupC;
+
+  let lateVetoWarning = null;
+  // A late blitz veto needs WRITING-driven flow on the opposing side (fresh calls / fresh puts).
+  const isLateCallBlitz = isClosingDataValid && lastHourNetDelta <= -50000 &&
+    closingFlow?.driver === "WRITING" && closingFlow?.dominantLeg === "CALL";
+  const isLatePutBlitz = isClosingDataValid && lastHourNetDelta >= 50000 &&
+    closingFlow?.driver === "WRITING" && closingFlow?.dominantLeg === "PUT";
+
+  const slShort = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 35);
+  const targetShort = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 70);
+
+  const slLong = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 35);
+  const targetLong = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 70);
+
+  const vetoAnchorTime = p1415?.time || flowAnchorStr;
+  const guardAudit = [];
+
+  if (isLateCallBlitz) {
+    score = Math.min(1, score);
+    const callLots = formatLotsAbs(lastHourNetDelta);
+    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots net; ${closingFlow.legsText}) entered after ${vetoAnchorTime}. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
+    guardAudit.push({
+      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
+      group: "GUARD",
+      status: "BEARISH_VETO",
+      detail: lateVetoWarning,
+      impact: `VETO BTST · Short SL: ${slShort}`,
+    });
+  } else if (isLatePutBlitz) {
+    score = Math.max(-1, score);
+    const putLots = formatLotsAbs(lastHourNetDelta);
+    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots net; ${closingFlow.legsText}) entered after ${vetoAnchorTime}. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
+    guardAudit.push({
+      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
+      group: "GUARD",
+      status: "BULLISH_VETO",
+      detail: lateVetoWarning,
+      impact: `VETO STBT · Long SL: ${slLong}`,
+    });
   }
-  audit.push({
-    label: "Spot vs Levels",
-    status: levelStatus,
-    detail: levelDetail,
-    impact: levelStatus === "BULLISH" ? "+1 pt" : levelStatus === "BEARISH" ? "-1 pt" : "0 pts",
+
+  // Smart Money Futures Fusion: veto guardrail / information only — no points.
+  let fusionVetoWarning = null;
+  if (fusion?.eodCarryVeto === "VETO_BTST") {
+    score = Math.min(1, score);
+    fusionVetoWarning = `🚨 FUSION BULL TRAP VETO: ${fusion.headline}. BTST strictly forbidden. ${fusion.rationale}`;
+    guardAudit.push({
+      label: "Smart Money Futures Fusion",
+      group: "GUARD",
+      status: "BEARISH_VETO",
+      impact: "VETO BTST (Bull Trap)",
+      detail: fusionVetoWarning,
+    });
+  } else if (fusion?.eodCarryVeto === "VETO_STBT") {
+    score = Math.max(-1, score);
+    fusionVetoWarning = `🟢 FUSION BEAR TRAP VETO: ${fusion.headline}. STBT strictly forbidden. ${fusion.rationale}`;
+    guardAudit.push({
+      label: "Smart Money Futures Fusion",
+      group: "GUARD",
+      status: "BULLISH_VETO",
+      impact: "VETO STBT (Bear Trap)",
+      detail: fusionVetoWarning,
+    });
+  } else if (fusion) {
+    guardAudit.push({
+      label: "Smart Money Futures Fusion",
+      group: "INFO",
+      status: fusion.scenarioId,
+      impact: "0 pts (scored via Groups A and C)",
+      detail: `${fusion.badge}: ${fusion.headline}. ${fusion.rationale}`,
+    });
+  }
+
+  const groups = {
+    A: { id: "A", name: "Options positioning (PCR / ΔPCR / walls)", contribution: groupA, raw: rawA, cap: EOD_GROUP_CAPS.A },
+    B: { id: "B", name: `Closing options flow (${flowAnchorStr}+)`, contribution: groupB, raw: groupB, cap: EOD_GROUP_CAPS.B, driver: closingFlow?.driver || null },
+    C: { id: "C", name: "Futures (quadrant + basis)", contribution: groupC, raw: quadPts + basisPts, cap: EOD_GROUP_CAPS.C, quadrant, quadrantSource: quadSource },
+  };
+  const groupSummary = (g, parts) => ({
+    label: `Group ${g.id} · ${g.name}`,
+    group: g.id,
+    isGroupSummary: true,
+    status: g.contribution > 0 ? "BULLISH" : g.contribution < 0 ? "BEARISH" : "NEUTRAL",
+    contribution: g.contribution,
+    detail: parts,
+    impact: `${g.contribution === 0 ? "0 pts" : signedPts(g.contribution)} (cap ±${g.cap})`,
   });
+  audit.push(
+    groupSummary(groups.A, `Full-day writing ${signedPts(fullDayPts)}, PCR ${signedPts(pcrPts)}, walls ${signedPts(levelPts)} → raw ${signedPts(rawA)}${rawA !== groupA ? `, capped to ${signedPts(groupA)} (writing ratio and ΔPCR are the same ratio)` : ""}.`),
+    groupSummary(groups.B, closingFlowDetail),
+    groupSummary(groups.C, `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""} ${signedPts(quadPts)}; ${basisDetail}.`),
+    ...detailAudit,
+    ...guardAudit,
+  );
 
   const isDecisionWindow = isSunday
     ? (nowMins >= 900 && nowMins <= 960) // 15:00 to 16:00 IST on Sunday Muhurat
@@ -1744,87 +2005,15 @@ export function calculateEODDecision({
     }
   }
 
-  let verdict = "EXIT TO CASH / DO NOT CARRY";
-  let bias = "NEUTRAL";
-  let conviction = 75;
-  let sizing = "0% (Zero Leverage)";
-  let action = "No overnight edge. Balanced flow or chop. Carry zero leverage into next session.";
-
-  // Thresholds: on Friday, require score >= 4 or <= -4 due to weekend decay
-  // Late Institutional Divergence Guardrails (14:15+ Veto / Sunday Muhurat Veto)
-  // If late flow aggressively contradicts full-day writing, block carry trade to avoid gap traps
-  // GATED: Only fire if closing window data is verified valid!
-  let lateVetoWarning = null;
-  const isLateCallBlitz = isClosingDataValid && (lastHourNetDelta <= -50000);
-  const isLatePutBlitz = isClosingDataValid && (lastHourNetDelta >= 50000);
-
-  const slShort = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 35);
-  const targetShort = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 70);
-
-  const slLong = floorStrike && Number(floorStrike) < Number(spot) ? Number(floorStrike) : Math.round(Number(spot) - 35);
-  const targetLong = roofStrike && Number(roofStrike) > Number(spot) ? Number(roofStrike) : Math.round(Number(spot) + 70);
-
-  const vetoAnchorTime = p1415?.time || flowAnchorStr;
-
-  if (isLateCallBlitz) {
-    // Neutralize BTST: Smart money wrote heavy Calls into close (like Nov 5th)
-    score = Math.min(1, score);
-    const callLots = formatLotsAbs(lastHourNetDelta);
-    lateVetoWarning = `⚠️ LATE CALL BLITZ VETO: Heavy Call writing (${callLots} lots) entered after ${vetoAnchorTime}. BTST strictly forbidden. Short / STBT PE carry with Strict SL at ${slShort} (Roof Resistance). Target: Morning gap-down toward Floor (${targetShort}).`;
-    audit.push({
-      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
-      status: "BEARISH_VETO",
-      detail: lateVetoWarning,
-      impact: `VETO BTST · Short SL: ${slShort}`,
-    });
-  } else if (isLatePutBlitz) {
-    // Neutralize STBT: Smart money underwrote heavy Puts into close
-    score = Math.max(-1, score);
-    const putLots = formatLotsAbs(lastHourNetDelta);
-    lateVetoWarning = `⚠️ LATE PUT UNDERWRITING VETO: Heavy Put writing (${putLots} lots) entered after ${vetoAnchorTime}. STBT strictly forbidden. Long / BTST CE carry with Strict SL at ${slLong} (Floor Support). Target: Morning gap-up toward Roof (${targetLong}).`;
-    audit.push({
-      label: isSunday ? "Muhurat Institutional Veto Guardrail" : "14:15+ Institutional Veto Guardrail",
-      status: "BULLISH_VETO",
-      detail: lateVetoWarning,
-      impact: `VETO STBT · Long SL: ${slLong}`,
-    });
-  }
-
-  // 5. Smart Money Futures + Options Fusion Vetoes & Confluence Pillar
-  let fusionVetoWarning = null;
-  if (fusion?.eodCarryVeto === "VETO_BTST") {
-    score = Math.min(1, score);
-    fusionVetoWarning = `🚨 FUSION BULL TRAP VETO: ${fusion.headline}. BTST strictly forbidden. ${fusion.rationale}`;
-    audit.push({
-      label: "Smart Money Futures Fusion",
-      status: "BEARISH_VETO",
-      impact: "VETO BTST (Bull Trap)",
-      detail: fusionVetoWarning,
-    });
-  } else if (fusion?.eodCarryVeto === "VETO_STBT") {
-    score = Math.max(-1, score);
-    fusionVetoWarning = `🟢 FUSION BEAR TRAP VETO: ${fusion.headline}. STBT strictly forbidden. ${fusion.rationale}`;
-    audit.push({
-      label: "Smart Money Futures Fusion",
-      status: "BULLISH_VETO",
-      impact: "VETO STBT (Bear Trap)",
-      detail: fusionVetoWarning,
-    });
-  } else if (fusion) {
-    audit.push({
-      label: "Smart Money Futures Fusion",
-      status: fusion.scenarioId,
-      impact: fusion.actionableVerdict,
-      detail: `${fusion.badge}: ${fusion.headline}. ${fusion.rationale}`,
-    });
-  }
-
+  let verdict;
+  let bias;
+  let sizing;
+  let action;
   const thresh = isFriday ? 4 : 3;
 
   if (score >= thresh) {
     verdict = "CARRY NIFTY CE (BTST)";
     bias = "BULLISH";
-    conviction = Math.min(95, 72 + score * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
     action = `Favorable for holding overnight Nifty CE. Smart money has underwritten downside risk. Target: Morning gap-up continuation toward ${roofStrike}. Strict SL: Close below Floor Support (${slLong}).`;
     if (pcrWarning) {
@@ -1833,16 +2022,16 @@ export function calculateEODDecision({
   } else if (score <= -thresh) {
     verdict = "CARRY NIFTY PE (STBT)";
     bias = "BEARISH";
-    conviction = Math.min(95, 72 + Math.abs(score) * 4);
     sizing = isFriday ? "50% Size (Weekend Risk Control)" : "75% Normal Size";
-    action = `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}. Strict SL: Close above Roof Resistance (${slShort}).`;
+    action = closingFlow?.driver === "UNWINDING" && groupB < 0
+      ? `Favorable for holding overnight Nifty PE. Put support was withdrawn into the close (not fresh call writing). Target: Morning gap-down slippage toward ${floorStrike}. Strict SL: Close above Roof Resistance (${slShort}).`
+      : `Favorable for holding overnight Nifty PE. Smart money heavily capped resistance. Target: Morning gap-down slippage toward ${floorStrike}. Strict SL: Close above Roof Resistance (${slShort}).`;
     if (pcrWarning) {
       action += ` [${pcrWarning}: Tighten stop at ${slShort} due to oversold squeeze risk].`;
     }
   } else {
     verdict = "EXIT TO CASH / DO NOT CARRY";
     bias = "NEUTRAL";
-    conviction = 80;
     sizing = "0% (Cash Only)";
     if (fusionVetoWarning) {
       action = `${fusionVetoWarning} Carry 0 overnight leverage in cash.`;
@@ -1860,15 +2049,50 @@ export function calculateEODDecision({
     }
   }
 
+  // Agreement score (replaces the old "conviction %" = 72 + 4×|score|, which was not a probability).
+  const groupList = [groups.A, groups.B, groups.C];
+  let conviction;
+  let agreeing = [];
+  let opposing = [];
+  if (bias !== "NEUTRAL") {
+    const dir = bias === "BULLISH" ? 1 : -1;
+    agreeing = groupList.filter(g => Math.sign(g.contribution) === dir);
+    opposing = groupList.filter(g => Math.sign(g.contribution) === -dir);
+    const strength = agreeing.length
+      ? agreeing.reduce((s, g) => s + Math.abs(g.contribution) / g.cap, 0) / agreeing.length
+      : 0;
+    const cap = EOD_AGREEMENT_CAPS[agreeing.length];
+    conviction = Math.max(0, Math.round(cap * (0.5 + 0.5 * strength)) - OPPOSING_GROUP_PENALTY * opposing.length);
+  } else {
+    // No carry: how many groups support standing aside (zero, or against the net lean).
+    const lean = Math.sign(groupA + groupB + groupC);
+    agreeing = groupList.filter(g => g.contribution === 0 || lean === 0 || Math.sign(g.contribution) === -lean);
+    opposing = groupList.filter(g => !agreeing.includes(g));
+    conviction = EOD_AGREEMENT_CAPS[agreeing.length];
+  }
+  const agreement = {
+    kind: "RULE_BASED_AGREEMENT",
+    isProbability: false,
+    label: EOD_AGREEMENT_LABEL,
+    value: conviction,
+    cap: EOD_AGREEMENT_CAPS[agreeing.length],
+    groupsAgreeing: agreeing.map(g => g.id),
+    groupsOpposing: opposing.map(g => g.id),
+    verdictSide: bias === "NEUTRAL" ? "STAND_ASIDE" : bias,
+  };
+
   return {
     verdict,
     bias,
     conviction,
+    convictionLabel: EOD_AGREEMENT_LABEL,
+    agreement,
     sizing,
     action,
     stopLoss: (bias === "BEARISH" || isLateCallBlitz || fusion?.eodCarryVeto === "VETO_BTST") ? slShort : (bias === "BULLISH" || isLatePutBlitz || fusion?.eodCarryVeto === "VETO_STBT") ? slLong : null,
     target: (bias === "BEARISH" || isLateCallBlitz || fusion?.eodCarryVeto === "VETO_BTST") ? targetShort : (bias === "BULLISH" || isLatePutBlitz || fusion?.eodCarryVeto === "VETO_STBT") ? targetLong : null,
     score,
+    groups,
     isFriday,
     isSunday,
     isDecisionWindow,
@@ -1879,6 +2103,15 @@ export function calculateEODDecision({
     deltaPcr: numDelta,
     isClosingDataValid,
     lastHourNetDelta,
+    closingFlow: closingFlow ? {
+      netDelta: closingFlow.netDelta,
+      putLegDelta: closingFlow.putLegDelta,
+      callLegDelta: closingFlow.callLegDelta,
+      driver: closingFlow.driver,
+      dominantLeg: closingFlow.dominantLeg,
+      dominantShare: closingFlow.dominantShare,
+      wording: closingFlow.wording,
+    } : null,
     fusion,
     targetContract: targetContract || null,
     isRollover: Boolean(isRollover),
@@ -2525,11 +2758,41 @@ export async function refreshLiveSnapshot({
       floorPutWritingBlitz,
     };
 
-    const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics);
-    // Publish the server-computed futures quadrant so timeline ticks (futQuadrant),
-    // the payload's futures.quadrant and the webhook's futures veto use real data.
+    // Rolling-window (default 30m) futures quadrant from the stored per-minute ticks plus the
+    // current reading (the current tick is appended to the timeline only after this point).
+    const sessionCloseMins = sessionInfo.isSunday ? 960 : 940;
+    const currentTickMins = Math.min(getISTMinutes(), sessionCloseMins);
+    const intradayQuadrant = futuresMetrics && !futuresMetrics.isStale
+      ? classifyIntradayFuturesQuadrant(intradayHistory, {
+          current: {
+            minutes: currentTickMins,
+            time: toClockTimeStr(currentTickMins),
+            futPrice: Number(futuresMetrics.lastPrice),
+            futCombinedOI: Number(futuresMetrics.combinedOI),
+          },
+        })
+      : null;
+    const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics, {
+      intradayQuadrant,
+      mode: getFusionQuadrantMode(),
+    });
+    // Publish the quadrant fusion actually used (intraday when available, else day) so timeline
+    // ticks (futQuadrant), futures.quadrant and the webhook's futures veto agree, and expose both.
     if (futuresMetrics && fusion?.quadrantInfo?.quadrant) {
       futuresMetrics.quadrant = fusion.quadrantInfo.quadrant;
+      futuresMetrics.quadrantSource = fusion.quadrantSource;
+      futuresMetrics.quadrantSourceLabel = fusion.quadrantSourceLabel;
+      futuresMetrics.quadrantSourceReason = fusion.quadrantSourceReason;
+      futuresMetrics.quadrantDay = fusion.quadrantDay;
+      futuresMetrics.quadrantIntraday = fusion.quadrantIntraday;
+    }
+    // A floor/roof "shift" right after the 15:30 auction print is the corridor re-centring on
+    // the auction close, not price action; say so.
+    const prevTickMins = intradayHistory.length ? intradayHistory[intradayHistory.length - 1].minutes : null;
+    if (!sessionInfo.isSunday && prevTickMins !== null && prevTickMins < SPOT_FREEZE_END_MINS && currentTickMins >= SPOT_FREEZE_END_MINS) {
+      const note = " (reference moved with the 15:30 closing-auction print — not a price move)";
+      if (floorShift.startsWith("Floor moved")) floorShift += note;
+      if (roofShift.startsWith("Roof moved")) roofShift += note;
     }
 
     // Near expiry: always record the tick (buildTimeline appends the first tick of the
@@ -2564,6 +2827,9 @@ export async function refreshLiveSnapshot({
       fusion,
       targetContract: targetExpiry,
       isRollover: Boolean(isTargetRollover || isAfternoonRollover),
+      futuresQuadrant: fusion?.quadrantInfo || null,
+      futuresMetrics,
+      macroTurn: smartMoney.macroTurn,
     });
 
     smartMoney.eodDecision = eodDecision;
@@ -2644,13 +2910,14 @@ export async function refreshLiveSnapshot({
         monthlyExpiry,
         dte: calculateDte(monthlyExpiry),
         underlyingSpot: spot,
-        futuresBuildup: futuresMetrics?.quadrant || "NEUTRAL",
+        // T+2 swing context keeps the day-level quadrant (vs previous close / session open).
+        futuresBuildup: futuresMetrics?.quadrantDay?.quadrant || futuresMetrics?.quadrant || "NEUTRAL",
         futuresBasis: futuresMetrics?.rawBasis || 0,
         adjustedBasisSpread: futuresMetrics?.adjustedBasisSpread || 0,
         protocol: "Monthly Expiry (<=15th: current month, >15th: next month) · T+2 Holding Window",
-        executionVehicle: (futuresMetrics?.quadrant === "LONG_BUILDUP" || eodDecision.bias === "BULLISH")
+        executionVehicle: ((futuresMetrics?.quadrantDay?.quadrant || futuresMetrics?.quadrant) === "LONG_BUILDUP" || eodDecision.bias === "BULLISH")
           ? "BULL_CALL_SPREAD (+ATM CE / -OTM CE) [Zero Theta Burn & Gap-Protection]"
-          : (futuresMetrics?.quadrant === "SHORT_BUILDUP" || eodDecision.bias === "BEARISH")
+          : ((futuresMetrics?.quadrantDay?.quadrant || futuresMetrics?.quadrant) === "SHORT_BUILDUP" || eodDecision.bias === "BEARISH")
           ? "BEAR_PUT_SPREAD (+ATM PE / -OTM PE) [Zero Theta Burn & Gap-Protection]"
           : "NEUTRAL_WAIT_FOR_125M_BREAK",
         timeHorizon: "T+2 Days (6 to 7 bars of 125m)",
