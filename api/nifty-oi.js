@@ -8,6 +8,7 @@ import {
   classifyFuturesQuadrant,
   evaluateSmartMoneyFusion,
 } from "../src/smartMoneyFusion.js";
+import { authorizeRequest } from "../src/webhookAuth.js";
 
 let cache = {
   data: null,
@@ -36,6 +37,142 @@ const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN || process.env.REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_TOKEN;
 
 export const DEFAULT_EOD_SEED_HISTORY = CANONICAL_EOD_SEED_HISTORY;
+
+// ── Generic Upstash REST helpers (used by the EOD radar dispatcher) ──
+// Upstash REST accepts a JSON command array POSTed to the base URL.
+export async function redisRestCommand(args) {
+  if (!REDIS_URL || !REDIS_TOKEN) throw new Error("Redis not configured");
+  const res = await fetch(REDIS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(args),
+    signal: AbortSignal.timeout(2500),
+  });
+  if (!res.ok) throw new Error(`Redis command failed: HTTP ${res.status}`);
+  const json = await res.json();
+  if (json && json.error) throw new Error(`Redis command error: ${json.error}`);
+  return json ? json.result : null;
+}
+
+export async function redisRestGet(key) {
+  try {
+    const result = await redisRestCommand(["GET", key]);
+    if (result === null || result === undefined) return null;
+    try {
+      return typeof result === "string" ? JSON.parse(result) : result;
+    } catch (e) {
+      return result;
+    }
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function redisRestSet(key, value, exSeconds = 86400) {
+  try {
+    const body = typeof value === "string" ? value : JSON.stringify(value);
+    const result = await redisRestCommand(["SET", key, body, "EX", String(exSeconds)]);
+    return result === "OK";
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Atomic claim: SET key value NX EX ttl. Returns true only for the single caller that created the key. */
+export async function redisRestSetNx(key, value, exSeconds = 86400) {
+  const body = typeof value === "string" ? value : JSON.stringify(value);
+  const result = await redisRestCommand(["SET", key, body, "NX", "EX", String(exSeconds)]);
+  return result === "OK";
+}
+
+export async function redisRestDel(key) {
+  try {
+    await redisRestCommand(["DEL", key]);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 15-minute BTST/STBT carry radar dispatcher.
+ * Dedupe is an atomic SET NX claim on the slot key taken BEFORE sending, so two
+ * concurrent requests in the same slot cannot both send. If the send fails, the
+ * claim is released so a later poll in the same slot can retry.
+ * Without Redis (or if the claim errors) nothing is sent, except for the explicit
+ * authenticated `test=eod_alert` path which bypasses dedupe.
+ */
+export async function dispatchEodRadarAlert({
+  istMinutes,
+  istDateStr,
+  isEodTest = false,
+  eodDecision,
+  spot,
+  floorStrike,
+  roofStrike,
+  deps = {},
+}) {
+  const hasRedis = deps.hasRedis !== undefined ? deps.hasRedis : Boolean(REDIS_URL && REDIS_TOKEN);
+  const setNx = deps.setNx || redisRestSetNx;
+  const set = deps.set || redisRestSet;
+  const del = deps.del || redisRestDel;
+  const sendAlert = deps.sendAlert || (async (...args) => {
+    const { sendTelegramEODAlert } = await import("./tv-webhook.js");
+    return sendTelegramEODAlert(...args);
+  });
+
+  const inWindow = istMinutes >= 855 && istMinutes <= 930;
+  if (!inWindow && !isEodTest) return { status: "OUTSIDE_WINDOW", sent: false };
+
+  // Identify current 15-minute slot (14:15, 14:30, 14:45, 15:00, 15:15, 15:30)
+  const slotMins = isEodTest ? 915 : Math.floor(istMinutes / 15) * 15;
+  const slotTimeStr = `${String(Math.floor(slotMins / 60)).padStart(2, "0")}:${String(slotMins % 60).padStart(2, "0")}`;
+  const dispatchedKey = `nifty:eod_slot_dispatched:${istDateStr}:${slotTimeStr}`;
+
+  if (isEodTest) {
+    const sent = await sendAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
+    return { status: "TEST_SENT", sent: Boolean(sent), slotTimeStr };
+  }
+
+  if (!hasRedis) return { status: "NO_REDIS_SKIPPED", sent: false, slotTimeStr };
+
+  let claimed = false;
+  try {
+    claimed = await setNx(dispatchedKey, { claimedAt: new Date().toISOString(), state: "SENDING" }, 86400);
+  } catch (e) {
+    console.error("EOD radar dedupe claim failed; not sending:", e.message);
+    return { status: "CLAIM_ERROR", sent: false, slotTimeStr };
+  }
+  if (!claimed) return { status: "ALREADY_CLAIMED", sent: false, slotTimeStr };
+
+  let sent = false;
+  try {
+    sent = await sendAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
+  } catch (e) {
+    console.error("EOD radar send failed:", e.message);
+    sent = false;
+  }
+  if (sent) {
+    await set(dispatchedKey, { sentAt: new Date().toISOString(), state: "SENT" }, 86400);
+    return { status: "SENT", sent: true, slotTimeStr };
+  }
+  await del(dispatchedKey);
+  return { status: "SEND_FAILED_RELEASED", sent: false, slotTimeStr };
+}
+
+// ── Test hooks for module-level session state ──
+export function __getIntradayHistoryForTests() {
+  return intradayHistory;
+}
+export function __resetSessionStateForTests() {
+  intradayHistory = [];
+  sessionDate = "";
+  cache = { data: null, timestamp: 0 };
+  cacheByExpiry = new Map();
+}
 
 export function getActiveExpiryDate(contractExpiry) {
   if (contractExpiry && typeof contractExpiry === "string" && contractExpiry.trim().length > 0) {
@@ -237,11 +374,18 @@ export async function getRedisSessionPayload() {
   }
 }
 
-export async function saveRedisSessionPayload(payload) {
+/**
+ * @param {object} payload
+ * @param {{ snapshotAt?: number }} [opts] snapshotAt (epoch ms) must only be supplied by
+ *   the live NSE fetch path; it is what the webhook uses to reject stale snapshots.
+ */
+export async function saveRedisSessionPayload(payload, opts = {}) {
   if (!REDIS_URL || !REDIS_TOKEN || !payload) return false;
   try {
+    const { snapshotAt: _ignoredSnapshotAt, ...payloadWithoutStamp } = payload;
     const bridgeSnapshot = {
-      ...payload,
+      ...payloadWithoutStamp,
+      ...(Number.isFinite(opts.snapshotAt) && opts.snapshotAt > 0 ? { snapshotAt: opts.snapshotAt } : {}),
       corridor: {
         deltaPCR: payload.deltaPcr,
         floorStrike: payload.floor,
@@ -1596,7 +1740,7 @@ export function calculateEODDecision({
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-webhook-secret");
   res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=60");
 
   if (req.method === "OPTIONS") {
@@ -1607,9 +1751,20 @@ export default async function handler(req, res) {
   const now = Date.now();
 
   // Handle client-to-server sync via POST (e.g. mobile or desktop sharing gathered 1-min ticks or EOD history)
+  // Requires the webhook secret (fail closed: 503 if unconfigured, 401 if missing/wrong).
   if (req.method === "POST") {
+    let body = null;
     try {
-      const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    } catch (e) {
+      body = null;
+    }
+    const auth = authorizeRequest(req, body);
+    if (!auth.ok) {
+      return res.status(auth.status).json({ success: false, error: auth.error });
+    }
+    try {
+      if (!body || typeof body !== "object") throw new Error("Invalid sync payload");
       if (body?.action === "sync_eod_history" && Array.isArray(body?.history)) {
         if (REDIS_URL) {
           await saveRedisEodHistory(body.history);
@@ -1694,6 +1849,14 @@ export default async function handler(req, res) {
       success: false,
       error: `Timeline not found for date ${cleanKey}`
     });
+  }
+
+  // `force=true` (bypass market-hours/caches) and `test=eod_alert` (sends Telegram) require the secret.
+  if (req.query?.force === "true" || req.query?.test === "eod_alert") {
+    const auth = authorizeRequest(req);
+    if (!auth.ok) {
+      return res.status(auth.status).json({ success: false, error: auth.error });
+    }
   }
 
   const sessionInfo = getMarketSessionInfo();
@@ -2097,10 +2260,18 @@ export default async function handler(req, res) {
     };
 
     const fusion = evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics);
+    // Publish the server-computed futures quadrant so timeline ticks (futQuadrant),
+    // the payload's futures.quadrant and the webhook's futures veto use real data.
+    if (futuresMetrics && fusion?.quadrantInfo?.quadrant) {
+      futuresMetrics.quadrant = fusion.quadrantInfo.quadrant;
+    }
 
-    const timeline = (targetExpiry === nearExpiry && Array.isArray(intradayHistory) && intradayHistory.length > 0)
+    // Near expiry: always record the tick (buildTimeline appends the first tick of the
+    // session even when history is empty). Any other expiry: read-only copy of the real
+    // near-expiry history (possibly empty) — never synthetic ticks, never a mutation.
+    const timeline = (targetExpiry === nearExpiry)
       ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics)
-      : getCanonicalSettledTimeline(totPutWriting, totCallWriting, spot, futuresMetrics);
+      : (Array.isArray(intradayHistory) ? intradayHistory.map(pt => ({ ...pt })) : []);
 
     // Compute Smart Money / Institutional Analysis
     const smartMoney = analyzeSmartMoney({
@@ -2147,29 +2318,19 @@ export default async function handler(req, res) {
     // Automatic 15-Minute BTST / STBT Carry Radar & Final EOD Dispatcher (14:00 to 15:30 IST)
     const istMinutes = getISTMinutes();
     const istDateStr = getISTIsoDateStr();
-    const isEodTest = req.query?.test === "eod_alert";
-    if ((istMinutes >= 855 && istMinutes <= 930) || isEodTest) {
-      if (REDIS_URL || isEodTest) {
-        try {
-          // Identify current 15-minute slot (14:15, 14:30, 14:45, 15:00, 15:15, 15:30)
-          const slotMins = isEodTest ? 915 : Math.floor(istMinutes / 15) * 15;
-          const slotHour = String(Math.floor(slotMins / 60)).padStart(2, "0");
-          const slotMinute = String(slotMins % 60).padStart(2, "0");
-          const slotTimeStr = `${slotHour}:${slotMinute}`;
-
-          const dispatchedKey = `nifty:eod_slot_dispatched:${istDateStr}:${slotTimeStr}`;
-          const alreadySent = isEodTest ? null : await redisRestGet(dispatchedKey);
-          if (!alreadySent) {
-            const { sendTelegramEODAlert } = await import("./tv-webhook.js");
-            const sent = await sendTelegramEODAlert(eodDecision, spot, floorStrike, roofStrike, slotTimeStr);
-            if (sent && !isEodTest) {
-              await redisRestSet(dispatchedKey, { sentAt: new Date().toISOString() }, 86400);
-            }
-          }
-        } catch (err) {
-          console.error("Error dispatching 15-minute EOD radar alert:", err);
-        }
-      }
+    const isEodTest = req.query?.test === "eod_alert"; // authorised above
+    try {
+      await dispatchEodRadarAlert({
+        istMinutes,
+        istDateStr,
+        isEodTest,
+        eodDecision,
+        spot,
+        floorStrike,
+        roofStrike,
+      });
+    } catch (err) {
+      console.error("Error dispatching 15-minute EOD radar alert:", err);
     }
 
     const payload = {
@@ -2218,13 +2379,13 @@ export default async function handler(req, res) {
         monthlyExpiry,
         dte: calculateDte(monthlyExpiry),
         underlyingSpot: spot,
-        futuresBuildup: futuresMetrics?.buildup || "NEUTRAL",
+        futuresBuildup: futuresMetrics?.quadrant || "NEUTRAL",
         futuresBasis: futuresMetrics?.rawBasis || 0,
         adjustedBasisSpread: futuresMetrics?.adjustedBasisSpread || 0,
         protocol: "Monthly Expiry (<=15th: current month, >15th: next month) · T+2 Holding Window",
-        executionVehicle: (futuresMetrics?.buildup === "LONG_BUILDUP" || eodDecision.bias === "BULLISH")
+        executionVehicle: (futuresMetrics?.quadrant === "LONG_BUILDUP" || eodDecision.bias === "BULLISH")
           ? "BULL_CALL_SPREAD (+ATM CE / -OTM CE) [Zero Theta Burn & Gap-Protection]"
-          : (futuresMetrics?.buildup === "SHORT_BUILDUP" || eodDecision.bias === "BEARISH")
+          : (futuresMetrics?.quadrant === "SHORT_BUILDUP" || eodDecision.bias === "BEARISH")
           ? "BEAR_PUT_SPREAD (+ATM PE / -OTM PE) [Zero Theta Burn & Gap-Protection]"
           : "NEUTRAL_WAIT_FOR_125M_BREAK",
         timeHorizon: "T+2 Days (6 to 7 bars of 125m)",
@@ -2250,7 +2411,8 @@ export default async function handler(req, res) {
       cacheByExpiry.set("default", { data: payload, timestamp: now });
       cache = { data: payload, timestamp: now };
       if (REDIS_URL) {
-        saveRedisSessionPayload(payload).catch(() => {});
+        // snapshotAt marks this as a live NSE fetch; the webhook rejects snapshots older than FLOW_MAX_AGE_SEC.
+        saveRedisSessionPayload(payload, { snapshotAt: now }).catch(() => {});
       }
     }
     if (isCronRequest) {

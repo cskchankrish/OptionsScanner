@@ -27,6 +27,7 @@
  */
 
 import { Redis } from "@upstash/redis";
+import { authorizeRequest } from "../src/webhookAuth.js";
 
 const REDIS_URL =
   process.env.UPSTASH_REDIS_REST_URL ||
@@ -41,7 +42,13 @@ const REDIS_TOKEN =
   process.env.UPSTASH_REDIS_TOKEN;
 
 let _redisInstance = null;
+let _redisOverride = null;
+/** Test hook: inject an in-memory Redis-like client (pass null to clear). */
+export function setRedisClientForTesting(client) {
+  _redisOverride = client || null;
+}
 export function getRedisClient() {
+  if (_redisOverride) return _redisOverride;
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   if (!_redisInstance) {
     try {
@@ -92,6 +99,23 @@ async function redisRestSet(key, value, exSeconds = 86400) {
   }
 }
 
+/** Maximum accepted age (seconds) of the `nifty:flow:latest` snapshot for actionable grades. */
+export function getFlowMaxAgeSec() {
+  const v = Number(process.env.FLOW_MAX_AGE_SEC);
+  return Number.isFinite(v) && v > 0 ? v : 900;
+}
+
+export const ACTIONABLE_GRADES = ["BEAR_TRAP_BUY", "BULL_TRAP_SELL", "SYNERGY_BULL", "SYNERGY_BEAR"];
+
+/** Age of a snapshot in whole seconds, or null when it carries no usable `snapshotAt`. */
+export function getSnapshotAgeSec(liveScanner, nowMs = Date.now()) {
+  const at = Number(liveScanner?.snapshotAt);
+  if (!liveScanner || !Number.isFinite(at) || at <= 0) return null;
+  // A timestamp more than 60s in the future is not trustworthy.
+  if (at - nowMs > 60000) return null;
+  return Math.max(0, Math.round((nowMs - at) / 1000));
+}
+
 // Helper: Current IST Date string (YYYY-MM-DD)
 export function getIstDateString() {
   const now = new Date();
@@ -104,7 +128,7 @@ export function getIstDateString() {
  * Core Webhook Bridge Fusion Evaluator
  * Combines TradingView v4.3 payload + Live OptionsScanner 22-Strike Option Chain
  */
-export function fuseChartWithOptionChain(tv, liveScanner) {
+export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
   const dir = String(tv.dir || "LONG").toUpperCase();
   const grade = String(tv.grade || "SIGNAL").toUpperCase();
   const close = Number(tv.close || 0);
@@ -129,9 +153,19 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
         liveScanner.deltaPCR !== undefined)
   );
 
-  const deltaPCR = hasLiveOptions
-    ? Number(liveScanner.corridor?.deltaPCR ?? liveScanner.deltaPcr ?? liveScanner.deltaPCR ?? 1.0)
+  // Never fabricate a ΔPCR: missing/non-numeric values stay null (no option-chain confirmation).
+  const rawDeltaPCR = hasLiveOptions
+    ? (liveScanner.corridor?.deltaPCR ?? liveScanner.deltaPcr ?? liveScanner.deltaPCR ?? null)
     : null;
+  const deltaPCR =
+    rawDeltaPCR !== null && rawDeltaPCR !== "" && Number.isFinite(Number(rawDeltaPCR))
+      ? Number(rawDeltaPCR)
+      : null;
+  const hasDeltaPCR = deltaPCR !== null;
+  const snapshotAt = Number.isFinite(Number(liveScanner?.snapshotAt)) && Number(liveScanner?.snapshotAt) > 0
+    ? Number(liveScanner.snapshotAt)
+    : null;
+  const snapshotAgeSec = getSnapshotAgeSec(liveScanner, nowMs);
 
   const floorStrike = hasLiveOptions
     ? Number(liveScanner.corridor?.floorStrike ?? liveScanner.floor ?? tv.actFloor ?? 0)
@@ -146,14 +180,24 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     liveScanner?.fusion?.scenarioId ||
     tv.fusion ||
     "MIXED_FLOW";
+  // Only a scenario computed by the server from real option-chain data may confirm a trade.
+  const serverScenario = hasDeltaPCR
+    ? (liveScanner?.smartMoneyFusion?.primaryScenario || liveScanner?.fusion?.scenarioId || null)
+    : null;
 
   const scannerAction =
     liveScanner?.smartMoneyFusion?.actionTag ||
     liveScanner?.fusion?.eodCarryVeto ||
     "NEUTRAL";
 
-  const liveFutQuad =
-    liveScanner?.futures?.quadrant || tv.futQuad || "NEUTRAL_CHOP";
+  // Futures quadrant comes from the server only — never from the chart's own tv.futQuad
+  // (that would make the futures veto circular). Missing or stale => "UNAVAILABLE",
+  // which matches no veto and no confirmation condition below.
+  const futuresStale = Boolean(liveScanner?.futures?.isStale);
+  const serverFutQuadRaw =
+    liveScanner?.futures?.quadrant ?? liveScanner?.fusion?.quadrantInfo?.quadrant ?? null;
+  const liveFutQuad = !serverFutQuadRaw || futuresStale ? "UNAVAILABLE" : String(serverFutQuadRaw);
+  const chartFutQuad = tv.futQuad ?? null;
 
   // Distance to real Option Chain walls
   const distToFloor = floorStrike > 0 ? close - floorStrike : null;
@@ -162,8 +206,9 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
   const nearCallWall = distToRoof !== null && Math.abs(distToRoof) <= 80;
 
   // Real Option Chain Writer Blitz checks (from 22-strike corridor)
-  const realPutBlitz = deltaPCR !== null ? deltaPCR >= 1.30 : true;
-  const realCallBlitz = deltaPCR !== null ? deltaPCR <= 0.75 : true;
+  // No data => no blitz (previously defaulted to true, i.e. failed open).
+  const realPutBlitz = hasDeltaPCR ? deltaPCR >= 1.30 : false;
+  const realCallBlitz = hasDeltaPCR ? deltaPCR <= 0.75 : false;
   const severeOppositeCallWriting = deltaPCR !== null && deltaPCR <= 0.55;
   const severeOppositePutWriting = deltaPCR !== null && deltaPCR >= 1.65;
 
@@ -245,15 +290,17 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       } else {
         const verified =
           (deltaPCR !== null && deltaPCR >= 1.25) ||
-          scannerScenario === "HIGH_CONVICTION_BULLISH_SYNERGY" ||
-          scannerScenario === "BULLISH_SYNERGY";
+          serverScenario === "HIGH_CONVICTION_BULLISH_SYNERGY" ||
+          serverScenario === "BULLISH_SYNERGY";
         decision = verified ? "EXECUTE_HIGH_CONVICTION_SYNERGY" : "EXECUTE_MODERATE_SYNERGY";
         recommendedLots = verified ? 2 : 1;
         tier = verified ? "HIGH_CONVICTION_SYNERGY" : "MODERATE_SYNERGY";
         reason.push(
           verified
             ? `HIGH CONVICTION BULL SYNERGY VERIFIED: Real 22-strike Option Chain confirms Put Writing Blitz (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) above Floor ${floorStrike}.`
-            : `MODERATE BULL SYNERGY: Chart triggered Bull Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}). Sized to 1 Lot.`
+            : hasDeltaPCR
+            ? `MODERATE BULL SYNERGY: Chart triggered Bull Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR.toFixed(2)}). Sized to 1 Lot.`
+            : `MODERATE BULL SYNERGY: Chart triggered Bull Synergy; Option Chain data unavailable (ΔPCR=N/A) — NOT confirmed. Sized to 1 Lot.`
         );
       }
     } else {
@@ -281,15 +328,17 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       } else {
         const verified =
           (deltaPCR !== null && deltaPCR <= 0.75) ||
-          scannerScenario === "HIGH_CONVICTION_BEARISH_SYNERGY" ||
-          scannerScenario === "BEARISH_SYNERGY";
+          serverScenario === "HIGH_CONVICTION_BEARISH_SYNERGY" ||
+          serverScenario === "BEARISH_SYNERGY";
         decision = verified ? "EXECUTE_HIGH_CONVICTION_SYNERGY" : "EXECUTE_MODERATE_SYNERGY";
         recommendedLots = verified ? 2 : 1;
         tier = verified ? "HIGH_CONVICTION_SYNERGY" : "MODERATE_SYNERGY";
         reason.push(
           verified
             ? `HIGH CONVICTION BEAR SYNERGY VERIFIED: Real 22-strike Option Chain confirms Call Writing Blitz (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) below Roof ${roofStrike}.`
-            : `MODERATE BEAR SYNERGY: Chart triggered Bear Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}). Sized to 1 Lot.`
+            : hasDeltaPCR
+            ? `MODERATE BEAR SYNERGY: Chart triggered Bear Synergy, Option Chain is neutral/mixed (ΔPCR=${deltaPCR.toFixed(2)}). Sized to 1 Lot.`
+            : `MODERATE BEAR SYNERGY: Chart triggered Bear Synergy; Option Chain data unavailable (ΔPCR=N/A) — NOT confirmed. Sized to 1 Lot.`
         );
       }
     }
@@ -341,7 +390,9 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
             realCallBlitz));
       recommendedLots = synergyAligned ? 2 : 1;
       reason.push(
-        `TIER-2 CONFIRMED ${grade} (${dir}): EMA/Supertrend structure + Option Chain (${scannerScenario}, ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) aligned.`
+        hasDeltaPCR
+          ? `TIER-2 CONFIRMED ${grade} (${dir}): EMA/Supertrend structure + Option Chain (${scannerScenario}, ΔPCR=${deltaPCR.toFixed(2)}) aligned.`
+          : `TIER-2 ${grade} (${dir}): EMA/Supertrend structure only; Option Chain data unavailable (ΔPCR=N/A) — not confirmed by option chain.`
       );
     }
   }
@@ -363,7 +414,9 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       decision = "EXECUTE_INTRADAY";
       recommendedLots = Number(tv.score || 0) >= 7 ? 2 : 1;
       reason.push(
-        `Intraday ${grade} (${dir}) passed Option Chain filter (Score ${tv.score || 0}/8).`
+        hasDeltaPCR
+          ? `Intraday ${grade} (${dir}) passed Option Chain filter (Score ${tv.score || 0}/8).`
+          : `Intraday ${grade} (${dir}) (Score ${tv.score || 0}/8); Option Chain data unavailable — filter not applied.`
       );
     }
   }
@@ -428,6 +481,7 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
     chartMetrics: {
       score: tv.score,
       futQuad: tv.futQuad,
+      chartFutQuad,
       futOiPct: tv.futOiPct,
       futOiSrc: tv.futOiSrc,
       basis: tv.basis,
@@ -444,6 +498,13 @@ export function fuseChartWithOptionChain(tv, liveScanner) {
       scannerScenario,
       scannerAction,
       liveFutQuad,
+      serverFutQuad: liveFutQuad,
+      chartFutQuad,
+      futuresStale,
+      snapshotAt,
+      snapshotAgeSec,
+      realPutBlitz,
+      realCallBlitz,
     },
     reasoning: reason.join(" "),
   };
@@ -462,6 +523,7 @@ export async function sendTelegramAlert(fused) {
   const icon =
     fused.decision === "VETO_SIGNAL" ||
     fused.decision === "VETO_DIVERGENT_SYNERGY" ||
+    fused.decision === "VETO_STALE_OPTION_CHAIN" ||
     fused.decision === "BLOCKED_BY_ACTIVE_TRADE"
       ? "🚫"
       : fused.decision === "LOG_ONLY"
@@ -481,7 +543,16 @@ export async function sendTelegramAlert(fused) {
 
   let lines = [];
 
-  if (fused.decision === "VETO_DIVERGENT_SYNERGY" || fused.decision === "VETO_SIGNAL") {
+  if (fused.decision === "VETO_STALE_OPTION_CHAIN") {
+    lines = [
+      `🚫 *VETOED · OPTION CHAIN SNAPSHOT STALE OR MISSING*`,
+      `• *Chart Signal:* \`${fused.grade}\`${kindBadge} (${fused.direction})`,
+      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Chart Price:* \`${fused.entryPrice}\``,
+      `• *Verdict:* ${fused.reasoning}`,
+      `• *Directive:* 🚫 *DO NOT TRADE (0 Lots)*. The signal could not be verified against a fresh option chain.`,
+    ].filter(Boolean);
+  } else if (fused.decision === "VETO_DIVERGENT_SYNERGY" || fused.decision === "VETO_SIGNAL") {
     lines = [
       `🚫 *VETOED · REAL OPTION CHAIN DIVERGENCE*`,
       `• *Chart Signal:* \`${fused.grade}\`${kindBadge} (${fused.direction})`,
@@ -898,7 +969,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-webhook-secret");
 
   if (req.method === "OPTIONS") {
     return res.status(200).end();
@@ -909,6 +980,25 @@ export default async function handler(req, res) {
 
   // ── GET: Query Signals, Archive, Export CSV, or Close Active Trade ──
   if (req.method === "GET") {
+    // State-changing or message-sending GETs require the webhook secret (fail closed).
+    // Plain reads (status, latest signal, archive, CSV) stay open.
+    const hasQueryValue = (v) => v !== undefined && v !== null && v !== "";
+    const isMutatingGet =
+      req.query?.close_trade === "1" ||
+      req.query?.action === "close_trade" ||
+      req.query?.test === "telegram" ||
+      req.query?.test === "eod" ||
+      req.query?.send_eod === "1" ||
+      hasQueryValue(req.query?.spot) ||
+      hasQueryValue(req.query?.high) ||
+      hasQueryValue(req.query?.low);
+    if (isMutatingGet) {
+      const auth = authorizeRequest(req);
+      if (!auth.ok) {
+        return res.status(auth.status).json({ ok: false, error: auth.error });
+      }
+    }
+
     // 1. Close Active Trade manually or via exit trigger
     if (req.query?.close_trade === "1" || req.query?.action === "close_trade") {
       const exitReason = req.query?.reason || "MANUAL_CLOSE";
@@ -1133,12 +1223,20 @@ export default async function handler(req, res) {
   }
 
   try {
-    const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-    // 1. Verify Webhook Secret if configured
-    const expectedSecret = process.env.TV_WEBHOOK_SECRET;
-    if (expectedSecret && expectedSecret !== "CHANGE_ME" && payload?.secret !== expectedSecret) {
-      return res.status(401).json({ error: "Unauthorized webhook secret" });
+    // 1. Verify Webhook Secret — fail closed: 503 when TV_WEBHOOK_SECRET is unset/CHANGE_ME,
+    //    401 when the request's secret (body `secret`, x-webhook-secret header or `key` query) is wrong.
+    let payload = null;
+    try {
+      payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    } catch (e) {
+      payload = null;
+    }
+    const auth = authorizeRequest(req, payload);
+    if (!auth.ok) {
+      return res.status(auth.status).json({ error: auth.error });
+    }
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ error: "Invalid JSON payload" });
     }
 
     // 1b. Handle Trade Exit / T1 Scale-Out Webhooks directly from TradingView or Execution Bridge
@@ -1231,37 +1329,55 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, event: "TRADE_CLOSED", exitRecord });
     }
 
-    // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis
-    let liveScanner = null;
-    if (redis) {
-      try {
-        const [latestSnapshot, sessionPayload] = await Promise.all([
-          redis.get("nifty:flow:latest"),
-          redis.get("nifty_latest_session_payload_v2"),
-        ]);
-        liveScanner =
-          (typeof latestSnapshot === "string" ? JSON.parse(latestSnapshot) : latestSnapshot) ||
-          (typeof sessionPayload === "string" ? JSON.parse(sessionPayload) : sessionPayload);
-      } catch (e) {
-        liveScanner =
-          (await redisRestGet("nifty:flow:latest")) ||
-          (await redisRestGet("nifty_latest_session_payload_v2"));
-      }
-    } else {
-      liveScanner =
-        (await redisRestGet("nifty:flow:latest")) ||
-        (await redisRestGet("nifty_latest_session_payload_v2"));
-    }
-
-    // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
-    const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner);
-
-    // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
+    // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis.
+    //    Actionable grades may only be verified against the live `nifty:flow:latest`
+    //    snapshot; the 14-day session payload is an informational fallback for other grades.
     const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
     const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
     const isActionable = isTrap || isSynergy;
+    const parseMaybe = (v) => (typeof v === "string" ? JSON.parse(v) : v);
 
-    if (!isActionable) {
+    let liveScanner = null;
+    if (redis) {
+      try {
+        liveScanner = parseMaybe(await redis.get("nifty:flow:latest"));
+        if (!liveScanner && !isActionable) {
+          liveScanner = parseMaybe(await redis.get("nifty_latest_session_payload_v2"));
+        }
+      } catch (e) {
+        liveScanner = await redisRestGet("nifty:flow:latest");
+        if (!liveScanner && !isActionable) {
+          liveScanner = await redisRestGet("nifty_latest_session_payload_v2");
+        }
+      }
+    } else {
+      liveScanner = await redisRestGet("nifty:flow:latest");
+      if (!liveScanner && !isActionable) {
+        liveScanner = await redisRestGet("nifty_latest_session_payload_v2");
+      }
+    }
+
+    // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
+    const nowMs = Date.now();
+    const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner, nowMs);
+
+    // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
+    const maxAgeSec = getFlowMaxAgeSec();
+    const snapshotAgeSec = fusedVerdict.liveOptionChainMetrics.snapshotAgeSec;
+    const isSnapshotStale = !liveScanner || snapshotAgeSec === null || snapshotAgeSec > maxAgeSec;
+
+    if (isActionable && isSnapshotStale) {
+      // Fail closed: never open a position without a fresh, live option-chain snapshot.
+      fusedVerdict.decision = "VETO_STALE_OPTION_CHAIN";
+      fusedVerdict.recommendedLots = 0;
+      fusedVerdict.tier = "VETOED_STALE_DATA";
+      fusedVerdict.liveOptionChainMetrics.maxAgeSec = maxAgeSec;
+      fusedVerdict.reasoning = !liveScanner
+        ? `VETOED: No live option-chain snapshot (nifty:flow:latest) available to verify ${payload.grade}. Snapshot age: unknown (missing). 0 Lots.`
+        : snapshotAgeSec === null
+        ? `VETOED: Option-chain snapshot has no snapshotAt timestamp, so its freshness cannot be verified for ${payload.grade}. Snapshot age: unknown. 0 Lots.`
+        : `VETOED: Option-chain snapshot is stale (age ${snapshotAgeSec}s > max ${maxAgeSec}s); cannot verify ${payload.grade}. 0 Lots.`;
+    } else if (!isActionable) {
       // Non-actionable signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
       fusedVerdict.decision = "LOG_ONLY";
       fusedVerdict.recommendedLots = 0;
