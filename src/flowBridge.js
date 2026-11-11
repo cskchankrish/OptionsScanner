@@ -36,7 +36,23 @@ export const MIN_DISPATCH_MS = 1000;
 export const DEFAULT_DISPATCH_TIMEOUT_MS = 3000;
 
 /** Statuses that make a trade "bridge-owned": the Algo, not the auto-lifecycle, drives it. */
-export const BRIDGE_OWNED_STATUSES = ["PENDING", "ACCEPTED", "UNKNOWN"];
+export const BRIDGE_OWNED_STATUSES = ["PENDING", "ACCEPTED", "UNKNOWN", "FILLED"];
+/** Statuses from which an ENTRY_FILLED / ENTRY_FAILED sync-back may move the trade. */
+export const ENTRY_REPORTABLE_STATUSES = ["PENDING", "ACCEPTED", "UNKNOWN"];
+export const ENTRY_SYNC_GRADES = ["ENTRY_FILLED", "ENTRY_FAILED"];
+
+/** Seconds an ACCEPTED trade may wait for ENTRY_FILLED/ENTRY_FAILED before the owner is warned. */
+export function getFillWaitSec(env = process.env) {
+  const v = Number(env.FLOW_BRIDGE_FILL_WAIT_SEC);
+  return Number.isFinite(v) && v > 0 ? v : 120;
+}
+
+/** True when the trade has sat in ACCEPTED (no fill report) longer than waitSec. */
+export function isStuckAccepted(trade, nowMs, waitSec) {
+  if (!trade?.active || trade.execution?.status !== "ACCEPTED") return false;
+  const at = Date.parse(trade.execution.at);
+  return Number.isFinite(at) && nowMs - at > waitSec * 1000;
+}
 
 export function isBridgeOwned(trade) {
   return Boolean(trade && trade.execution && BRIDGE_OWNED_STATUSES.includes(trade.execution.status));

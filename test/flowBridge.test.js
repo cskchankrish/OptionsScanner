@@ -257,7 +257,8 @@ test("accepted: execution ACCEPTED stored on the trade, lock held with TTL, Tele
   assert.equal(redis.ttl[KEY], 604800, "synergy trades keep the 7-day TTL");
   assert.equal(res.body.fusedVerdict.execution.status, "ACCEPTED");
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /ALGO ACCEPTED/);
+  assert.match(sent[0], /SENT TO ALGO · AWAITING FILL/);
+  assert.doesNotMatch(sent[0], /EXECUTED/);
   assert.ok(sent[0].includes(t.id));
 }));
 
@@ -373,7 +374,7 @@ test("paper trade with wrong tradeId -> 409 too", bridgeCase({ initial: { [KEY]:
   assert.ok(redis.store[KEY]);
 }));
 
-for (const status of ["ACCEPTED", "UNKNOWN", "PENDING"]) {
+for (const status of ["ACCEPTED", "UNKNOWN", "PENDING", "FILLED"]) {
   test(`bridge-owned (${status}) trade: exit without tradeId (e.g. TradingView) -> 409`, bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade(status)) } }, async ({ redis }) => {
     const before = redis.store[KEY];
     const res = await post({ secret: SECRET, grade: "STOP_LOSS_HIT", close: 25025 });
@@ -417,9 +418,9 @@ test("sync-back: T1 then T2 with matching tradeId drive the bridge-owned trade a
   assert.equal(stored(redis), null, "flat");
 }));
 
-test("sync-back: STOP_LOSS_HIT closes the matching trade; UNKNOWN resolved by a matching T1", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("UNKNOWN")) } }, async ({ redis }) => {
+test("sync-back: STOP_LOSS_HIT closes the matching trade; UNKNOWN resolved to FILLED by a matching T1", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("UNKNOWN")) } }, async ({ redis }) => {
   await post(exitBody("TARGET_1_HIT", { tradeId: "ft-owned-1", spot: 24895 }));
-  assert.equal(stored(redis).execution.status, "ACCEPTED");
+  assert.equal(stored(redis).execution.status, "FILLED");
   assert.equal(stored(redis).execution.resolvedBy, "sync-back");
   const r = await post(exitBody("BREAKEVEN_STOP", { tradeId: "ft-owned-1", spot: 24960 }));
   assert.equal(r.statusCode, 200);
@@ -449,3 +450,163 @@ test("GET close_trade on a bridge-owned trade needs its tradeId", bridgeCase({ i
   assert.equal(r3.statusCode, 200);
   assert.equal(stored(redis), null);
 }));
+
+// ── Contract v1.1: ENTRY_FILLED / ENTRY_FAILED, FILLED ownership, stuck-ACCEPTED guard ──
+
+const filledBody = (extra = {}) => ({ secret: SECRET, grade: "ENTRY_FILLED", tradeId: "ft-owned-1", source: "algo", spot: 24958, optionFill: 112.35, contract: "NIFTY17NOV2624950PE", lots: 1, mode: "live", t: 1762841000000, ...extra });
+const failedBody = (extra = {}) => ({ secret: SECRET, grade: "ENTRY_FAILED", tradeId: "ft-owned-1", source: "algo", reason: "broker rejected: margin", mode: "live", t: 1762841000000, ...extra });
+const archive = (redis) => (redis.lists["nifty:tv:signals:master_archive"] || []).map((s) => JSON.parse(s));
+
+for (const from of ["PENDING", "ACCEPTED", "UNKNOWN"]) {
+  test(`ENTRY_FILLED from ${from}: FILLED with fill details, lock held, Telegram; repeat is a 200 no-op`, bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade(from)) } }, async ({ redis, sent }) => {
+    const r = await post(filledBody());
+    assert.equal(r.statusCode, 200);
+    const t = stored(redis);
+    assert.equal(t.active, true);
+    assert.equal(t.execution.status, "FILLED");
+    assert.equal(t.execution.previousStatus, from);
+    assert.equal(t.execution.optionFill, 112.35);
+    assert.equal(t.execution.contract, "NIFTY17NOV2624950PE");
+    assert.equal(t.execution.mode, "live");
+    assert.equal(t.execution.filledAt, new Date(1762841000000).toISOString());
+    assert.equal(redis.ttl[KEY], 604800, "normal TTL once filled");
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /ENTRY FILLED/);
+    assert.ok(sent[0].includes("NIFTY17NOV2624950PE") && sent[0].includes("112.35"));
+    assert.equal(archive(redis)[0].type, "ENTRY_FILLED");
+    const before = redis.store[KEY];
+    const again = await post(filledBody({ optionFill: 999 }));
+    assert.equal(again.statusCode, 200);
+    assert.equal(again.body.duplicate, true);
+    assert.equal(redis.store[KEY], before, "no state change on repeat");
+    assert.equal(sent.length, 1, "no second Telegram");
+    assert.equal(archive(redis).length, 1);
+  }));
+
+  test(`ENTRY_FAILED from ${from}: NOT_EXECUTED, lock released, archived, Telegram; repeat is a 200 no-op`, bridgeCase({ env: BRIDGE_ON, initial: { [KEY]: JSON.stringify(ownedTrade(from)) } }, async ({ redis, sent, calls }) => {
+    const r = await post(failedBody());
+    assert.equal(r.statusCode, 200);
+    assert.equal(r.body.execution.status, "NOT_EXECUTED");
+    assert.equal(r.body.execution.reason, "broker rejected: margin");
+    assert.equal(stored(redis), null, "lock released");
+    const rec = archive(redis)[0];
+    assert.equal(rec.type, "ENTRY_FAILED");
+    assert.equal(rec.trade.id, "ft-owned-1");
+    assert.equal(rec.trade.execution.status, "NOT_EXECUTED");
+    assert.match(sent[0], /APPROVED BUT NOT EXECUTED/);
+    assert.ok(sent[0].includes("broker rejected: margin"));
+    const again = await post(failedBody());
+    assert.equal(again.statusCode, 200);
+    assert.equal(again.body.duplicate, true);
+    assert.equal(sent.length, 1);
+    assert.equal(archive(redis).length, 1);
+    // The next signal is free to open and dispatch.
+    const next = await post(bearAlert());
+    assert.equal(next.body.decision, "EXECUTE_HIGH_CONVICTION_SYNERGY");
+    assert.equal(calls.length, 1);
+  }));
+}
+
+test("ENTRY_FAILED on a FILLED trade: 409, loud Telegram, state unchanged", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("FILLED", { execution: { status: "FILLED", contract: "NIFTYPE", optionFill: 100 } })) } }, async ({ redis, sent }) => {
+  const before = redis.store[KEY];
+  const r = await post(failedBody());
+  assert.equal(r.statusCode, 409);
+  assert.equal(r.body.error, "CONTRADICTORY_REPORT");
+  assert.equal(redis.store[KEY], before);
+  assert.match(sent[0], /CONTRADICTORY/);
+  assert.deepEqual(redis.lists, {});
+}));
+
+test("ENTRY_FILLED after ENTRY_FAILED (lock released): 409 with a loud Telegram", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("ACCEPTED")) } }, async ({ sent }) => {
+  await post(failedBody());
+  const r = await post(filledBody());
+  assert.equal(r.statusCode, 409);
+  assert.equal(r.body.error, "CONTRADICTORY_REPORT");
+  assert.match(sent[1], /CONTRADICTORY/);
+}));
+
+for (const [name, body] of [
+  ["ENTRY_FILLED wrong tradeId", () => filledBody({ tradeId: "ft-other" })],
+  ["ENTRY_FAILED wrong tradeId", () => failedBody({ tradeId: "ft-other" })],
+  ["ENTRY_FILLED without tradeId", () => filledBody({ tradeId: undefined })],
+  ["ENTRY_FAILED without tradeId", () => failedBody({ tradeId: undefined })],
+]) {
+  test(`${name}: 409, no state change`, bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("ACCEPTED")) } }, async ({ redis, sent }) => {
+    const before = redis.store[KEY];
+    const r = await post(body());
+    assert.equal(r.statusCode, 409);
+    assert.equal(redis.store[KEY], before);
+    assert.deepEqual(redis.lists, {});
+    assert.equal(sent.length, 0);
+  }));
+}
+
+test("ENTRY_FILLED / ENTRY_FAILED need the webhook secret", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("ACCEPTED")) } }, async ({ redis }) => {
+  const before = redis.store[KEY];
+  assert.equal((await post(filledBody({ secret: "wrong" }))).statusCode, 401);
+  assert.equal((await post(failedBody({ secret: undefined }))).statusCode, 401);
+  assert.equal(redis.store[KEY], before);
+}));
+
+test("ENTRY_FILLED / ENTRY_FAILED on a paper trade: 409", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("ACCEPTED", { execution: undefined })) } }, async ({ redis }) => {
+  const before = redis.store[KEY];
+  assert.equal((await post(filledBody())).statusCode, 409);
+  assert.equal((await post(failedBody())).statusCode, 409);
+  assert.equal(redis.store[KEY], before);
+}));
+
+test("FILLED trade is Algo-owned: auto-lifecycle skips it, exits need the matching tradeId", bridgeCase({ initial: { [KEY]: JSON.stringify(ownedTrade("FILLED")) } }, async ({ redis }) => {
+  assert.equal(await webhook.evaluateActiveTradeLifecycle(25100, 25100, 25100, redis), null);
+  assert.ok(stored(redis));
+  assert.equal((await post({ secret: SECRET, grade: "STOP_LOSS_HIT", close: 25025 })).statusCode, 409);
+  assert.equal((await post(exitBody("STOP_LOSS_HIT", { tradeId: "ft-owned-1" }))).statusCode, 200);
+  assert.equal(stored(redis), null);
+}));
+
+test("end-to-end v1.1: accepted -> ENTRY_FILLED -> Algo T2 closes it", bridgeCase({ env: BRIDGE_ON }, async ({ redis, sent }) => {
+  const res = await post(bearAlert());
+  const id = res.body.fusedVerdict.tradeId;
+  assert.equal(stored(redis).execution.status, "ACCEPTED");
+  assert.equal((await post(filledBody({ tradeId: id }))).statusCode, 200);
+  assert.equal(stored(redis).execution.status, "FILLED");
+  assert.equal((await post(exitBody("TARGET_2_HIT", { tradeId: id, spot: 24830 }))).statusCode, 200);
+  assert.equal(stored(redis), null);
+  assert.match(sent[0], /AWAITING FILL/);
+  assert.match(sent[1], /ENTRY FILLED/);
+}));
+
+// Stuck-ACCEPTED guard
+const acceptedAgo = (sec) => ownedTrade("ACCEPTED", { execution: { status: "ACCEPTED", mode: "live", orderRef: "ORD-9", at: new Date(Date.now() - sec * 1000).toISOString() } });
+
+test("stuck ACCEPTED: one Telegram across repeated lifecycle checks and webhooks, state untouched", bridgeCase({ env: BRIDGE_ON, initial: { [KEY]: JSON.stringify(acceptedAgo(300)) } }, async ({ redis, sent, calls }) => {
+  const before = redis.store[KEY];
+  assert.equal(await webhook.evaluateActiveTradeLifecycle(24950, 24950, 24950, redis), null);
+  await webhook.evaluateActiveTradeLifecycle(24950, 24950, 24950, redis);
+  const blocked = await post(bearAlert());
+  assert.equal(blocked.body.decision, "BLOCKED_BY_ACTIVE_TRADE");
+  await get({ spot: "24950" });
+  const stuck = sent.filter((t) => /NO FILL REPORT FROM ALGO/.test(t));
+  assert.equal(stuck.length, 1, "exactly one alert");
+  assert.ok(stuck[0].includes("ft-owned-1"));
+  assert.equal(redis.store[KEY], before, "state left alone");
+  assert.ok(redis.store["nifty:tv:bridge:stuck_alert:ft-owned-1"], "dedupe marker set");
+  assert.equal(calls.length, 0);
+}));
+
+test("stuck guard: quiet within FLOW_BRIDGE_FILL_WAIT_SEC, and for FILLED / UNKNOWN / PENDING", bridgeCase({ env: { FLOW_BRIDGE_FILL_WAIT_SEC: "600" }, initial: { [KEY]: JSON.stringify(acceptedAgo(300)) } }, async ({ redis, sent }) => {
+  await webhook.evaluateActiveTradeLifecycle(24950, 24950, 24950, redis);
+  assert.equal(sent.length, 0, "300s < 600s");
+  for (const status of ["FILLED", "UNKNOWN", "PENDING"]) {
+    redis.store[KEY] = JSON.stringify(ownedTrade(status, { execution: { status, at: new Date(Date.now() - 3600_000).toISOString() } }));
+    await webhook.evaluateActiveTradeLifecycle(24950, 24950, 24950, redis);
+  }
+  assert.equal(sent.length, 0);
+}));
+
+test("stuck guard default wait is 120s", () => {
+  assert.equal(bridge.getFillWaitSec({}), 120);
+  const now = Date.now();
+  const t = (sec) => ({ active: true, execution: { status: "ACCEPTED", at: new Date(now - sec * 1000).toISOString() } });
+  assert.equal(bridge.isStuckAccepted(t(100), now, 120), false);
+  assert.equal(bridge.isStuckAccepted(t(121), now, 120), true);
+});

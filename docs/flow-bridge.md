@@ -1,8 +1,25 @@
-# Flow execution bridge (scanner side, contract v1)
+# Flow execution bridge (scanner side, contract v1.1)
 
 The scanner (`api/tv-webhook.js`) can send approved flow signals to the external execution
-engine ("the Algo") as signed `FLOW_ENTRY` instructions. The Algo places at most **1 lot** and
-reports exits back. Code: `src/flowBridge.js` (dispatcher), wiring in `api/tv-webhook.js`,
+engine ("the Algo") as signed `FLOW_ENTRY` instructions. The Algo places at most **1 lot**.
+
+In v1.1 the Algo acknowledges at once (`accepted` means validated and queued, **not** filled) and
+executes in the background. It then reports the entry outcome (`ENTRY_FILLED` or `ENTRY_FAILED`)
+and later the exits, all through sync-back.
+
+### Trade states (`execution.status`)
+
+```
+PENDING ──accepted──▶ ACCEPTED ──ENTRY_FILLED──▶ FILLED ──exit sync-back──▶ (closed)
+   │                     │  └──ENTRY_FAILED──▶ NOT_EXECUTED (lock released)
+   │                     └─ no report > FLOW_BRIDGE_FILL_WAIT_SEC ⇒ one "no fill report" Telegram
+   ├──rejected/duplicate──▶ NOT_EXECUTED (lock released)
+   └──timeout/5xx/…──▶ UNKNOWN ──ENTRY_FILLED──▶ FILLED   (or ENTRY_FAILED ⇒ NOT_EXECUTED)
+```
+
+`PENDING`, `ACCEPTED`, `UNKNOWN` and `FILLED` are **Algo-owned**:
+- the auto-lifecycle never touches them;
+- exits must carry the matching `tradeId`. Code: `src/flowBridge.js` (dispatcher), wiring in `api/tv-webhook.js`,
 tests in `test/flowBridge.test.js`.
 
 ## Turning it off instantly
@@ -24,6 +41,7 @@ by hand once you have checked the broker:
 | `FLOW_BRIDGE_SECRET` | HMAC key shared with the Algo. Required. |
 | `FLOW_BRIDGE_DECISIONS` | Comma-separated decision allow-list. Default `EXECUTE_TIER1_SCOUT,EXECUTE_HIGH_CONVICTION_SYNERGY`. |
 | `FLOW_BRIDGE_TIMEOUT_MS` | Upper bound for the dispatch call. Default 3000, clamped to 1000..5000. |
+| `FLOW_BRIDGE_FILL_WAIT_SEC` | Seconds an `ACCEPTED` trade may wait for ENTRY_FILLED or ENTRY_FAILED before the one-time "no fill report" alert. Default 120. |
 | `TV_WEBHOOK_SECRET` | Existing secret. The Algo's sync-back must carry it. |
 
 The bridge is enabled only when the flag is `true` **and** both the URL and the secret are set.
@@ -65,7 +83,7 @@ HTTP 200 with `{ "status":"accepted"|"rejected"|"duplicate", "reason":…, "mode
 
 | Algo result | Stored `execution` | Lock | Telegram |
 |---|---|---|---|
-| `accepted` | `{status:"ACCEPTED", mode, orderRef, at, dispatchMs}` | held, normal TTL | "ALGO ACCEPTED · 1 LOT" |
+| `accepted` | `{status:"ACCEPTED", mode, orderRef, at, dispatchMs}` | held, normal TTL | "SENT TO ALGO · AWAITING FILL (1 LOT)" (not "executed") |
 | `rejected` / `duplicate` | `{status:"NOT_EXECUTED", outcome, reason, mode, orderRef, at}` | **released** | "APPROVED BUT NOT EXECUTED" + reason |
 | non-200, timeout, network error, non-JSON, unknown `status` | `{status:"UNKNOWN", error, httpStatus, timeoutMs, at}` | held **with no expiry** | "ALGO OUTCOME UNKNOWN — CHECK YOUR BROKER NOW" |
 
@@ -95,7 +113,7 @@ trade id and send no dispatch.
   `TIME_STOP_EXIT`, `MANUAL_CLOSE`) that carries `tradeId` must match the active trade's id.
   Otherwise it gets **409** `{ok:false, error:"TRADE_ID_MISMATCH"}`, a log line, and no state
   change.
-- A **bridge-owned** trade (`execution.status` PENDING, ACCEPTED or UNKNOWN) is exited only by an
+- A **bridge-owned** trade (`execution.status` PENDING, ACCEPTED, UNKNOWN or FILLED) is exited only by an
   exit with its matching `tradeId`. TradingView exits without a `tradeId` get 409. The same rule
   applies to `GET ?close_trade=1`, which takes `&tradeId=`.
 - `evaluateActiveTradeLifecycle` (GET `?spot=` and the `nifty-oi` hook) skips bridge-owned trades
@@ -126,7 +144,42 @@ Final accepted fields:
   trade's T1, T2 or entry, as before.
 - Exit and T1 archive records carry `sync: {source, tradeId, spot, optionFill, lots, mode, t}`.
 - `TARGET_1_HIT` keeps the trade open, sets `hitT1` and moves SL to cost.
-- A matching `TARGET_1_HIT` on an `UNKNOWN` trade turns it into `ACCEPTED` (`resolvedBy:"sync-back"`).
+- A matching `TARGET_1_HIT` on a `PENDING`, `ACCEPTED` or `UNKNOWN` trade turns it into `FILLED`
+  (`resolvedBy:"sync-back"`), since a T1 proves a filled position.
+
+### Entry outcome sync-back (v1.1)
+
+Same endpoint and auth as exits. A `tradeId` matching the open trade is **required**.
+
+| Grade | Body | Valid from | Effect |
+|---|---|---|---|
+| `ENTRY_FILLED` | `{grade, tradeId, source:"algo", spot, optionFill, contract, lots, mode, t}` | PENDING, ACCEPTED, UNKNOWN | `execution` becomes `{status:"FILLED", previousStatus, optionFill, contract, mode, lots, fillSpot, filledAt}`. `filledAt` comes from `t`, else now. The lock is kept with the trade TTL. The record is archived and Telegram "ENTRY FILLED BY ALGO" is sent with the contract and fill. |
+| `ENTRY_FAILED` | `{grade, tradeId, source:"algo", reason, mode, t}` | PENDING, ACCEPTED, UNKNOWN | `execution` becomes `{status:"NOT_EXECUTED", outcome:"ENTRY_FAILED", reason, mode}`. The lock is **released** and a marker `nifty:tv:bridge:failed:<id>` is kept for 7 d. The record is archived and Telegram "APPROVED BUT NOT EXECUTED" is sent with the reason. |
+
+The response is `200 {ok:true, event, tradeId, execution}`. Other cases:
+
+| Situation | Response |
+|---|---|
+| Repeat `ENTRY_FILLED` on a FILLED trade | 200 `{duplicate:true}`, no change, no Telegram |
+| Repeat `ENTRY_FAILED` (failed marker exists) | 200 `{duplicate:true}`, no change, no Telegram |
+| Missing `tradeId` | 409 `TRADE_ID_REQUIRED` |
+| `tradeId` doesn't match the open trade | 409 `TRADE_ID_MISMATCH` |
+| Report on a paper trade | 409 `INVALID_TRANSITION` |
+| `ENTRY_FAILED` on a FILLED trade | 409 `CONTRADICTORY_REPORT` + loud Telegram, state unchanged |
+| `ENTRY_FILLED` after `ENTRY_FAILED` released the lock | 409 `CONTRADICTORY_REPORT` + loud Telegram ("scanner is NOT tracking this position") |
+| Redis not configured or unreadable | 503 `REDIS_UNAVAILABLE` |
+
+### Stuck-ACCEPTED guard
+
+A trade can stay `ACCEPTED` with no ENTRY_FILLED or ENTRY_FAILED for longer than
+`FLOW_BRIDGE_FILL_WAIT_SEC` (default 120 s, measured from `execution.at`). When that happens, the
+next place that already inspects the open trade sends **one** Telegram, "NO FILL REPORT FROM ALGO —
+CHECK THE BROKER". Those places are:
+- `evaluateActiveTradeLifecycle`, which runs from the `nifty-oi` refresh and from GET `?spot=`;
+- an actionable webhook that is blocked by the trade.
+
+The alert is deduped with `SET NX` on `nifty:tv:bridge:stuck_alert:<id>` (7 d). State is never
+changed, and no scheduler was added. The alert fires only when one of those code paths runs.
 - Full exits delete the trade.
 - P&L is still computed in spot points by the existing formulas.
 

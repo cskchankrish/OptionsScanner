@@ -36,6 +36,10 @@ import {
   computeDispatchTimeoutMs,
   newTradeId as defaultNewTradeId,
   isBridgeOwned,
+  ENTRY_REPORTABLE_STATUSES,
+  ENTRY_SYNC_GRADES,
+  getFillWaitSec,
+  isStuckAccepted,
 } from "../src/flowBridge.js";
 
 export const ACTIVE_TRADE_KEY = "nifty:tv:active_trade";
@@ -1019,7 +1023,9 @@ export function describeExecution(ex) {
   if (!ex) return "n/a";
   switch (ex.status) {
     case "ACCEPTED":
-      return `✅ ACCEPTED by Algo · mode \`${mdSafe(ex.mode || "?")}\` · orderRef \`${mdSafe(ex.orderRef || "none")}\` · 1 lot`;
+      return `📨 sent to Algo, awaiting fill · mode \`${mdSafe(ex.mode || "?")}\` · orderRef \`${mdSafe(ex.orderRef || "none")}\` · 1 lot`;
+    case "FILLED":
+      return `✅ FILLED by Algo · \`${mdSafe(ex.contract || "?")}\` @ \`${mdSafe(ex.optionFill ?? "?")}\` · mode \`${mdSafe(ex.mode || "?")}\``;
     case "NOT_EXECUTED":
       return `⚠️ NOT EXECUTED (${mdSafe(ex.outcome || "skipped")}): ${mdSafe(ex.reason || "no reason given")}`;
     case "UNKNOWN":
@@ -1099,9 +1105,10 @@ async function runBridgeDispatch({ redis, config, fused, activeData, activeTtl, 
   let text;
   if (execution.status === "ACCEPTED") {
     text = [
-      `🤖✅ *ALGO ACCEPTED · 1 LOT* · ${head}`,
+      `🤖📨 *SENT TO ALGO · AWAITING FILL (1 LOT)* · ${head}`,
       `• *Mode:* \`${mdSafe(execution.mode || "?")}\` | *Order Ref:* \`${mdSafe(execution.orderRef || "none")}\``,
       `• *Levels (spot):* SL \`${fused.stopLoss}\` | T1 \`${fused.target1Price}\` | T2 \`${fused.target2Price}\``,
+      `• Accepted = validated and queued, NOT yet filled. A fill/fail report from the Algo follows.`,
       `• Exits now come from the Algo's sync-back; the scanner will not auto-manage this trade.`,
     ].join("\n");
   } else if (execution.status === "NOT_EXECUTED") {
@@ -1127,6 +1134,181 @@ async function runBridgeDispatch({ redis, config, fused, activeData, activeTtl, 
     console.error("[flow-bridge] Telegram send failed:", e?.message);
   }
   return execution;
+}
+
+export const BRIDGE_FAILED_PREFIX = "nifty:tv:bridge:failed:";
+export const BRIDGE_STUCK_ALERT_PREFIX = "nifty:tv:bridge:stuck_alert:";
+const BRIDGE_MARKER_TTL_SEC = 7 * 86400;
+
+function tradeTtlSec(t) {
+  const isHtf = t?.timeframe === "125" || t?.timeframe === "D" || Number(t?.timeframe) >= 60 || t?.grade?.includes("SYNERGY");
+  return isHtf ? 604800 : 28800;
+}
+
+/**
+ * Stuck-ACCEPTED guard: a trade still ACCEPTED (no ENTRY_FILLED / ENTRY_FAILED) more than
+ * FLOW_BRIDGE_FILL_WAIT_SEC after acceptance triggers ONE Telegram (deduped with SET NX per trade
+ * id). State is never changed. Never throws.
+ */
+export async function checkStuckAcceptedTrade(redis, trade, deps = getWebhookDeps()) {
+  try {
+    const waitSec = getFillWaitSec();
+    if (!redis || !isStuckAccepted(trade, deps.now(), waitSec)) return false;
+    const r = await redis.set(
+      BRIDGE_STUCK_ALERT_PREFIX + trade.id,
+      JSON.stringify({ at: new Date(deps.now()).toISOString() }),
+      { nx: true, ex: BRIDGE_MARKER_TTL_SEC }
+    );
+    if (r !== "OK") return false;
+    const ageSec = Math.round((deps.now() - Date.parse(trade.execution.at)) / 1000);
+    await deps.sendText([
+      `🚨 *NO FILL REPORT FROM ALGO — CHECK THE BROKER* 🚨`,
+      `• \`${trade.grade}\` ${trade.direction} @ \`${trade.entryPrice}\` · Trade ID \`${trade.id}\``,
+      `• Accepted ${ageSec}s ago (limit ${waitSec}s) with no ENTRY\\_FILLED / ENTRY\\_FAILED report.`,
+      `• Position stays LOCKED; the scanner changes nothing. This alert is sent once.`,
+    ].join("\n"));
+    return true;
+  } catch (e) {
+    console.error("[flow-bridge] stuck-accepted check failed:", e?.message);
+    return false;
+  }
+}
+
+/**
+ * ENTRY_FILLED / ENTRY_FAILED sync-back (contract v1.1). Requires a tradeId matching the open
+ * trade; repeats are 200 no-ops; ENTRY_FAILED after FILLED (or FILLED after a FAILED) is a 409
+ * with a loud Telegram.
+ */
+async function handleEntrySync({ redis, payload, res }) {
+  const deps = getWebhookDeps();
+  const grade = payload.grade;
+  const tradeId = payload.tradeId === undefined || payload.tradeId === null ? "" : String(payload.tradeId);
+  const reject = (status, error, detail) => {
+    console.warn(`[tv-webhook] ${grade} rejected (${status}): ${detail}`);
+    return res.status(status).json({ ok: false, error, detail });
+  };
+  if (!tradeId) return reject(409, "TRADE_ID_REQUIRED", `${grade} must carry the tradeId from FLOW_ENTRY`);
+  if (!redis) return reject(503, "REDIS_UNAVAILABLE", "Redis not configured; cannot apply entry report");
+
+  let activeTrade = null;
+  try {
+    activeTrade = parseMaybeJson(await redis.get(ACTIVE_TRADE_KEY));
+  } catch (e) {
+    return reject(503, "REDIS_UNAVAILABLE", `could not read the active trade: ${e?.message}`);
+  }
+  const nowIso = new Date(deps.now()).toISOString();
+  const nowIst = new Date(deps.now()).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
+  const sync = {
+    source: payload.source ?? null,
+    tradeId,
+    spot: payload.spot ?? null,
+    optionFill: payload.optionFill ?? null,
+    contract: payload.contract ?? null,
+    lots: payload.lots ?? null,
+    mode: payload.mode ?? null,
+    reason: payload.reason ?? null,
+    t: payload.t ?? null,
+  };
+  const loud = async (text) => {
+    try { await deps.sendText(text); } catch (e) {}
+  };
+
+  if (!activeTrade || String(activeTrade.id || "") !== tradeId) {
+    let failed = null;
+    try { failed = parseMaybeJson(await redis.get(BRIDGE_FAILED_PREFIX + tradeId)); } catch (e) {}
+    if (failed && grade === "ENTRY_FAILED") {
+      return res.status(200).json({ ok: true, event: "ENTRY_FAILED", duplicate: true, tradeId });
+    }
+    if (failed && grade === "ENTRY_FILLED") {
+      await loud([
+        `🚨🚨 *CONTRADICTORY ALGO REPORTS — CHECK YOUR BROKER NOW* 🚨🚨`,
+        `• Trade ID \`${tradeId}\` was reported *ENTRY\\_FAILED* (lock released) but is now reported *FILLED*`,
+        `• Contract \`${mdSafe(sync.contract || "?")}\` @ \`${mdSafe(sync.optionFill ?? "?")}\` · mode \`${mdSafe(sync.mode || "?")}\``,
+        `• The scanner is NOT tracking this position. Manage it at the broker.`,
+      ].join("\n"));
+      return reject(409, "CONTRADICTORY_REPORT", `trade ${tradeId} already failed; FILLED report rejected`);
+    }
+    return reject(409, "TRADE_ID_MISMATCH", activeTrade
+      ? `tradeId ${tradeId} does not match the active trade (${activeTrade.id || "no id"})`
+      : `tradeId ${tradeId} does not match: no active trade`);
+  }
+
+  const ex = activeTrade.execution || null;
+  const status = ex?.status || null;
+  const head = `\`${activeTrade.grade}\` ${activeTrade.direction} @ \`${activeTrade.entryPrice}\` · Trade ID \`${tradeId}\``;
+
+  if (grade === "ENTRY_FILLED") {
+    if (status === "FILLED") return res.status(200).json({ ok: true, event: "ENTRY_FILLED", duplicate: true, tradeId });
+    if (!ENTRY_REPORTABLE_STATUSES.includes(status)) {
+      return reject(409, "INVALID_TRANSITION", `trade ${tradeId} is ${status || "a paper trade"}; ENTRY_FILLED not applicable`);
+    }
+    const filledAtMs = Number.isFinite(Number(payload.t)) && Number(payload.t) > 0 ? Number(payload.t) : deps.now();
+    activeTrade.execution = {
+      ...ex,
+      status: "FILLED",
+      previousStatus: status,
+      optionFill: sync.optionFill,
+      contract: sync.contract,
+      mode: sync.mode ?? ex.mode ?? null,
+      lots: sync.lots,
+      fillSpot: sync.spot,
+      filledAt: new Date(filledAtMs).toISOString(),
+    };
+    await redis.set(ACTIVE_TRADE_KEY, JSON.stringify(activeTrade), { ex: tradeTtlSec(activeTrade) });
+    const record = {
+      type: "ENTRY_FILLED", timestamp: nowIso, istTime: nowIst, trade: activeTrade, decision: "ENTRY_FILLED",
+      recommendedLots: 0, sync,
+      reasoning: `Algo filled ${sync.contract || "?"} @ ${sync.optionFill ?? "?"} (spot ${sync.spot ?? "?"}, mode ${sync.mode || "?"}).`,
+    };
+    try { await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(record)); } catch (e) {}
+    await loud([
+      `🤖✅ *ENTRY FILLED BY ALGO* · ${head}`,
+      `• *Contract:* \`${mdSafe(sync.contract || "?")}\` | *Fill:* \`${mdSafe(sync.optionFill ?? "?")}\` | *Spot:* \`${mdSafe(sync.spot ?? "?")}\``,
+      `• *Lots:* \`${mdSafe(sync.lots ?? "?")}\` | *Mode:* \`${mdSafe(sync.mode || "?")}\``,
+    ].join("\n"));
+    return res.status(200).json({ ok: true, event: "ENTRY_FILLED", tradeId, execution: activeTrade.execution });
+  }
+
+  // ENTRY_FAILED
+  if (status === "FILLED") {
+    await loud([
+      `🚨🚨 *CONTRADICTORY ALGO REPORTS — CHECK YOUR BROKER NOW* 🚨🚨`,
+      `• ${head}`,
+      `• Already reported *FILLED* (\`${mdSafe(ex.contract || "?")}\` @ \`${mdSafe(ex.optionFill ?? "?")}\`), now reported *ENTRY\\_FAILED*: ${mdSafe(sync.reason || "no reason")}`,
+      `• State NOT changed: the position stays open and locked.`,
+    ].join("\n"));
+    return reject(409, "CONTRADICTORY_REPORT", `trade ${tradeId} is FILLED; ENTRY_FAILED rejected`);
+  }
+  if (!ENTRY_REPORTABLE_STATUSES.includes(status)) {
+    return reject(409, "INVALID_TRANSITION", `trade ${tradeId} is ${status || "a paper trade"}; ENTRY_FAILED not applicable`);
+  }
+  activeTrade.execution = {
+    ...ex,
+    status: "NOT_EXECUTED",
+    previousStatus: status,
+    outcome: "ENTRY_FAILED",
+    reason: sync.reason,
+    mode: sync.mode ?? ex.mode ?? null,
+    at: nowIso,
+  };
+  activeTrade.active = false;
+  try {
+    await redis.set(BRIDGE_FAILED_PREFIX + tradeId, JSON.stringify({ reason: sync.reason, at: nowIso }), { ex: BRIDGE_MARKER_TTL_SEC });
+  } catch (e) {}
+  await releaseActiveTradeIfOwned(redis, tradeId);
+  const record = {
+    type: "ENTRY_FAILED", timestamp: nowIso, istTime: nowIst, trade: activeTrade, decision: "NOT_EXECUTED",
+    recommendedLots: 0, sync,
+    reasoning: `Algo reported entry failed: ${sync.reason || "no reason given"}. Position lock released.`,
+  };
+  try { await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(record)); } catch (e) {}
+  await loud([
+    `⚠️ *APPROVED BUT NOT EXECUTED* · ${head}`,
+    `• *Algo said:* \`ENTRY_FAILED\`${sync.mode ? ` (mode \`${mdSafe(sync.mode)}\`)` : ""}`,
+    `• *Reason:* ${mdSafe(sync.reason || "no reason given")}`,
+    `• Position lock released — the next signal can be taken.`,
+  ].join("\n"));
+  return res.status(200).json({ ok: true, event: "ENTRY_FAILED", tradeId, execution: activeTrade.execution });
 }
 
 /**
@@ -1167,7 +1349,10 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
   if (!activeTrade || !activeTrade.active) return null;
   // A bridge-owned trade (sent to the Algo) is driven only by the Algo's sync-back exits:
   // never auto-scale or auto-close it from scanner prices.
-  if (isBridgeOwned(activeTrade)) return null;
+  if (isBridgeOwned(activeTrade)) {
+    await checkStuckAcceptedTrade(redis, activeTrade);
+    return null;
+  }
 
   const spot = Number(currentSpot);
   if (!spot || isNaN(spot)) return null;
@@ -1604,6 +1789,11 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid JSON payload" });
     }
 
+    // 1a. Algo entry outcome sync-back (contract v1.1): ENTRY_FILLED / ENTRY_FAILED.
+    if (ENTRY_SYNC_GRADES.includes(payload?.grade)) {
+      return await handleEntrySync({ redis, payload, res });
+    }
+
     // 1b. Handle Trade Exit / T1 Scale-Out Webhooks directly from TradingView or Execution Bridge
     const exitGrades = ["TARGET_1_HIT", "TARGET_2_HIT", "BREAKEVEN_STOP", "STOP_LOSS_HIT", "TIME_STOP_EXIT", "MANUAL_CLOSE"];
     if (exitGrades.includes(payload?.grade)) {
@@ -1648,9 +1838,10 @@ export default async function handler(req, res) {
       if (payload.grade === "TARGET_1_HIT") {
         if (activeTrade) {
           if (sync) activeTrade.lastSync = { grade: payload.grade, ...sync };
-          // An Algo sync-back for this exact trade proves the Algo holds it: resolve UNKNOWN.
-          if (sync?.tradeId && activeTrade.execution?.status === "UNKNOWN") {
-            activeTrade.execution = { ...activeTrade.execution, status: "ACCEPTED", mode: sync.mode ?? activeTrade.execution.mode ?? null, resolvedBy: "sync-back", resolvedAt: nowIso };
+          // A T1 sync-back for this exact trade proves the Algo holds a filled position: resolve
+          // PENDING / ACCEPTED / UNKNOWN to FILLED (otherwise the stuck-ACCEPTED guard would fire).
+          if (sync?.tradeId && ENTRY_REPORTABLE_STATUSES.includes(activeTrade.execution?.status)) {
+            activeTrade.execution = { ...activeTrade.execution, status: "FILLED", previousStatus: activeTrade.execution.status, mode: sync.mode ?? activeTrade.execution.mode ?? null, resolvedBy: "sync-back", resolvedAt: nowIso };
           }
           activeTrade.hitT1 = true;
           activeTrade.t1HitTime = nowIst;
@@ -1839,6 +2030,7 @@ export default async function handler(req, res) {
       };
 
       if (activeTrade && activeTrade.active) {
+        if (isBridgeOwned(activeTrade)) await checkStuckAcceptedTrade(redis, activeTrade, deps);
         blockAsActive(activeTrade);
       } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
         const isHtf = fusedVerdict.timeframe === "125" || fusedVerdict.timeframe === "D" || Number(fusedVerdict.timeframe) >= 60 || fusedVerdict.grade?.includes("SYNERGY");
