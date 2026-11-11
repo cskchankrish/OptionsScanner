@@ -2776,7 +2776,8 @@ export async function refreshLiveSnapshot({
       intradayQuadrant,
       mode: getFusionQuadrantMode(),
     });
-    // Publish the quadrant fusion actually used (intraday when available, else day) so timeline
+    // Publish the quadrant fusion actually used (day by default; intraday only when
+    // FUSION_QUADRANT_MODE=intraday and the window is available) so timeline
     // ticks (futQuadrant), futures.quadrant and the webhook's futures veto agree, and expose both.
     if (futuresMetrics && fusion?.quadrantInfo?.quadrant) {
       futuresMetrics.quadrant = fusion.quadrantInfo.quadrant;
@@ -2785,6 +2786,8 @@ export async function refreshLiveSnapshot({
       futuresMetrics.quadrantSourceReason = fusion.quadrantSourceReason;
       futuresMetrics.quadrantDay = fusion.quadrantDay;
       futuresMetrics.quadrantIntraday = fusion.quadrantIntraday;
+      futuresMetrics.quadrantIntradayInformational = fusion.quadrantIntradayInformational;
+      futuresMetrics.quadrantIntradayInfoLabel = fusion.quadrantIntradayInfoLabel;
     }
     // A floor/roof "shift" right after the 15:30 auction print is the corridor re-centring on
     // the auction close, not price action; say so.

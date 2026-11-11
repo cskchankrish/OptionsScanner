@@ -66,7 +66,7 @@ test("intraday quadrant: the current (not yet appended) reading replaces same-mi
   assert.equal(q.end.futPrice, 25100);
 });
 
-test("fusion quadrant selection: intraday when available, day fallback, FUSION_QUADRANT_MODE=day reverts", () => {
+test("fusion quadrant selection: day by default; FUSION_QUADRANT_MODE=intraday opts in, with day fallback", () => {
   const fut = { ...FIXTURE.futures, priceChangeBase: "PREV_CLOSE" };
   const iq = classifyIntradayFuturesQuadrant(upTo("15:13"));
   assert.equal(iq.quadrant, "SHORT_BUILDUP");
@@ -80,7 +80,20 @@ test("fusion quadrant selection: intraday when available, day fallback, FUSION_Q
   const dayMode = selectFusionQuadrant(fut, iq, "day");
   assert.equal(dayMode.quadrantSource, "DAY");
   assert.equal(dayMode.quadrantInfo.quadrant, "SHORT_COVERING");
-  assert.match(dayMode.quadrantSourceReason, /FUSION_QUADRANT_MODE=day/);
+  assert.match(dayMode.quadrantSourceReason, /default whole-day quadrant/);
+  // the rolling window is still exposed, as information only
+  assert.equal(dayMode.quadrantIntraday.quadrant, "SHORT_BUILDUP");
+  assert.equal(dayMode.quadrantIntradayInformational, true);
+  assert.match(dayMode.quadrantIntradayInfoLabel, /last 30 min, informational: SHORT_BUILDUP/);
+  // with no mode argument and no env, the default is day
+  const prev = process.env.FUSION_QUADRANT_MODE;
+  delete process.env.FUSION_QUADRANT_MODE;
+  try {
+    assert.equal(selectFusionQuadrant(fut, iq).quadrantSource, "DAY");
+    assert.equal(evaluateSmartMoneyFusion(fut, { deltaPcr: 0.66, pcr: 0.77 }, { intradayQuadrant: iq }).quadrantSource, "DAY");
+  } finally {
+    if (prev !== undefined) process.env.FUSION_QUADRANT_MODE = prev;
+  }
 
   const fallback = selectFusionQuadrant(fut, { available: false, reason: "only 1 futures tick(s) in the window (< 3)" }, "intraday");
   assert.equal(fallback.quadrantSource, "DAY");
@@ -99,11 +112,11 @@ test("env: FUSION_QUADRANT_MODE and FUSION_INTRADAY_WINDOW_MINS", () => {
   const prevWin = process.env.FUSION_INTRADAY_WINDOW_MINS;
   try {
     delete process.env.FUSION_QUADRANT_MODE;
+    assert.equal(getFusionQuadrantMode(), "day", "default is the whole-day quadrant");
+    process.env.FUSION_QUADRANT_MODE = "intraday";
     assert.equal(getFusionQuadrantMode(), "intraday");
-    process.env.FUSION_QUADRANT_MODE = "day";
-    assert.equal(getFusionQuadrantMode(), "day");
     process.env.FUSION_QUADRANT_MODE = "garbage";
-    assert.equal(getFusionQuadrantMode(), "intraday");
+    assert.equal(getFusionQuadrantMode(), "day");
     delete process.env.FUSION_INTRADAY_WINDOW_MINS;
     assert.equal(getIntradayQuadrantWindowMins(), 30);
     process.env.FUSION_INTRADAY_WINDOW_MINS = "45";
@@ -116,7 +129,24 @@ test("env: FUSION_QUADRANT_MODE and FUSION_INTRADAY_WINDOW_MINS", () => {
   }
 });
 
-test("webhook: futures.quadrant (the selected one) drives the veto and its source is reported", () => {
+test("webhook: day-mode quadrant drives the veto; the 30m quadrant is informational only", () => {
+  const base = { corridor: { deltaPCR: 0.5, floorStrike: 24990, roofStrike: 25300 } };
+  const intra = { available: true, quadrant: "SHORT_BUILDUP", windowMins: 30, window: "14:33→15:13" };
+  // Day quadrant LONG_BUILDUP, intraday SHORT_BUILDUP: the intraday one must not veto.
+  const fused = fuseChartWithOptionChain({ grade: "BEAR_TRAP_BUY", dir: "LONG", close: 25000 },
+    { ...base, futures: { quadrant: "LONG_BUILDUP", quadrantSource: "DAY", quadrantSourceLabel: "day vs previous close", quadrantIntraday: intra } });
+  assert.notEqual(fused.decision, "VETO_SIGNAL");
+  assert.equal(fused.liveOptionChainMetrics.liveFutQuad, "LONG_BUILDUP");
+  assert.equal(fused.liveOptionChainMetrics.intradayFutQuadInformational, "SHORT_BUILDUP");
+  assert.match(fused.reasoning, /Last 30 min futures \(informational, not used for this decision\): SHORT_BUILDUP/);
+  // Same signal and day quadrant without the intraday info: identical decision and sizing.
+  const plain = fuseChartWithOptionChain({ grade: "BEAR_TRAP_BUY", dir: "LONG", close: 25000 },
+    { ...base, futures: { quadrant: "LONG_BUILDUP", quadrantSource: "DAY" } });
+  assert.equal(plain.decision, fused.decision);
+  assert.equal(plain.recommendedLots, fused.recommendedLots);
+});
+
+test("webhook (opt-in intraday mode): futures.quadrant drives the veto and its source is reported", () => {
   const scanner = {
     corridor: { deltaPCR: 0.5, floorStrike: 24990, roofStrike: 25300 },
     futures: { quadrant: "SHORT_BUILDUP", quadrantSource: "INTRADAY", quadrantSourceLabel: "30m intraday 14:33→15:13" },
@@ -334,14 +364,11 @@ test("11-Nov regression: no '30-min macro bull trap' is manufactured from the fr
   assert.equal(close.priceSource, "FUTURES");
 });
 
-test("11-Nov regression: closing flow is UNWINDING-driven with both legs quoted; EOD audit shows each group once", () => {
+function closeReadings(mode) {
   const iq = classifyIntradayFuturesQuadrant(TL);
   const fusion = evaluateSmartMoneyFusion({ ...FIXTURE.futures, priceChangeBase: "PREV_CLOSE" },
     { deltaPcr: FIXTURE.deltaPcr, pcr: FIXTURE.pcr, totalPutWriting: FIXTURE.totalPutWriting, totalCallWriting: FIXTURE.totalCallWriting },
-    { intradayQuadrant: iq, mode: "intraday" });
-  assert.equal(fusion.scenarioId, "MIXED_FLOW", "no bull trap from a whole-day 'price up' label");
-  assert.equal(fusion.quadrantSource, "INTRADAY");
-
+    { intradayQuadrant: iq, mode });
   const macroTurn = detectMacroTurn({ timeline: TL, spot: FIXTURE.spotPrice, floorStrike: FIXTURE.floor, roofStrike: FIXTURE.roof });
   const eod = calculateEODDecision({
     spot: FIXTURE.spotPrice, floorStrike: FIXTURE.floor, roofStrike: FIXTURE.roof,
@@ -349,6 +376,36 @@ test("11-Nov regression: closing flow is UNWINDING-driven with both legs quoted;
     pcr: FIXTURE.pcr, deltaPcr: FIXTURE.deltaPcr, timeline: TL, dayOfWeek: 3, nowMins: 936,
     fusion, futuresQuadrant: fusion.quadrantInfo, futuresMetrics: FIXTURE.futures, macroTurn,
   });
+  return { fusion, eod };
+}
+
+test("11-Nov regression (default day mode): fusion as before, closing flow UNWINDING-driven, each EOD group once", () => {
+  const { fusion, eod } = closeReadings("day");
+  assert.equal(fusion.scenarioId, "BULL_TRAP", "day quadrant SHORT_COVERING + ΔPCR 0.66 roof blitz, unchanged");
+  assert.equal(fusion.quadrantSource, "DAY");
+  assert.equal(fusion.quadrantInfo.quadrant, "SHORT_COVERING");
+  assert.match(fusion.quadrantIntradayInfoLabel, /last 30 min, informational: LONG_BUILDUP \(15:06→15:36\)/);
+
+  assert.equal(eod.closingFlow.driver, "UNWINDING");
+  assert.equal(eod.audit.find(a => a.label === "Closing Hour Flow (14:15+)").status, "BEARISH_PUT_UNWINDING");
+  assert.deepEqual(eod.audit.filter(a => a.isGroupSummary).map(a => a.group), ["A", "B", "C"]);
+  assert.deepEqual([eod.groups.A.contribution, eod.groups.B.contribution, eod.groups.C.contribution], [-2, -2, 0]);
+  assert.equal(eod.groups.C.quadrant, "SHORT_COVERING", "group C uses the mode-selected (day) quadrant");
+  assert.equal(eod.score, -4);
+  assert.equal(eod.verdict, "CARRY NIFTY PE (STBT)");
+  assert.deepEqual(eod.agreement.groupsAgreeing, ["A", "B"]);
+  assert.deepEqual(eod.agreement.groupsOpposing, []);
+  assert.equal(eod.conviction, 69);
+  assert.equal(eod.audit.find(a => a.label === "Smart Money Futures Fusion").status, "BEARISH_VETO",
+    "bull-trap veto blocks BTST only; adds no points");
+  assert.equal(eod.audit.find(a => a.label.includes("Institutional Veto")), undefined);
+});
+
+test("11-Nov regression (opt-in intraday mode): closing flow UNWINDING-driven with both legs quoted; each EOD group once", () => {
+  const { fusion, eod } = closeReadings("intraday");
+  assert.equal(fusion.scenarioId, "MIXED_FLOW", "no bull trap from a whole-day 'price up' label");
+  assert.equal(fusion.quadrantSource, "INTRADAY");
+  assert.equal(fusion.quadrantIntradayInformational, false);
 
   assert.equal(eod.lastHourNetDelta, -108743);
   assert.equal(eod.closingFlow.driver, "UNWINDING");

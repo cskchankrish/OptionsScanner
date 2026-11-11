@@ -351,6 +351,12 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
   // Which quadrant the server published: "INTRADAY" (rolling window) or "DAY" (vs prev close/open).
   const liveFutQuadSource = liveScanner?.futures?.quadrantSource ?? liveScanner?.fusion?.quadrantSource ?? null;
   const liveFutQuadSourceLabel = liveScanner?.futures?.quadrantSourceLabel ?? liveScanner?.fusion?.quadrantSourceLabel ?? null;
+  // Rolling-window quadrant shown for information only when it is not the one driving decisions
+  // (default day mode). Never read by any veto, sizing or confirmation below.
+  const intradayInfo = liveScanner?.futures?.quadrantIntraday ?? liveScanner?.fusion?.quadrantIntraday ?? null;
+  const intradayInfoText = liveFutQuadSource !== "INTRADAY" && intradayInfo?.available
+    ? `Last ${intradayInfo.windowMins} min futures (informational, not used for this decision): ${intradayInfo.quadrant} (${intradayInfo.window}).`
+    : null;
   const chartFutQuad = tv.futQuad ?? null;
 
   // Distance to real Option Chain walls
@@ -655,6 +661,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
       serverFutQuad: liveFutQuad,
       serverFutQuadSource: liveFutQuadSource,
       serverFutQuadSourceLabel: liveFutQuadSourceLabel,
+      intradayFutQuadInformational: intradayInfo?.available && liveFutQuadSource !== "INTRADAY" ? intradayInfo.quadrant : null,
       chartFutQuad,
       futuresStale,
       snapshotAt,
@@ -662,7 +669,7 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
       realPutBlitz,
       realCallBlitz,
     },
-    reasoning: reason.join(" "),
+    reasoning: (intradayInfoText ? [...reason, intradayInfoText] : reason).join(" "),
   };
 }
 

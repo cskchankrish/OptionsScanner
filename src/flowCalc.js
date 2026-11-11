@@ -169,10 +169,16 @@ export function getIntradayQuadrantWindowMins() {
   return Number.isFinite(v) && v >= 5 && v <= 180 ? Math.round(v) : 30;
 }
 
-/** "intraday" (default) or "day": which quadrant drives fusion and the webhook. */
+/**
+ * Which quadrant drives fusion, futures.quadrant (the webhook's veto input) and EOD group C.
+ * "day" (default, owner decision 11-Nov-2026): the whole-day quadrant vs previous close /
+ * session open, exactly as before. "intraday" (opt-in via FUSION_QUADRANT_MODE=intraday): the
+ * rolling window when available. In "day" mode the intraday quadrant is still computed and
+ * exposed, labelled "last 30 min, informational", and influences no decision.
+ */
 export function getFusionQuadrantMode() {
   const v = String(envOf("FUSION_QUADRANT_MODE") || "").trim().toLowerCase();
-  return v === "day" ? "day" : "intraday";
+  return v === "intraday" ? "intraday" : "day";
 }
 
 // Deadbands for the rolling window. The day-level classifier uses 0.08% price / 0.25% OI.

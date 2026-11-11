@@ -197,8 +197,9 @@ export function classifyFuturesQuadrant(futuresMetrics) {
  */
 /**
  * Picks the quadrant that drives fusion (and, via futures.quadrant, the webhook):
- * the rolling intraday window when FUSION_QUADRANT_MODE=intraday (default) and the window
- * is available, else the day-level quadrant (vs previous close / session open).
+ * the day-level quadrant (vs previous close / session open) by default; the rolling intraday
+ * window only when FUSION_QUADRANT_MODE=intraday is set AND the window is available. In day
+ * mode the intraday quadrant is returned as information only (quadrantIntradayInformational).
  */
 export function selectFusionQuadrant(futuresMetrics, intradayQuadrant = null, mode = getFusionQuadrantMode()) {
   const day = classifyFuturesQuadrant(futuresMetrics);
@@ -224,7 +225,7 @@ export function selectFusionQuadrant(futuresMetrics, intradayQuadrant = null, mo
     };
   }
   const reason = mode === "day"
-    ? "FUSION_QUADRANT_MODE=day"
+    ? "default whole-day quadrant (FUSION_QUADRANT_MODE=intraday opts in to the rolling window)"
     : `intraday window unavailable (${intradayQuadrant?.reason || (futuresMetrics?.isStale ? "futures snapshot stale" : "not computed")})`;
   const sourceLabel = futuresMetrics ? `day vs ${dayBase}` : "day (futures unavailable)";
   return {
@@ -234,6 +235,11 @@ export function selectFusionQuadrant(futuresMetrics, intradayQuadrant = null, mo
     quadrantSourceReason: reason,
     quadrantDay,
     quadrantIntraday: intradayQuadrant || null,
+    // In day mode the rolling window is shown for information only and drives nothing.
+    quadrantIntradayInformational: true,
+    quadrantIntradayInfoLabel: intradayQuadrant?.available
+      ? `last ${intradayQuadrant.windowMins} min, informational: ${intradayQuadrant.quadrant} (${intradayQuadrant.window})`
+      : null,
   };
 }
 
@@ -249,6 +255,8 @@ export function evaluateSmartMoneyFusion(futuresMetrics, optionsMetrics, opts = 
     quadrantSourceReason: selection.quadrantSourceReason,
     quadrantDay: selection.quadrantDay,
     quadrantIntraday: selection.quadrantIntraday,
+    quadrantIntradayInformational: Boolean(selection.quadrantIntradayInformational),
+    quadrantIntradayInfoLabel: selection.quadrantIntradayInfoLabel || null,
   };
 }
 

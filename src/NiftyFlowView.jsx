@@ -2090,10 +2090,12 @@ export function NiftyFlowView({ t, isDark }) {
                   {fusion?.quadrantSource === "INTRADAY" && fusion?.quadrantDay?.label && (
                     <span> · Day ({fusion.quadrantDay.base || "prev close"}): {fusion.quadrantDay.label}</span>
                   )}
-                  {fusion?.quadrantSource === "DAY" && fusion?.quadrantSourceReason && (
-                    <span> · {fusion.quadrantSourceReason}</span>
-                  )}
                 </div>
+                {fusion?.quadrantSource === "DAY" && fusion?.quadrantIntraday?.available && (
+                  <div style={{ fontSize: isMobile ? 9 : 10, color: t.textMuted, lineHeight: 1.3, marginTop: 2 }} title="Shown for information only: does not drive fusion, vetoes, sizing or the EOD score (set FUSION_QUADRANT_MODE=intraday to opt in).">
+                    Last {fusion.quadrantIntraday.windowMins} min, informational: <strong style={{ color: fusion.quadrantIntraday.color || t.textSub }}>{fusion.quadrantIntraday.label}</strong> ({fusion.quadrantIntraday.window})
+                  </div>
+                )}
               </div>
 
               {/* Cell 3: Smart Money Fusion Matrix Scenario */}
