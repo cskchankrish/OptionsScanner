@@ -42,6 +42,9 @@ export function parseNseFuturesPayload(
   const next = niftyFutRows[1] || null;
 
   const lastPrice = Number(near.lastPrice ?? near.ltp ?? 0);
+  // A futures row without a traded price is not futures data (12-Nov: a 0 price made the basis
+  // −25,000 and poisoned the day's "since open" baseline).
+  if (!(lastPrice > 0)) return null;
   const spotPrice = Number(near.underlyingValue ?? spotPriceFallback ?? 0);
   let priceChange = Number(near.change ?? near.ptsChange ?? 0);
   let priceChangePct = Number(near.pChange ?? (spotPrice > 0 ? (priceChange / spotPrice) * 100 : 0));
@@ -89,10 +92,12 @@ export function parseNseFuturesPayload(
   const rawBasis = Number((lastPrice - spotPrice).toFixed(2));
   const fairBasis = Number((spotPrice * ((ANNUALIZED_RISK_FREE_RATE * dte) / 365)).toFixed(2));
   const adjustedBasisSpread = Number((rawBasis - fairBasis).toFixed(2));
+  // Since-open basis change: null ("unavailable") without a valid session anchor or spot —
+  // never a number measured from zero.
   const intradayBasisDelta =
-    openBasisBaseline !== null && Number.isFinite(Number(openBasisBaseline))
+    openBasisBaseline !== null && openBasisBaseline !== undefined && Number.isFinite(Number(openBasisBaseline)) && spotPrice > 0
       ? Number((rawBasis - Number(openBasisBaseline)).toFixed(2))
-      : 0;
+      : null;
 
   return {
     contract: near.identifier || near.contract || `NIFTY ${near.expiryDate || "NEAR"}`,

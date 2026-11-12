@@ -2573,9 +2573,17 @@ export function NiftyFlowView({ t, isDark }) {
                     color: color,
                     border: `1px solid ${borderTint}`,
                   }}>
-                    <span title={eod.convictionLabel || "Agreement score (rule-based, not a probability)"}>
-                      Agreement {eod.conviction}/100{eod.agreement ? ` (${eod.agreement.groupsAgreeing.length}/3 groups)` : ""} · rule-based, not a probability
-                    </span> · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
+                    {eod.bias === "NEUTRAL" || eod.conviction == null ? (
+                      <span title="No carry: no agreement figure; distance of the score to each threshold instead">
+                        {eod.thresholdDistance?.text || `Score: ${eod.score > 0 ? `+${eod.score}` : eod.score}`}
+                      </span>
+                    ) : (
+                      <>
+                        <span title={eod.convictionLabel || "Agreement score (rule-based, not a probability)"}>
+                          Agreement {eod.conviction}/100{eod.agreement ? ` (${eod.agreement.groupsAgreeing.length}/3 groups)` : ""} · rule-based, not a probability
+                        </span> · Score: {eod.score > 0 ? `+${eod.score}` : eod.score}
+                      </>
+                    )}
                   </span>
                 </div>
 
@@ -2974,7 +2982,7 @@ export function NiftyFlowView({ t, isDark }) {
                             <span style={{ color: t.textMuted }}>Score: </span>
                             <strong>{item.score > 0 ? `+${item.score}` : item.score}</strong>
                             <span style={{ color: t.textMuted }}> · Agreement (rule-based): </span>
-                            <strong>{item.conviction}/100</strong>
+                            <strong>{item.conviction == null ? "— (no carry)" : `${item.conviction}/100`}</strong>
                             <span style={{ color: t.textMuted }}> · PCR: </span>
                             <strong>{item.pcr || "—"}</strong>
                           </div>

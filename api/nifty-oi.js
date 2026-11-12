@@ -21,6 +21,7 @@ import {
   getFusionQuadrantMode,
 } from "../src/flowCalc.js";
 import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
+import { getCarryConfig } from "../src/carryBridge.js";
 
 let cache = {
   data: null,
@@ -60,6 +61,48 @@ export function describeFloorRoofShift({ previous = {}, nowMins, floor, roof }) 
       ? { ok: false, text: `not enough data for floor/roof migration (previous reading ${dqHhmm(prevAt)}, ${gapMin} min earlier)` }
       : { ok: hasPrev ? true : null, text: hasPrev ? null : "no earlier reading to compare" },
   };
+}
+
+/**
+ * "Since open" futures anchor for the intraday basis delta, session OI change and session price
+ * change. The first timeline tick with a valid futures price, futures OI and spot (> 0, not a
+ * frozen-auction spot, not a synthetic placeholder); otherwise a stored Redis baseline that passes
+ * the same checks (|basis| < 2% of price, so a reading taken with futPrice 0 is rejected).
+ * Returns null when no valid anchor exists — callers must then report "unavailable", never 0.
+ * Pure.
+ */
+export function pickSessionFuturesAnchor({ timeline = [], cachedBase = null } = {}) {
+  const ok = (fut, spot) => Number(fut) > 0 && Number(spot) > 0 && Math.abs(Number(fut) - Number(spot)) < 0.02 * Number(fut);
+  const ticks = (Array.isArray(timeline) ? timeline : [])
+    .filter((p) => p && Number.isFinite(Number(p.minutes)) && p.synthetic !== true && !p.spotFrozen)
+    .slice()
+    .sort((a, b) => a.minutes - b.minutes);
+  const t = ticks.find((p) => ok(p.futPrice, p.spot) && Number(p.futCombinedOI) > 0);
+  if (t) {
+    return {
+      source: "timeline",
+      time: t.time || dqHhmm(t.minutes),
+      minutes: t.minutes,
+      futPrice: Number(t.futPrice),
+      spot: Number(t.spot),
+      futCombinedOI: Number(t.futCombinedOI),
+      rawBasis: Number((Number(t.futPrice) - Number(t.spot)).toFixed(2)),
+    };
+  }
+  const b = cachedBase;
+  if (b && Number(b.openPrice) > 0 && Number(b.openOI) > 0 && Number.isFinite(Number(b.openBasis)) &&
+      Math.abs(Number(b.openBasis)) < 0.02 * Number(b.openPrice)) {
+    return {
+      source: "redis-baseline",
+      time: b.time || (Number(b.timestamp) > 0 ? new Date(Number(b.timestamp)).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false }) : null),
+      minutes: null,
+      futPrice: Number(b.openPrice),
+      spot: Number(b.openSpot) > 0 ? Number(b.openSpot) : null,
+      futCombinedOI: Number(b.openOI),
+      rawBasis: Number(Number(b.openBasis).toFixed(2)),
+    };
+  }
+  return null;
 }
 
 // Previous floor/roof reading of THIS instance and when it was taken (IST minutes). Starts empty:
@@ -1606,6 +1649,27 @@ function analyzeSmartMoney({ strikes, spot, floorStrike, roofStrike, intradayHis
 // New scale: A ±2 + B ±3 + C ±2 = ±7. The carry thresholds stay ±3 (±4 Friday): every old
 // path to ±3 that did not rely on double counting still reaches it (e.g. B blitz alone = 3,
 // or A 2 + B 1), so the intent "≥3 net points of evidence" is unchanged.
+/**
+ * Weekday EOD status label built from the schedule constants: EOD radar alerts
+ * EOD_WINDOW_START_MINS–EOD_WINDOW_END_MINS (14:15–15:38), the carry instruction window
+ * (CARRY_WINDOW_START/END, default 15:31–15:37) and the F&O close (FNO_CLOSE_MINS, 15:40).
+ */
+export function eodScheduleLabel({ nowMins, env = process.env } = {}) {
+  const hh = (m) => minsToHHMM(m);
+  const carry = getCarryConfig(env);
+  const cs = carry.windowStartMins;
+  const ce = carry.windowEndMins;
+  const alerts = `EOD alerts ${hh(EOD_WINDOW_START_MINS)}–${hh(EOD_WINDOW_END_MINS)}`;
+  const carryTxt = `carry instruction ${hh(cs)}–${hh(ce)}${carry.enabled ? "" : " (automation off)"}`;
+  const close = `close ${hh(FNO_CLOSE_MINS)}`;
+  if (nowMins >= 1380 || nowMins < 555) return `PRE-MARKET · AWAITING ${hh(555)} IST OPEN`;
+  if (nowMins > FNO_CLOSE_MINS) return `MARKET CLOSED · EOD DECISION SETTLED AT ${hh(FNO_CLOSE_MINS)} IST (Active until 23:00 IST)`;
+  if (nowMins < EOD_WINDOW_START_MINS) return `MONITORING · ${alerts} · ${carryTxt} · ${close} IST`;
+  if (nowMins < cs) return `EOD ALERT WINDOW (${hh(EOD_WINDOW_START_MINS)}–${hh(EOD_WINDOW_END_MINS)} IST) · ${carryTxt} · ${close}`;
+  if (nowMins <= ce) return `CARRY INSTRUCTION WINDOW (${hh(cs)}–${hh(ce)} IST)${carry.enabled ? "" : " · automation off"} · EOD alerts until ${hh(EOD_WINDOW_END_MINS)} · ${close}`;
+  return `FINAL MINUTES · EOD alerts until ${hh(EOD_WINDOW_END_MINS)} · ${close} IST`;
+}
+
 export const EOD_GROUP_CAPS = { A: 2, B: 3, C: 2 };
 // Agreement score caps by number of independent groups agreeing with a carry verdict.
 // One group can be wrong for one reason (60); each further independent confirmation adds 15;
@@ -1933,13 +1997,20 @@ export function calculateEODDecision({
       basisDetail = `basis not scored (${CLOSING_AUCTION_NOTE}; futures − frozen spot is not a basis)`;
     } else {
       const adj = Number(futuresMetrics.adjustedBasisSpread ?? 0);
-      const intra = Number(futuresMetrics.intradayBasisDelta ?? 0);
+      // Since-open basis change: null when there is no valid session anchor → "unavailable",
+      // and it then takes no part in the basis direction (never measured from zero).
+      const intraRaw = futuresMetrics.intradayBasisDelta;
+      const intra = intraRaw === null || intraRaw === undefined || !Number.isFinite(Number(intraRaw)) ? null : Number(intraRaw);
+      const anchorTime = futuresMetrics.intradayBasisAnchor?.time || null;
       const raw = Number(futuresMetrics.rawBasis ?? 0);
-      const basisBull = adj >= -5 || intra >= 5;
-      const basisBear = raw < 0 || adj <= -10 || intra <= -5;
+      const basisBull = adj >= -5 || (intra !== null && intra >= 5);
+      const basisBear = raw < 0 || adj <= -10 || (intra !== null && intra <= -5);
       const basisDir = basisBull && !basisBear ? 1 : basisBear && !basisBull ? -1 : 0;
       basisPts = quadDir !== 0 && basisDir === quadDir ? basisDir : 0;
-      basisDetail = `basis raw ${raw}, adj ${adj}, Δ ${intra} → ${basisDir > 0 ? "bullish" : basisDir < 0 ? "bearish" : "mixed"}${basisPts !== 0 ? " (confirms quadrant)" : quadDir !== 0 && basisDir !== 0 ? " (contradicts quadrant, 0 pts)" : ""}`;
+      const intraTxt = intra === null
+        ? "Δ since open unavailable (no valid session anchor tick)"
+        : `Δ ${intra}${anchorTime ? ` since ${anchorTime}` : ""}`;
+      basisDetail = `basis raw ${raw}, adj ${adj}, ${intraTxt} → ${basisDir > 0 ? "bullish" : basisDir < 0 ? "bearish" : "mixed"}${basisPts !== 0 ? " (confirms quadrant)" : quadDir !== 0 && basisDir !== 0 ? " (contradicts quadrant, 0 pts)" : ""}`;
     }
   }
   // Futures missing or stale (cached snapshot) → group C UNVERIFIED (0 pts).
@@ -2075,15 +2146,9 @@ export function calculateEODDecision({
       statusLabel = "🪔 DIWALI MUHURAT MONITORING · TRADING ACTIVE (14:20 - 15:20 IST)";
     }
   } else {
-    if (isDecisionWindow) {
-      statusLabel = "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)";
-    } else if (nowMins > 940 && nowMins < 1380) {
-      statusLabel = "MARKET CLOSED · EOD DECISION SETTLED AT 15:40 IST (Active until 23:00 IST)";
-    } else if (nowMins >= 1380 || nowMins < 555) {
-      statusLabel = "PRE-MARKET · AWAITING 09:15 IST OPEN";
-    } else {
-      statusLabel = "EARLY MONITORING · DECISION SETTLES AT 15:00 IST";
-    }
+    // Weekday label derived from the real schedule constants (12-Nov: the old fixed text said
+    // "ACTIVE EXECUTION WINDOW (15:00 - 15:25 IST)", which matched nothing that actually runs).
+    statusLabel = eodScheduleLabel({ nowMins });
   }
 
   let verdict;
@@ -2145,22 +2210,40 @@ export function calculateEODDecision({
     const cap = EOD_AGREEMENT_CAPS[agreeing.length];
     conviction = Math.max(0, Math.round(cap * (0.5 + 0.5 * strength)) - OPPOSING_GROUP_PENALTY * opposing.length);
   } else {
-    // No carry: how many groups support standing aside (zero, or against the net lean).
-    const lean = Math.sign(groupA + groupB + groupC);
-    agreeing = groupList.filter(g => g.contribution === 0 || lean === 0 || Math.sign(g.contribution) === -lean);
-    opposing = groupList.filter(g => !agreeing.includes(g));
-    conviction = EOD_AGREEMENT_CAPS[agreeing.length];
+    // No carry: NO agreement percentage (12-Nov showed "90" on a score-0 NO CARRY, which read as
+    // confidence). Show how far the score is from each threshold instead.
+    conviction = null;
   }
-  const agreement = {
-    kind: "RULE_BASED_AGREEMENT",
-    isProbability: false,
-    label: EOD_AGREEMENT_LABEL,
-    value: conviction,
-    cap: EOD_AGREEMENT_CAPS[agreeing.length],
-    groupsAgreeing: agreeing.map(g => g.id),
-    groupsOpposing: opposing.map(g => g.id),
-    verdictSide: bias === "NEUTRAL" ? "STAND_ASIDE" : bias,
+  const thresholdDistance = {
+    score,
+    btstThreshold: thresh,
+    stbtThreshold: -thresh,
+    toBtst: Math.max(0, thresh - score),
+    toStbt: Math.max(0, score + thresh),
+    text: `Score ${score >= 0 ? "+" : ""}${score} · ${Math.max(0, thresh - score)} pt${Math.abs(thresh - score) === 1 ? "" : "s"} short of BTST (≥ +${thresh}) · ${Math.max(0, score + thresh)} pt${Math.abs(score + thresh) === 1 ? "" : "s"} short of STBT (≤ −${thresh})`,
   };
+  const agreement = bias === "NEUTRAL"
+    ? {
+        kind: "THRESHOLD_DISTANCE",
+        isProbability: false,
+        label: "No carry: distance to each threshold (no agreement figure)",
+        value: null,
+        cap: null,
+        groupsAgreeing: [],
+        groupsOpposing: [],
+        verdictSide: "STAND_ASIDE",
+        thresholdDistance,
+      }
+    : {
+        kind: "RULE_BASED_AGREEMENT",
+        isProbability: false,
+        label: EOD_AGREEMENT_LABEL,
+        value: conviction,
+        cap: EOD_AGREEMENT_CAPS[agreeing.length],
+        groupsAgreeing: agreeing.map(g => g.id),
+        groupsOpposing: opposing.map(g => g.id),
+        verdictSide: bias,
+      };
 
   // Data-quality caveat: an UNVERIFIED group scored 0 because its window lacked coverage.
   const unverifiedGroups = groupList.filter(g => g.unverified).map(g => g.id);
@@ -2178,7 +2261,8 @@ export function calculateEODDecision({
     verdict,
     bias,
     conviction,
-    convictionLabel: EOD_AGREEMENT_LABEL,
+    convictionLabel: bias === "NEUTRAL" ? "No carry: no agreement figure (see thresholdDistance)" : EOD_AGREEMENT_LABEL,
+    thresholdDistance,
     agreement,
     sizing,
     action,
@@ -2651,19 +2735,17 @@ export async function refreshLiveSnapshot({
 
     // Parse Nifty Futures with Rollover Protection & Graceful Degradation
     let futuresMetrics = null;
-    const openTick = Array.isArray(intradayHistory) && intradayHistory.length > 0 ? intradayHistory[0] : null;
-    let openOiBaseline = openTick?.futCombinedOI || null;
-    let openBasisBaseline = openTick?.futBasis || null;
-    let openPriceBaseline = openTick?.futPrice || null;
-
-    if (!openOiBaseline && REDIS_URL) {
-      const cachedBase = await getRedisFuturesBaseline(today);
-      if (cachedBase) {
-        openOiBaseline = cachedBase.openOI;
-        openBasisBaseline = cachedBase.openBasis;
-        openPriceBaseline = cachedBase.openPrice;
-      }
+    // Session ("since open") anchor: the first tick with a VALID futures price, OI and spot — never
+    // a null/0 tick (12-Nov: a 09:15 tick with futPrice null made the basis delta Δ 25302).
+    let cachedBase = null;
+    let sessionAnchor = pickSessionFuturesAnchor({ timeline: intradayHistory });
+    if (!sessionAnchor && REDIS_URL) {
+      cachedBase = await getRedisFuturesBaseline(today);
+      sessionAnchor = pickSessionFuturesAnchor({ timeline: [], cachedBase });
     }
+    const openOiBaseline = sessionAnchor?.futCombinedOI ?? null;
+    const openBasisBaseline = sessionAnchor?.rawBasis ?? null;
+    const openPriceBaseline = sessionAnchor?.futPrice ?? null;
 
     if (futSettled.status === "fulfilled" && futSettled.value.ok) {
       try {
@@ -2675,13 +2757,21 @@ export async function refreshLiveSnapshot({
           openOiBaseline,
           openPriceBaseline
         );
+        if (futuresMetrics) {
+          futuresMetrics.intradayBasisAnchor = sessionAnchor
+            ? { time: sessionAnchor.time, source: sessionAnchor.source, rawBasis: sessionAnchor.rawBasis }
+            : null;
+        }
         if (futuresMetrics && REDIS_URL) {
           saveRedisFuturesSnapshot(futuresMetrics).catch(() => {});
-          if (!openOiBaseline && futuresMetrics.combinedOI > 0) {
+          // Only a fully valid reading may become the day's baseline.
+          if (!sessionAnchor && futuresMetrics.combinedOI > 0 && futuresMetrics.lastPrice > 0 && futuresMetrics.spotPrice > 0) {
             saveRedisFuturesBaseline(today, {
               openOI: futuresMetrics.combinedOI,
               openBasis: futuresMetrics.rawBasis,
               openPrice: futuresMetrics.lastPrice,
+              openSpot: futuresMetrics.spotPrice,
+              time: getISTTimeStr(),
               timestamp: Date.now(),
             }).catch(() => {});
           }
@@ -2700,14 +2790,14 @@ export async function refreshLiveSnapshot({
 
     // Baseline fallback patch: Ensure combinedChgOI is computed even if cached snapshot had 0 delta
     if (futuresMetrics && (!futuresMetrics.combinedChgOI || futuresMetrics.combinedChgOI === 0)) {
-      const baseOI = openOiBaseline || openTick?.futCombinedOI;
+      const baseOI = openOiBaseline;
       if (baseOI && futuresMetrics.combinedOI > 0) {
         const delta = futuresMetrics.combinedOI - Number(baseOI);
         const deltaPct = Number(((delta / Number(baseOI)) * 100).toFixed(2));
         futuresMetrics.combinedChgOI = delta;
         futuresMetrics.combinedOiChangePct = deltaPct;
         futuresMetrics.nearChgOI = delta;
-        const basePrice = openPriceBaseline || openTick?.futPrice;
+        const basePrice = openPriceBaseline;
         if (basePrice && futuresMetrics.lastPrice) {
           const sessionPts = Number((futuresMetrics.lastPrice - Number(basePrice)).toFixed(2));
           const sessionPct = Number(((sessionPts / Number(basePrice)) * 100).toFixed(2));

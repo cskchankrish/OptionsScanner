@@ -1066,7 +1066,9 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
   lines.push(
     header,
     `• *${isFinalDirective ? "Official Verdict" : "Interim Verdict"}:* \`${eodDecision.verdict}\``,
-    `• *Bias & Agreement:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Agreement: \`${eodDecision.conviction}/100\` — rule-based, not a probability${eodDecision.agreement ? `; ${eodDecision.agreement.groupsAgreeing.length}/3 evidence groups agree` : ""})`,
+    eodDecision.bias === "NEUTRAL" || eodDecision.conviction == null
+      ? `• *Score vs thresholds:* ${eodDecision.thresholdDistance?.text || `Score ${eodDecision.score}`} (no carry: no agreement figure)`
+      : `• *Bias & Agreement:* ${eodDecision.bias} (Score: \`${eodDecision.score >= 0 ? "+" + eodDecision.score : eodDecision.score}\` | Agreement: \`${eodDecision.conviction}/100\` — rule-based, not a probability${eodDecision.agreement ? `; ${eodDecision.agreement.groupsAgreeing.length}/3 evidence groups agree` : ""})`,
     `• *Recommended Sizing:* \`${eodDecision.sizing}\``,
     `• *Spot Index:* \`₹${Math.round(spot)}\`${isSpotFrozenAt(slotClockMins(slotTimeStr)) ? " ❄ _(frozen 15:15–15:30 for the NSE closing auction)_" : ""} | *Corridor:* Floor \`${floorStrike}\` ↔ Roof \`${roofStrike}\``,
   );
