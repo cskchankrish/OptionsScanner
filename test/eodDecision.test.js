@@ -21,7 +21,33 @@ const withLegs = (timeline) => (Array.isArray(timeline) ? timeline : []).map(pt 
     ? { ...pt, putWriting: LEG_BASE + Math.max(0, pt.netDiff), callWriting: LEG_BASE + Math.max(0, -pt.netDiff) }
     : pt
 );
-const calculateEODDecision = (args) => calculateEODDecisionRaw({ ...args, timeline: withLegs(args.timeline) });
+// These scenarios also place a handful of ticks by hand (e.g. 14:15, 14:45, 15:20). A working
+// poller produces one tick per minute, and the scorer now refuses to read a window across a hole
+// (12-Nov: data coverage). Fill every missing minute BETWEEN the given ticks by linear
+// interpolation — only between given ticks at most 60 minutes apart, never before the first or
+// after the last given tick, so "missing anchor" and
+// "short span" scenarios keep testing exactly that. Gap behaviour has its own tests below.
+const densify = (timeline) => {
+  const src = (Array.isArray(timeline) ? timeline : []).filter(Boolean).slice().sort((a, b) => a.minutes - b.minutes);
+  const out = [];
+  const lerp = (a, b, f, k) => (Number.isFinite(a[k]) && Number.isFinite(b[k]) ? a[k] + (b[k] - a[k]) * f : a[k]);
+  for (let i = 0; i < src.length; i++) {
+    out.push(src[i]);
+    const a = src[i], b = src[i + 1];
+    if (!b || !Number.isFinite(a.minutes) || !Number.isFinite(b.minutes) || b.minutes - a.minutes > 60) continue;
+    for (let m = a.minutes + 1; m < b.minutes; m++) {
+      const f = (m - a.minutes) / (b.minutes - a.minutes);
+      const pt = { minutes: m, time: `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`, isLiveTick: true };
+      for (const k of ["netDiff", "putWriting", "callWriting", "spot", "futPrice", "futCombinedOI"]) {
+        const v = lerp(a, b, f, k);
+        if (v !== undefined) pt[k] = v;
+      }
+      out.push(pt);
+    }
+  }
+  return out;
+};
+const calculateEODDecision = (args) => calculateEODDecisionRaw({ ...args, timeline: densify(withLegs(args.timeline)) });
 
 test("calculateDeltaPcr handles normal, negative, and zero call writing safely", () => {
   // Normal writing
@@ -300,7 +326,9 @@ test("calculateEODDecision enforces data integrity validation: requires >= 15m c
   const closingAudit = result.audit.find(a => a.label.includes("Closing Hour Flow"));
   assert.equal(closingAudit.status, "AWAITING_DATA");
   assert.ok(closingAudit.detail.includes("Data Integrity Notice"));
-  assert.equal(closingAudit.impact, "0 pts (Data Pending)");
+  // 12-Nov: once the closing window is active, missing data marks group B UNVERIFIED (still 0 pts).
+  assert.equal(closingAudit.impact, "0 pts (UNVERIFIED)");
+  assert.equal(result.groups.B.unverified, true);
 
   // Crucially: late blitz veto must NOT trigger on unvalidated short span
   const vetoAudit = result.audit.find(a => a.label.includes("14:15+ Institutional Veto"));
@@ -331,7 +359,9 @@ test("calculateEODDecision enforces data integrity validation: holds neutral whe
   const closingAudit = result.audit.find(a => a.label.includes("Closing Hour Flow"));
   assert.equal(closingAudit.status, "AWAITING_DATA");
   assert.ok(closingAudit.detail.includes("Missing 14:15 IST baseline tick"));
-  assert.equal(closingAudit.impact, "0 pts (Data Pending)");
+  // 12-Nov: once the closing window is active, missing data marks group B UNVERIFIED (still 0 pts).
+  assert.equal(closingAudit.impact, "0 pts (UNVERIFIED)");
+  assert.equal(result.groups.B.unverified, true);
 
   // Late call blitz veto must NOT trigger from disconnected morning to 15:40 gap
   const vetoAudit = result.audit.find(a => a.label.includes("14:15+ Institutional Veto"));

@@ -20,6 +20,7 @@ import {
   classifyIntradayFuturesQuadrant,
   getFusionQuadrantMode,
 } from "../src/flowCalc.js";
+import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
 
 let cache = {
   data: null,
@@ -35,9 +36,38 @@ let lastKnownExpiryDates = [
   "08-Dec-2026"
 ];
 
+/**
+ * Floor/roof migration text vs this instance's previous reading. When that reading is more than
+ * DQ_WINDOW_MAX_GAP_MIN minutes old the text says so (data gap; not a continuous migration) and
+ * the coverage verdict is not ok. Pure.
+ */
+export function describeFloorRoofShift({ previous = {}, nowMins, floor, roof }) {
+  const prevAt = previous?.atMins;
+  const gapMin = Number.isFinite(prevAt) ? nowMins - prevAt : null;
+  const gapNote = gapMin !== null && gapMin > DQ_WINDOW_MAX_GAP_MIN
+    ? ` — compared with the ${dqHhmm(prevAt)} reading, ${gapMin} min earlier (data gap; not a continuous migration)`
+    : "";
+  const one = (name, prev, cur) => {
+    if (prev === null || prev === undefined) return `${name} at ${cur} (no earlier reading to compare)`;
+    if (prev !== cur) return `${name} moved from ${prev} to ${cur}${gapNote}`;
+    return `${name} holding steady at ${cur}${gapNote}`;
+  };
+  const hasPrev = previous?.floor !== null && previous?.floor !== undefined;
+  return {
+    floorShift: one("Floor", previous?.floor, floor),
+    roofShift: one("Roof", previous?.roof, roof),
+    coverage: gapNote
+      ? { ok: false, text: `not enough data for floor/roof migration (previous reading ${dqHhmm(prevAt)}, ${gapMin} min earlier)` }
+      : { ok: hasPrev ? true : null, text: hasPrev ? null : "no earlier reading to compare" },
+  };
+}
+
+// Previous floor/roof reading of THIS instance and when it was taken (IST minutes). Starts empty:
+// the old hard-coded 22600/22800 made every cold instance report a fake "migration".
 let previousState = {
-  floor: 22600,
-  roof: 22800,
+  floor: null,
+  roof: null,
+  atMins: null,
 };
 
 let intradayHistory = [];
@@ -872,6 +902,9 @@ async function setRedisTimeline(dateKey, timelineArray) {
   }
 }
 
+// Placeholder timeline shown when no real ticks exist (cold instance outside market hours). Its
+// ticks are marked synthetic: they never count as data coverage, so nothing history-based is
+// concluded from them (12-Nov data-quality rule).
 export function getCanonicalSettledTimeline(totPut, totCall, spot, futuresMetrics) {
   const pTot = Number(totPut) || 279500;
   const cTot = Number(totCall) || 157500;
@@ -891,19 +924,19 @@ export function getCanonicalSettledTimeline(totPut, totCall, spot, futuresMetric
   };
 
   return [
-    { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: sp - 25, isLiveTick: false, ...fut },
-    { time: "09:30", minutes: 570, putWriting: 24000, callWriting: 12000, netDiff: 12000, spot: sp - 18, isLiveTick: false, ...fut },
-    { time: "10:00", minutes: 600, putWriting: 55000, callWriting: 36500, netDiff: 18500, spot: sp - 10, isLiveTick: false, ...fut },
-    { time: "11:00", minutes: 660, putWriting: 95000, callWriting: 70000, netDiff: 25000, spot: sp - 5, isLiveTick: false, ...fut },
-    { time: "12:00", minutes: 720, putWriting: 135000, callWriting: 103000, netDiff: 32000, spot: sp + 8, isLiveTick: false, ...fut },
-    { time: "13:00", minutes: 780, putWriting: 168000, callWriting: 140000, netDiff: 28000, spot: sp + 2, isLiveTick: false, ...fut },
-    { time: "14:00", minutes: 840, putWriting: 195000, callWriting: 173000, netDiff: 22000, spot: sp - 12, isLiveTick: false, ...fut },
-    { time: "14:15", minutes: 855, putWriting: 202000, callWriting: 180000, netDiff: 22000, spot: sp - 15, isLiveTick: false, ...fut },
-    { time: "14:30", minutes: 870, putWriting: 225000, callWriting: 180000, netDiff: 45000, spot: sp + 5, isLiveTick: false, ...fut },
-    { time: "15:00", minutes: 900, putWriting: 252000, callWriting: 174000, netDiff: 78000, spot: sp + 20, isLiveTick: false, ...fut },
-    { time: "15:15", minutes: 915, putWriting: 268000, callWriting: 173000, netDiff: 95000, spot: sp + 28, isLiveTick: false, ...fut },
-    { time: "15:30", minutes: 930, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, ...fut },
-    { time: "15:40", minutes: 940, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, ...fut },
+    { time: "09:15", minutes: 555, putWriting: 0, callWriting: 0, netDiff: 0, spot: sp - 25, isLiveTick: false, synthetic: true, ...fut },
+    { time: "09:30", minutes: 570, putWriting: 24000, callWriting: 12000, netDiff: 12000, spot: sp - 18, isLiveTick: false, synthetic: true, ...fut },
+    { time: "10:00", minutes: 600, putWriting: 55000, callWriting: 36500, netDiff: 18500, spot: sp - 10, isLiveTick: false, synthetic: true, ...fut },
+    { time: "11:00", minutes: 660, putWriting: 95000, callWriting: 70000, netDiff: 25000, spot: sp - 5, isLiveTick: false, synthetic: true, ...fut },
+    { time: "12:00", minutes: 720, putWriting: 135000, callWriting: 103000, netDiff: 32000, spot: sp + 8, isLiveTick: false, synthetic: true, ...fut },
+    { time: "13:00", minutes: 780, putWriting: 168000, callWriting: 140000, netDiff: 28000, spot: sp + 2, isLiveTick: false, synthetic: true, ...fut },
+    { time: "14:00", minutes: 840, putWriting: 195000, callWriting: 173000, netDiff: 22000, spot: sp - 12, isLiveTick: false, synthetic: true, ...fut },
+    { time: "14:15", minutes: 855, putWriting: 202000, callWriting: 180000, netDiff: 22000, spot: sp - 15, isLiveTick: false, synthetic: true, ...fut },
+    { time: "14:30", minutes: 870, putWriting: 225000, callWriting: 180000, netDiff: 45000, spot: sp + 5, isLiveTick: false, synthetic: true, ...fut },
+    { time: "15:00", minutes: 900, putWriting: 252000, callWriting: 174000, netDiff: 78000, spot: sp + 20, isLiveTick: false, synthetic: true, ...fut },
+    { time: "15:15", minutes: 915, putWriting: 268000, callWriting: 173000, netDiff: 95000, spot: sp + 28, isLiveTick: false, synthetic: true, ...fut },
+    { time: "15:30", minutes: 930, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, synthetic: true, ...fut },
+    { time: "15:40", minutes: 940, putWriting: pTot, callWriting: cTot, netDiff: pTot - cTot, spot: sp, isLiveTick: false, synthetic: true, ...fut },
   ];
 }
 
@@ -1002,22 +1035,25 @@ async function syncRedisHistory(today) {
     sessionDate = today;
   }
 
-  // Preload history from Redis if memory is empty
-  if (REDIS_URL && (!intradayHistory || intradayHistory.length < 5)) {
+  // Merge the shared Redis timeline into memory on EVERY refresh (12-Nov fix). The poller, the
+  // browser and the webhook run in separate function instances, each with its own memory, and
+  // each writes the whole timeline back to Redis. Previously a warm instance only read Redis when
+  // it held < 5 ticks, so it overwrote the shared key with its own sparse copy and other callers'
+  // ticks were lost. Union by minute; this instance's tick wins for the same minute.
+  if (REDIS_URL) {
     const remote = await getRedisTimeline(sessionDate || today);
-    if (Array.isArray(remote) && remote.length > (intradayHistory ? intradayHistory.length : 0)) {
-      intradayHistory = remote
-        .filter(pt => {
-          if (!pt) return false;
-          const m = pt.minutes || 0;
-          // During live market: strictly only include ticks that belong to today's active session!
-          // Cannot be earlier than market open, and CANNOT be in the future (greater than current minute)!
-          if (sessionInfo.isLiveMarket) {
-            return m >= openMins && m <= nowMins;
-          }
-          return m <= closeMins && (pt.time || "") <= closeTimeStr;
-        })
-        .sort((a, b) => (a.minutes || 0) - (b.minutes || 0));
+    if (Array.isArray(remote) && remote.length > 0) {
+      const inSession = remote.filter(pt => {
+        if (!pt) return false;
+        const m = pt.minutes || 0;
+        // During live market: strictly only include ticks that belong to today's active session!
+        // Cannot be earlier than market open, and CANNOT be in the future (greater than current minute)!
+        if (sessionInfo.isLiveMarket) {
+          return m >= openMins && m <= nowMins;
+        }
+        return m <= closeMins && (pt.time || "") <= closeTimeStr;
+      });
+      intradayHistory = mergeTimelines(intradayHistory || [], inSession);
     }
   }
 }
@@ -1267,6 +1303,19 @@ export function detectMacroTurn({ timeline = [], spot, floorStrike, roofStrike }
   const priceKey = touchesAuction ? "futPrice" : "spot";
   const priceName = touchesAuction ? "Futures" : "Spot";
   const auctionNote = touchesAuction ? ` (${CLOSING_AUCTION_NOTE}; price measured on NIFTY futures)` : "";
+
+  // Data coverage of THIS window first: never read a turn across a hole in the timeline.
+  const coverage = windowCoverage(ticks, c1Start, c2End, { label: `the 30-min radar window ${windowStr}` });
+  if (!coverage.ok) {
+    return {
+      isTriggered: false,
+      status: "INSUFFICIENT_DATA",
+      dataCoverage: coverage,
+      priceSource: touchesAuction ? "FUTURES" : "SPOT",
+      window: windowStr,
+      message: `⚠️ 30-Min Macro Engine: ${coverage.text} — no reading.`,
+    };
+  }
 
   const hasPrice = pt => Number(pt?.[priceKey]) > 0;
   const anchorAtOrBefore = (m) => {
@@ -1744,6 +1793,8 @@ export function calculateEODDecision({
   let closingFlowStatus = "NEUTRAL";
   let closingFlowDetail = isSunday ? "Neutral Diwali Muhurat flow" : "Neutral closing hour flow";
   let closingImpact = "0 pts";
+  let closingFlowPending = false;
+  let closingCoverage = null;
 
   if (validTimeline.length >= 3) {
     let minAnchorDiff = Infinity;
@@ -1756,6 +1807,7 @@ export function calculateEODDecision({
     }
 
     if (nowMins < flowActivateMins && !isSettledReview) {
+      closingFlowPending = true;
       closingFlowStatus = "MONITORING";
       closingFlowDetail = isSunday
         ? "Diwali Muhurat flow accumulating (14:20+ window activates after 14:40 IST)"
@@ -1769,10 +1821,19 @@ export function calculateEODDecision({
       pClose = validTimeline[validTimeline.length - 1];
       const spanMinutes = (pClose.minutes || 0) - (p1415.minutes || 0);
 
+      // Coverage of the WHOLE closing window (anchor target → latest tick): a delta across a
+      // hole in the timeline is not a continuous closing flow, so it is not scored.
+      closingCoverage = windowCoverage(validTimeline, anchorTargetMins, pClose.minutes, {
+        label: `the closing-flow window ${flowAnchorStr}–${pClose.time || dqHhmm(pClose.minutes)}`,
+      });
       if (spanMinutes < 15) {
         closingFlowStatus = "AWAITING_DATA";
         closingFlowDetail = `Data Integrity Notice: Insufficient closing tick span (${spanMinutes}m < 15m required). Scoring held neutral.`;
         closingImpact = "0 pts (Data Pending)";
+      } else if (!closingCoverage.ok) {
+        closingFlowStatus = "UNVERIFIED";
+        closingFlowDetail = `UNVERIFIED — ${closingCoverage.text}. Closing flow and last-hour delta not scored.`;
+        closingImpact = "0 pts (UNVERIFIED)";
       } else {
         isClosingDataValid = true;
         closingFlow = decomposeWritingDelta(p1415, pClose);
@@ -1818,9 +1879,20 @@ export function calculateEODDecision({
     closingImpact = "0 pts (Data Pending)";
   }
 
+  // Once the closing window is active, missing / gappy data makes group B UNVERIFIED (0 pts).
+  const closingWindowActive = isSettledReview || nowMins >= flowActivateMins;
+  const groupBUnverified = closingWindowActive && !closingFlowPending &&
+    (closingFlowStatus === "UNVERIFIED" || closingFlowStatus === "AWAITING_DATA");
+  if (groupBUnverified && closingFlowStatus === "AWAITING_DATA") {
+    closingFlowDetail = `UNVERIFIED — ${closingFlowDetail}`;
+    closingImpact = "0 pts (UNVERIFIED)";
+  }
+
   detailAudit.push({
     label: flowLabel,
     group: "B",
+    unverified: groupBUnverified,
+    coverage: closingCoverage,
     status: closingFlowStatus,
     detail: closingFlowDetail,
     impact: closingImpact,
@@ -1870,13 +1942,20 @@ export function calculateEODDecision({
       basisDetail = `basis raw ${raw}, adj ${adj}, Δ ${intra} → ${basisDir > 0 ? "bullish" : basisDir < 0 ? "bearish" : "mixed"}${basisPts !== 0 ? " (confirms quadrant)" : quadDir !== 0 && basisDir !== 0 ? " (contradicts quadrant, 0 pts)" : ""}`;
     }
   }
-  const groupC = clampAbs(quadPts + basisPts, EOD_GROUP_CAPS.C);
+  // Futures missing or stale (cached snapshot) → group C UNVERIFIED (0 pts).
+  const groupCUnverified = quadrant === "UNAVAILABLE" || futuresMetrics?.isStale === true;
+  const groupCReason = !groupCUnverified ? null
+    : futuresMetrics?.isStale === true ? "futures snapshot is stale (cached, not live)" : "futures quadrant unavailable";
+  const groupC = groupCUnverified ? 0 : clampAbs(quadPts + basisPts, EOD_GROUP_CAPS.C);
   detailAudit.push({
     label: "Futures Quadrant & Basis",
     group: "C",
+    unverified: groupCUnverified,
     status: quadrant,
-    detail: `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""}: ${signedPts(quadPts)}; ${basisDetail}${basisPts ? `: ${signedPts(basisPts)}` : ""}.`,
-    impact: groupC === 0 ? "0 pts" : signedPts(groupC),
+    detail: groupCUnverified
+      ? `UNVERIFIED — ${groupCReason}. Futures not scored.`
+      : `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""}: ${signedPts(quadPts)}; ${basisDetail}${basisPts ? `: ${signedPts(basisPts)}` : ""}.`,
+    impact: groupCUnverified ? "0 pts (UNVERIFIED)" : groupC === 0 ? "0 pts" : signedPts(groupC),
   });
 
   // ═════════════ Guardrails (no points) ═════════════
@@ -1956,22 +2035,24 @@ export function calculateEODDecision({
 
   const groups = {
     A: { id: "A", name: "Options positioning (PCR / ΔPCR / walls)", contribution: groupA, raw: rawA, cap: EOD_GROUP_CAPS.A },
-    B: { id: "B", name: `Closing options flow (${flowAnchorStr}+)`, contribution: groupB, raw: groupB, cap: EOD_GROUP_CAPS.B, driver: closingFlow?.driver || null },
-    C: { id: "C", name: "Futures (quadrant + basis)", contribution: groupC, raw: quadPts + basisPts, cap: EOD_GROUP_CAPS.C, quadrant, quadrantSource: quadSource },
+    B: { id: "B", name: `Closing options flow (${flowAnchorStr}+)`, contribution: groupB, raw: groupB, cap: EOD_GROUP_CAPS.B, driver: closingFlow?.driver || null, unverified: groupBUnverified, pending: !closingWindowActive || closingFlowPending, coverage: closingCoverage },
+    C: { id: "C", name: "Futures (quadrant + basis)", contribution: groupC, raw: quadPts + basisPts, cap: EOD_GROUP_CAPS.C, quadrant, quadrantSource: quadSource, unverified: groupCUnverified, unverifiedReason: groupCReason },
   };
+  groups.A.unverified = false;
   const groupSummary = (g, parts) => ({
     label: `Group ${g.id} · ${g.name}`,
     group: g.id,
     isGroupSummary: true,
-    status: g.contribution > 0 ? "BULLISH" : g.contribution < 0 ? "BEARISH" : "NEUTRAL",
+    unverified: Boolean(g.unverified),
+    status: g.unverified ? "UNVERIFIED" : g.contribution > 0 ? "BULLISH" : g.contribution < 0 ? "BEARISH" : "NEUTRAL",
     contribution: g.contribution,
     detail: parts,
-    impact: `${g.contribution === 0 ? "0 pts" : signedPts(g.contribution)} (cap ±${g.cap})`,
+    impact: `${g.contribution === 0 ? "0 pts" : signedPts(g.contribution)}${g.unverified ? " (UNVERIFIED)" : ""} (cap ±${g.cap})`,
   });
   audit.push(
     groupSummary(groups.A, `Full-day writing ${signedPts(fullDayPts)}, PCR ${signedPts(pcrPts)}, walls ${signedPts(levelPts)} → raw ${signedPts(rawA)}${rawA !== groupA ? `, capped to ${signedPts(groupA)} (writing ratio and ΔPCR are the same ratio)` : ""}.`),
     groupSummary(groups.B, closingFlowDetail),
-    groupSummary(groups.C, `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""} ${signedPts(quadPts)}; ${basisDetail}.`),
+    groupSummary(groups.C, groupCUnverified ? `UNVERIFIED — ${groupCReason}. Futures not scored.` : `Quadrant ${quadrant.replace(/_/g, " ")}${quadSource ? ` [${quadSource}]` : ""} ${signedPts(quadPts)}; ${basisDetail}.`),
     ...detailAudit,
     ...guardAudit,
   );
@@ -2081,7 +2162,19 @@ export function calculateEODDecision({
     verdictSide: bias === "NEUTRAL" ? "STAND_ASIDE" : bias,
   };
 
+  // Data-quality caveat: an UNVERIFIED group scored 0 because its window lacked coverage.
+  const unverifiedGroups = groupList.filter(g => g.unverified).map(g => g.id);
+  const unverifiedReasons = unverifiedGroups.map(id => id === "B"
+    ? `Group B closing flow: ${closingFlowDetail.replace(/^UNVERIFIED — /, "")}`
+    : `Group C futures: ${groupCReason}`);
+  const dataQualityCaveat = unverifiedGroups.length
+    ? `⚠️ Data caveat: ${unverifiedReasons.join("; ")} — scored 0 (UNVERIFIED); the verdict rests on the verified groups only.`
+    : null;
+  if (dataQualityCaveat) action = `${dataQualityCaveat} ${action}`;
+
   return {
+    unverifiedGroups,
+    dataQualityCaveat,
     verdict,
     bias,
     conviction,
@@ -2702,17 +2795,16 @@ export async function refreshLiveSnapshot({
       recommendation = "Call writing dominates. Favorable for stock PUTS / avoid fresh longs.";
     }
 
-    let floorShift = `Floor holding steady at ${floorStrike}`;
-    if (previousState.floor && previousState.floor !== floorStrike) {
-      floorShift = `Floor moved from ${previousState.floor} to ${floorStrike}`;
-      previousState.floor = floorStrike;
-    }
-
-    let roofShift = `Roof holding steady at ${roofStrike}`;
-    if (previousState.roof && previousState.roof !== roofStrike) {
-      roofShift = `Roof moved from ${previousState.roof} to ${roofStrike}`;
-      previousState.roof = roofStrike;
-    }
+    // Floor/roof migration compares with this instance's previous reading. If that reading is
+    // more than DQ_WINDOW_MAX_GAP_MIN minutes old, say so: it is not a continuous migration.
+    const shiftNowMins = getISTMinutes();
+    const shifts = describeFloorRoofShift({ previous: previousState, nowMins: shiftNowMins, floor: floorStrike, roof: roofStrike });
+    let floorShift = shifts.floorShift;
+    let roofShift = shifts.roofShift;
+    const floorRoofCoverage = shifts.coverage;
+    previousState.floor = floorStrike;
+    previousState.roof = roofStrike;
+    previousState.atMins = shiftNowMins;
 
     // Compute True Full Expiry Cumulative Open Interest across ALL strikes in option chain
     let fullExpiryPutOI = Number(v3Data.filtered?.PE?.totOI) || 0;
@@ -2837,6 +2929,51 @@ export async function refreshLiveSnapshot({
 
     smartMoney.eodDecision = eodDecision;
 
+    // Data quality of today's timeline + the coverage verdict of each history-based panel.
+    const dqFull = computeDataQuality({
+      timeline,
+      nowMins: getISTMinutes(),
+      isSunday: sessionInfo.isSunday,
+      isLive: sessionInfo.isLiveMarket,
+      snapshotAgeSec: 0,
+    });
+    const { _gapMins: dqGapMins, ...dataQuality } = dqFull;
+    const panel = (ok, text) => ({ ok, text: text || null });
+    dataQuality.panels = {
+      radar30: smartMoney.macroTurn?.status === "INSUFFICIENT_DATA"
+        ? panel(false, smartMoney.macroTurn.dataCoverage?.text)
+        : smartMoney.macroTurn?.status === "BUILDING" ? panel(null, "building") : panel(true),
+      closingFlow: eodDecision.groups?.B?.pending
+        ? panel(null, "closing window not active yet")
+        : eodDecision.groups?.B?.unverified ? panel(false, eodDecision.groups.B.coverage?.text || "closing-flow data missing") : panel(true),
+      intradayQuadrant: futuresMetrics?.quadrantIntraday?.dataCoverage
+        ? panel(false, futuresMetrics.quadrantIntraday.dataCoverage.text)
+        : futuresMetrics?.quadrantIntraday?.available === false ? panel(null, futuresMetrics.quadrantIntraday.reason) : panel(true),
+      floorRoof: panel(floorRoofCoverage.ok, floorRoofCoverage.text),
+      eod: panel(!(eodDecision.unverifiedGroups || []).length, eodDecision.dataQualityCaveat),
+    };
+
+    // Collector alerts: one Telegram per newly closed ≥5-min gap; on non-poller refreshes also a
+    // poller-heartbeat check (the poller may be down while browser loads keep data "fresh").
+    if (REDIS_URL && REDIS_TOKEN && sessionInfo.isLiveMarket && !isEodTest) {
+      try {
+        const { alertNewGaps, checkPollerHeartbeat } = await import("../src/collectorAlerts.js");
+        const { sendTelegramText } = await import("./tv-webhook.js");
+        const alertDeps = {
+          setNx: (k, v, ttl) => redisRestSetNx(k, v, ttl),
+          del: async (k) => Number(await redisRestCommand(["DEL", k])) || 0,
+          send: (t) => sendTelegramText(t),
+          getHeartbeat: () => redisRestGet("nifty:poller:last_ok"),
+        };
+        await alertNewGaps({ dataQuality: { ...dataQuality, _gapMins: dqGapMins }, istDateStr: getISTIsoDateStr(), deps: alertDeps });
+        if (source !== "poller") {
+          await checkPollerHeartbeat({ nowMs: Date.now(), isLiveMarket: true, trigger: source, deps: alertDeps });
+        }
+      } catch (e) {
+        console.error("Collector alert error:", e?.message);
+      }
+    }
+
     const eodHistory = await resolveAndSyncEodHistory({
       spot,
       floorStrike,
@@ -2930,6 +3067,7 @@ export async function refreshLiveSnapshot({
       eodDecision,
       eodHistory,
       intradayTimeline: timeline,
+      dataQuality,
       hasRedis: Boolean(REDIS_URL),
       rollover: {
         isExpiryDay,

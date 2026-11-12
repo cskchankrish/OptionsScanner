@@ -213,6 +213,8 @@ export function quadrantFromChanges(priceChangePct, oiChangePct, priceDeadbandPc
   return "LONG_UNWINDING";
 }
 
+import { windowCoverage } from "./dataQuality.js";
+
 function hasFut(pt) {
   return pt && Number(pt.futPrice) > 0 && Number(pt.futCombinedOI) > 0 && Number.isFinite(Number(pt.minutes));
 }
@@ -266,6 +268,11 @@ export function classifyIntradayFuturesQuadrant(ticks = [], {
   if (inWindow.length < minTicks) {
     return unavailable(`only ${inWindow.length} futures tick(s) in the window (< ${minTicks})`);
   }
+  // Coverage of the whole window: a reading across a hole in the timeline is not a rolling flow.
+  const coverage = windowCoverage(pts, Math.max(base.minutes, nominalStart), end.minutes, {
+    label: `the ${windowMins}-min futures window ${hhmm(nominalStart)}–${hhmm(end.minutes)}`,
+  });
+  if (!coverage.ok) return { ...unavailable(coverage.text), dataCoverage: coverage };
 
   const priceChange = Number((end.futPrice - base.futPrice).toFixed(2));
   const priceChangePct = Number(((priceChange / base.futPrice) * 100).toFixed(3));

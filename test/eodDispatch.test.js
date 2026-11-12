@@ -150,7 +150,14 @@ test("item6: full handler path at 15:00 IST dispatches once across concurrent po
     ]);
     assert.equal(r1.statusCode, 200);
     assert.equal(r1.body.isLive, true, "live path must run (not fallback)");
-    assert.equal(telegramSends, 1, `expected one EOD alert, errors: ${errors.join(" | ")}`);
+    // Exactly one EOD radar message. Since 12-Nov the same refresh may also send collector alerts:
+    // this session has a single tick at 15:00 (a 09:15–15:00 hole) and no poller heartbeat, so one
+    // "missed ticks" and one "poller down" alert are expected — each exactly once.
+    const eodTexts = telegramTexts.filter(t => /EOD CARRY|CARRY DIRECTIVE/.test(t));
+    assert.equal(eodTexts.length, 1, `expected one EOD alert, errors: ${errors.join(" | ")}`);
+    assert.equal(telegramTexts.filter(t => /Scanner missed ticks/.test(t)).length, 1);
+    assert.equal(telegramTexts.filter(t => /POLLER DOWN/.test(t)).length, 1);
+    assert.equal(telegramSends, 3);
     assert.ok(!errors.some(e => /ReferenceError|is not defined/.test(e)), errors.join(" | "));
     assert.ok(store.has("nifty:eod_slot_dispatched:2026-11-11:15:00"));
   } finally {

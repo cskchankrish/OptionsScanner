@@ -221,6 +221,11 @@ export async function runCarryDispatch({ istMinutes, istDateStr, dayOfWeek, eodD
 
   if (!isWeekday) return block("not a regular weekday session");
   if (category !== "BTST" && category !== "STBT") return block(`EOD verdict is ${category}`);
+  // Never carry on a verdict built on missing data (12-Nov data-quality rule).
+  const unverified = Array.isArray(eodDecision?.unverifiedGroups) ? eodDecision.unverifiedGroups : [];
+  if (unverified.length) {
+    return block(`EOD group(s) ${unverified.join(", ")} UNVERIFIED (not enough data)${eodDecision.dataQualityCaveat ? ` — ${String(eodDecision.dataQualityCaveat).replace(/^⚠️ Data caveat: /, "").slice(0, 200)}` : ""}`);
+  }
   const lastN = polls.slice(-cfg.requiredPolls);
   if (lastN.length < cfg.requiredPolls || !lastN.every((p) => p.category === category)) {
     return block(`${category} not stable on the last ${cfg.requiredPolls} polls (${lastN.map((p) => `${p.time} ${p.category}`).join(", ") || "none"})`);

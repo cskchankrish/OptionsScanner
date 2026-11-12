@@ -12,12 +12,19 @@ import handler from "../api/nifty-oi.js";
 
 test("getActiveExpiryDate returns active November weekly expiry and rejects expired October dates", () => {
   // If an expired past date is passed (e.g. 27-Oct-2026), it must roll to the active upcoming expiry
+  // (Was pinned to ["09-Nov-2026", "12-Nov-2026"], which stopped being true once the 12-Nov expiry
+  // passed: the function correctly rolls on to the next weekly expiry. Assert the rule, not a date.)
+  const isUpcoming = (d) => {
+    const t = new Date(d).getTime();
+    return Number.isFinite(t) && t >= Date.now() - 2 * 86400000;
+  };
   const expiredAttempt = getActiveExpiryDate("27-Oct-2026");
-  assert.ok(["09-Nov-2026", "12-Nov-2026"].includes(expiredAttempt), "Must roll expired October dates to active upcoming expiry");
+  assert.notEqual(expiredAttempt, "27-Oct-2026");
+  assert.ok(isUpcoming(expiredAttempt), "Must roll expired October dates to active upcoming expiry");
 
   // If no argument is passed, it returns the active upcoming expiry
   const activeNow = getActiveExpiryDate();
-  assert.ok(["09-Nov-2026", "12-Nov-2026"].includes(activeNow));
+  assert.ok(isUpcoming(activeNow));
 
   // If a valid future expiry is passed, it preserves it
   const validFuture = getActiveExpiryDate("26-Nov-2026");
@@ -62,10 +69,14 @@ test("getCanonicalSettledTimeline provides verified closing window (14:15 to 15:
     fusion: { verdict: "HIGH_CONVICTION_BTST", scoreBoost: 2 },
   });
 
-  assert.equal(result.isClosingDataValid, true);
+  // 12-Nov: this placeholder timeline is synthetic (13 hand-made ticks), so it is not data:
+  // the closing flow is UNVERIFIED and scored 0 instead of producing a +3 "verified" blitz.
+  assert.equal(result.isClosingDataValid, false);
+  assert.equal(result.groups.B.unverified, true);
   assert.ok(result.statusLabel.includes("WEEKEND CLOSED · PREVIOUS SESSION SETTLED"));
-  assert.equal(result.verdict, "CARRY NIFTY CE (BTST)");
-  assert.ok(result.audit.some(a => a.label.includes("Closing Hour Flow") && a.impact.includes("+3 pts")));
+  assert.notEqual(result.verdict, "CARRY NIFTY CE (BTST)");
+  assert.ok(result.audit.some(a => a.label.includes("Closing Hour Flow") && a.impact.includes("UNVERIFIED")));
+  assert.ok(timeline.every(pt => pt.synthetic === true), "placeholder ticks are marked synthetic");
   assert.ok(result.pcrWarning.includes("HISTORICAL PEAK OVERBOUGHT"));
 });
 

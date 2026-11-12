@@ -10,6 +10,7 @@ import {
   classifyFuturesQuadrant,
 } from "./smartMoneyFusion.js";
 import { isSpotFrozenAt } from "./flowCalc.js";
+import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -1818,6 +1819,8 @@ export function NiftyFlowView({ t, isDark }) {
 
   return (
     <div style={{ padding: isMobile ? "10px" : "16px 20px", maxWidth: 1400, margin: "0 auto" }}>
+      {/* ── DATA-QUALITY STRIP (12-Nov: never show a history-based conclusion on missing data silently) ── */}
+      <DataQualityStrip dataQuality={oiData?.dataQuality} isDark={isDark} isMobile={isMobile} />
       {/* ── TOP LIVE CONSOLIDATOR BANNER ── */}
       <div style={{
         background: t.surface,
@@ -1940,6 +1943,7 @@ export function NiftyFlowView({ t, isDark }) {
               {floor}
             </div>
             <div style={{ fontSize: isMobile ? 9.5 : 11, color: isDark ? "#86efac" : "#15803d" }}>{oiData?.floorShift || "Support holding"}</div>
+            <PanelDataMarker panel={oiData?.dataQuality?.panels?.floorRoof} isDark={isDark} isMobile={isMobile} />
           </div>
 
           <div style={{ background: isDark ? "#2d0a0a" : "#fef2f2", padding: isMobile ? "10px 12px" : "14px 16px", borderRadius: 10, border: "1px solid #ef444444" }}>
@@ -2096,6 +2100,7 @@ export function NiftyFlowView({ t, isDark }) {
                     Last {fusion.quadrantIntraday.windowMins} min, informational: <strong style={{ color: fusion.quadrantIntraday.color || t.textSub }}>{fusion.quadrantIntraday.label}</strong> ({fusion.quadrantIntraday.window})
                   </div>
                 )}
+                <PanelDataMarker panel={oiData?.dataQuality?.panels?.intradayQuadrant} isDark={isDark} isMobile={isMobile} />
               </div>
 
               {/* Cell 3: Smart Money Fusion Matrix Scenario */}
@@ -2387,6 +2392,7 @@ export function NiftyFlowView({ t, isDark }) {
               {oiData.smartMoney.trapAlert || "● 30-Min Flow In-Sync: Price action aligned with institutional writing flow."}
             </div>
           )}
+          <PanelDataMarker panel={oiData?.dataQuality?.panels?.radar30} isDark={isDark} isMobile={isMobile} />
         </div>
       )}
 
@@ -2491,6 +2497,7 @@ export function NiftyFlowView({ t, isDark }) {
                   {eod.statusLabel}
                 </span>
               </div>
+              <PanelDataMarker panel={oiData?.dataQuality?.panels?.eod} isDark={isDark} isMobile={isMobile} style={{ width: "100%" }} />
 
               {/* View Switcher Pills */}
               <div style={{

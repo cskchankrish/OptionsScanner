@@ -68,7 +68,8 @@ test("intraday quadrant: the current (not yet appended) reading replaces same-mi
 
 test("fusion quadrant selection: day by default; FUSION_QUADRANT_MODE=intraday opts in, with day fallback", () => {
   const fut = { ...FIXTURE.futures, priceChangeBase: "PREV_CLOSE" };
-  const iq = classifyIntradayFuturesQuadrant(upTo("15:13"));
+  // Gap-free synthetic 30-min fall on rising OI (the 11-Nov capture is too gappy for a rolling window).
+  const iq = classifyIntradayFuturesQuadrant(series(853, 913, m => ({ fut: 25200 - (m - 853) * 2, oi: 210000 + (m - 853) * 40 })));
   assert.equal(iq.quadrant, "SHORT_BUILDUP");
 
   const sel = selectFusionQuadrant(fut, iq, "intraday");
@@ -104,7 +105,7 @@ test("fusion quadrant selection: day by default; FUSION_QUADRANT_MODE=intraday o
 
   const fusion = evaluateSmartMoneyFusion(fut, { deltaPcr: 0.66, pcr: 0.77 }, { intradayQuadrant: iq, mode: "intraday" });
   assert.equal(fusion.quadrantSource, "INTRADAY");
-  assert.match(fusion.headline, /\[quadrant: 30m intraday 14:33→15:13\]/);
+  assert.match(fusion.headline, /\[quadrant: 30m intraday 14:43→15:13\]/);
 });
 
 test("env: FUSION_QUADRANT_MODE and FUSION_INTRADAY_WINDOW_MINS", () => {
@@ -186,13 +187,13 @@ test("macro turn: the 15:30 auction jump in spot is not a price move (futures us
   assert.match(r.message, /closing auction/);
 });
 
-test("macro turn: candles never end after the current tick and need ≥3 live ticks each", () => {
-  // Last tick 15:36: C2 = 15:30–15:36 with a single tick → no verdict
+test("macro turn: candles never end after the current tick, and a hole in the window means no reading", () => {
+  // Last tick 15:36 after an 11-minute hole: the window 15:15–15:36 is not covered → no verdict
   const ticks = [...series(880, 925, () => ({})), tick(936, { spot: 25125 })];
   const r = detectMacroTurn({ timeline: ticks, spot: 25125, floorStrike: 25000, roofStrike: 25300 });
   assert.equal(r.isTriggered, false);
-  assert.equal(r.status, "INSUFFICIENT_TICKS");
-  assert.match(r.message, /C2 \(15:30-15:36\) has 1 live tick/);
+  assert.equal(r.status, "INSUFFICIENT_DATA");
+  assert.match(r.message, /not enough data for the 30-min radar window 15:15-15:36 \(12 of 22 expected ticks; gap 15:25–15:36\)/);
   assert.doesNotMatch(r.message, /15:45/, "no candle may extend to 15:45");
 });
 
@@ -259,11 +260,17 @@ const eodBase = {
   totPutWriting: 100000, totCallWriting: 100000, pcr: 1.05, deltaPcr: 1.10,
   dayOfWeek: 3, nowMins: 915,
 };
-const flowTicks = (put0, call0, put1, call1) => [
-  { minutes: 855, time: "14:15", putWriting: put0, callWriting: call0, netDiff: put0 - call0 },
-  { minutes: 885, time: "14:45", putWriting: (put0 + put1) / 2, callWriting: (call0 + call1) / 2, netDiff: (put0 + put1) / 2 - (call0 + call1) / 2 },
-  { minutes: 915, time: "15:15", putWriting: put1, callWriting: call1, netDiff: put1 - call1 },
-];
+// One tick per minute 14:15–15:15 (a working poller), legs moving linearly from (put0, call0) to (put1, call1).
+const flowTicks = (put0, call0, put1, call1) => {
+  const out = [];
+  for (let m = 855; m <= 915; m++) {
+    const f = (m - 855) / 60;
+    const put = put0 + (put1 - put0) * f;
+    const call = call0 + (call1 - call0) * f;
+    out.push({ minutes: m, time: hm(m), putWriting: put, callWriting: call, netDiff: put - call, isLiveTick: true });
+  }
+  return out;
+};
 
 test("EOD group B: WRITING-driven blitz scores full tier; UNWINDING-driven is one tier lower and never a blitz", () => {
   const writing = calculateEODDecision({ ...eodBase, timeline: flowTicks(300000, 300000, 300000, 390000) });
@@ -335,24 +342,25 @@ test("11-Nov fixture: captured 'before' readings are what the owner saw", () => 
   assert.equal(FIXTURE.eodDecision.lastHourNetDelta, -108743);
 });
 
-test("11-Nov regression: day vs intraday quadrant during the fall and at the close", () => {
-  const expected = {
-    "14:50": ["SHORT_COVERING", "LONG_UNWINDING"],
-    "15:01": ["LONG_UNWINDING", "SHORT_BUILDUP"],
-    "15:13": ["LONG_UNWINDING", "SHORT_BUILDUP"],
-    "15:25": ["LONG_UNWINDING", "SHORT_BUILDUP"],
-    "15:36": ["SHORT_COVERING", "LONG_BUILDUP"],
-  };
-  for (const [t, [day, intra]] of Object.entries(expected)) {
+// The 11-Nov capture is gappy: 120 ticks for 09:15–15:40, with holes such as 14:33→14:44 and
+// 15:25→15:36 inside the closing window. Since 12-Nov every history-based reading checks the
+// coverage of its own window, so on this capture the honest output is "not enough data", not a
+// conclusion. The arithmetic of the old readings is still checked directly on the same ticks.
+
+test("11-Nov regression: day-level quadrant as stored; rolling 30-min quadrant refuses to read across the gaps", () => {
+  const dayLevel = { "14:50": "SHORT_COVERING", "15:01": "LONG_UNWINDING", "15:13": "LONG_UNWINDING", "15:25": "LONG_UNWINDING", "15:36": "SHORT_COVERING" };
+  for (const [t, day] of Object.entries(dayLevel)) {
     const ticks = upTo(t);
     assert.equal(ticks.at(-1).futQuadrant, day, `${t} day-level quadrant as stored`);
-    assert.equal(classifyIntradayFuturesQuadrant(ticks).quadrant, intra, `${t} intraday quadrant`);
+    const iq = classifyIntradayFuturesQuadrant(ticks);
+    assert.equal(iq.available, false, `${t}: ${iq.reason}`);
+    assert.match(iq.reason, /not enough data for the 30-min futures window/, t);
+    assert.match(iq.reason, /\d+ of 31 expected ticks/, t);
   }
-  // 12:40 sits after a 29-minute feed gap → intraday unavailable → day fallback
   assert.equal(classifyIntradayFuturesQuadrant(upTo("12:40")).available, false);
 });
 
-test("11-Nov regression: no '30-min macro bull trap' is manufactured from the frozen window", () => {
+test("11-Nov regression: no '30-min macro bull trap' is manufactured — the radar reports the gap", () => {
   for (const t of ["15:16", "15:18", "15:24", "15:25", "15:36"]) {
     const r = detectMacroTurn({ timeline: upTo(t), spot: upTo(t).at(-1).spot, floorStrike: FIXTURE.floor, roofStrike: FIXTURE.roof });
     assert.equal(r.isTriggered, false, `${t}: ${r.message}`);
@@ -360,8 +368,9 @@ test("11-Nov regression: no '30-min macro bull trap' is manufactured from the fr
     assert.doesNotMatch(r.message, /15:45/, t);
   }
   const close = detectMacroTurn({ timeline: TL, spot: FIXTURE.spotPrice, floorStrike: FIXTURE.floor, roofStrike: FIXTURE.roof });
-  assert.equal(close.status, "INSUFFICIENT_TICKS");
+  assert.equal(close.status, "INSUFFICIENT_DATA");
   assert.equal(close.priceSource, "FUTURES");
+  assert.match(close.message, /not enough data for the 30-min radar window 15:15-15:36 \(\d+ of 22 expected ticks; gap 15:25–15:36\)/);
 });
 
 function closeReadings(mode) {
@@ -379,53 +388,45 @@ function closeReadings(mode) {
   return { fusion, eod };
 }
 
-test("11-Nov regression (default day mode): fusion as before, closing flow UNWINDING-driven, each EOD group once", () => {
+test("11-Nov regression (day mode): closing flow UNVERIFIED across the gaps, scored 0, verdict carries a data caveat", () => {
   const { fusion, eod } = closeReadings("day");
   assert.equal(fusion.scenarioId, "BULL_TRAP", "day quadrant SHORT_COVERING + ΔPCR 0.66 roof blitz, unchanged");
   assert.equal(fusion.quadrantSource, "DAY");
   assert.equal(fusion.quadrantInfo.quadrant, "SHORT_COVERING");
-  assert.match(fusion.quadrantIntradayInfoLabel, /last 30 min, informational: LONG_BUILDUP \(15:06→15:36\)/);
 
-  assert.equal(eod.closingFlow.driver, "UNWINDING");
-  assert.equal(eod.audit.find(a => a.label === "Closing Hour Flow (14:15+)").status, "BEARISH_PUT_UNWINDING");
+  const closing = eod.audit.find(a => a.label === "Closing Hour Flow (14:15+)");
+  assert.equal(closing.status, "UNVERIFIED");
+  assert.equal(closing.unverified, true);
+  assert.match(closing.detail, /not enough data for the closing-flow window 14:15–15:36 \(\d+ of 82 expected ticks; gap 14:33–14:44\)/);
+  assert.equal(eod.isClosingDataValid, false);
+  assert.equal(eod.groups.B.contribution, 0);
+  assert.equal(eod.groups.B.unverified, true);
+  assert.deepEqual(eod.unverifiedGroups, ["B"]);
+  assert.match(eod.dataQualityCaveat, /Group B closing flow: not enough data/);
   assert.deepEqual(eod.audit.filter(a => a.isGroupSummary).map(a => a.group), ["A", "B", "C"]);
-  assert.deepEqual([eod.groups.A.contribution, eod.groups.B.contribution, eod.groups.C.contribution], [-2, -2, 0]);
-  assert.equal(eod.groups.C.quadrant, "SHORT_COVERING", "group C uses the mode-selected (day) quadrant");
-  assert.equal(eod.score, -4);
-  assert.equal(eod.verdict, "CARRY NIFTY PE (STBT)");
-  assert.deepEqual(eod.agreement.groupsAgreeing, ["A", "B"]);
-  assert.deepEqual(eod.agreement.groupsOpposing, []);
-  assert.equal(eod.conviction, 69);
-  assert.equal(eod.audit.find(a => a.label === "Smart Money Futures Fusion").status, "BEARISH_VETO",
-    "bull-trap veto blocks BTST only; adds no points");
-  assert.equal(eod.audit.find(a => a.label.includes("Institutional Veto")), undefined);
+  assert.equal(eod.audit.find(a => a.isGroupSummary && a.group === "B").status, "UNVERIFIED");
+  assert.deepEqual([eod.groups.A.contribution, eod.groups.B.contribution, eod.groups.C.contribution], [-2, 0, 0]);
+  assert.equal(eod.score, -2);
+  assert.equal(eod.verdict, "EXIT TO CASH / DO NOT CARRY", "the old STBT rested on a delta read across two 11-minute holes");
+  assert.match(eod.action, /^⚠️ Data caveat/);
+  assert.equal(eod.audit.find(a => a.label.includes("Institutional Veto")), undefined, "no late veto from unverified data");
 });
 
-test("11-Nov regression (opt-in intraday mode): closing flow UNWINDING-driven with both legs quoted; each EOD group once", () => {
+test("11-Nov regression: the two-leg decomposition of the old closing delta is unchanged (arithmetic only)", () => {
+  const anchor = TL.find(p => p.time === "14:12");
+  const last = TL.at(-1);
+  const f = decomposeWritingDelta(anchor, last);
+  assert.equal(f.netDelta, -108743);
+  assert.equal(f.driver, "UNWINDING");
+  assert.equal(f.dominantLeg, "PUT");
+  assert.equal(f.putLegDelta, -177411);
+  assert.equal(f.callLegDelta, -68668);
+});
+
+test("11-Nov regression (opt-in intraday mode): intraday window unavailable on the gappy capture → day fallback", () => {
   const { fusion, eod } = closeReadings("intraday");
-  assert.equal(fusion.scenarioId, "MIXED_FLOW", "no bull trap from a whole-day 'price up' label");
-  assert.equal(fusion.quadrantSource, "INTRADAY");
-  assert.equal(fusion.quadrantIntradayInformational, false);
-
-  assert.equal(eod.lastHourNetDelta, -108743);
-  assert.equal(eod.closingFlow.driver, "UNWINDING");
-  assert.equal(eod.closingFlow.dominantLeg, "PUT");
-  assert.equal(eod.closingFlow.putLegDelta, -177411);
-  assert.equal(eod.closingFlow.callLegDelta, -68668);
-  const closing = eod.audit.find(a => a.label === "Closing Hour Flow (14:15+)");
-  assert.equal(closing.status, "BEARISH_PUT_UNWINDING");
-  assert.match(closing.detail, /put writing -1\.8L/);
-  assert.match(closing.detail, /call writing -68\.7k/);
-  assert.doesNotMatch(closing.detail, /distribution|Blitz/i);
-
-  const summaries = eod.audit.filter(a => a.isGroupSummary);
-  assert.deepEqual(summaries.map(a => a.group), ["A", "B", "C"]);
-  assert.deepEqual([eod.groups.A.contribution, eod.groups.B.contribution, eod.groups.C.contribution], [-2, -2, 1]);
-  assert.equal(eod.score, -3);
-  assert.equal(eod.verdict, "CARRY NIFTY PE (STBT)");
-  assert.deepEqual(eod.agreement.groupsAgreeing, ["A", "B"]);
-  assert.deepEqual(eod.agreement.groupsOpposing, ["C"]);
-  assert.equal(eod.conviction, 59);
-  assert.equal(eod.audit.find(a => a.label.includes("Institutional Veto")), undefined, "no late call blitz veto from put unwinding");
+  assert.equal(fusion.quadrantSource, "DAY");
+  assert.match(fusion.quadrantSourceReason, /intraday window unavailable/);
+  assert.equal(eod.groups.B.unverified, true);
   assert.equal(eod.audit.find(a => a.label === "30-Min Macro Turn").impact, "0 pts (counted in Group B)");
 });
