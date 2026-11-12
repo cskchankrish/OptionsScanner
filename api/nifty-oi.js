@@ -2867,6 +2867,38 @@ export async function refreshLiveSnapshot({
       console.error("Error dispatching 15-minute EOD radar alert:", err);
     }
 
+    // Overnight carry bridge (BTST/STBT → Algo, src/carryBridge.js). Inert unless
+    // CARRY_BRIDGE_ENABLED=true and the flow-bridge URL + secret are set.
+    if (!isEodTest) {
+      try {
+        const { runCarryDispatch, storeFromCommand, newCarryId } = await import("../src/carryBridge.js");
+        const rawSpot = Number(v3Data.records?.underlyingValue);
+        await runCarryDispatch({
+          istMinutes,
+          istDateStr,
+          dayOfWeek: getISTDayOfWeek(),
+          eodDecision,
+          // The real NSE print only (never the hard-coded fallback used for display).
+          spot: Number.isFinite(rawSpot) && rawSpot > 0 ? rawSpot : null,
+          dataTimestamp: v3Data.records?.timestamp ?? null,
+          deadlineMs,
+          store: REDIS_URL && REDIS_TOKEN ? storeFromCommand(redisRestCommand) : null,
+          deps: {
+            env: () => process.env,
+            now: () => Date.now(),
+            fetchImpl: (...a) => globalThis.fetch(...a),
+            sendText: async (text) => {
+              const { sendTelegramText } = await import("./tv-webhook.js");
+              return sendTelegramText(text);
+            },
+            newId: newCarryId,
+          },
+        });
+      } catch (err) {
+        console.error("Carry dispatch error:", err?.message);
+      }
+    }
+
     payload = {
       success: true,
       isLive: true,

@@ -287,3 +287,141 @@ Tests: `test/bridgeStatus.test.js`.
 ```bash
 curl -s -H "x-webhook-secret: $TV_WEBHOOK_SECRET" "https://niftyninjaa.vercel.app/api/bridge-status?fresh=1"
 ```
+
+## Overnight carry (BTST / STBT)
+
+Near the close the scanner can tell the Algo to place **one overnight carry trade per IST date**.
+
+- Code: `src/carryBridge.js`, called from the EOD-radar call site in `refreshLiveSnapshot`, so it
+  runs on every poll.
+- Tests: `test/carryBridge.test.js`.
+- The carry is tracked in `nifty:carry:active`, separately from the intraday trade. It does
+  **not** block intraday signal validation; the Algo itself rejects entries while it holds a carry.
+
+### Switch
+
+- The carry runs only when `CARRY_BRIDGE_ENABLED=true` **and** `FLOW_BRIDGE_URL` +
+  `FLOW_BRIDGE_SECRET` are set.
+- It is independent of `FLOW_BRIDGE_ENABLED`.
+- The default is off. Turn it off instantly with `CARRY_BRIDGE_ENABLED=false`.
+- When off, nothing is recorded, sent or reported.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `CARRY_BRIDGE_ENABLED` | off | Master switch for the carry |
+| `CARRY_WINDOW_START` / `CARRY_WINDOW_END` | `15:31` / `15:37` | Dispatch window (IST, inclusive) |
+| `CARRY_REPORT_TIME` | `15:38` | When the "nothing sent today" line is sent (checked 15:38–15:40) |
+| `CARRY_REQUIRED_POLLS` | 3 | Number of consecutive in-window polls that must show the same category |
+| `CARRY_MIN_POLL_GAP_SEC` | 30 | Polls closer together than this count as one, so a burst of browser refreshes cannot fake stability |
+| `CARRY_MIN_AGREEMENT` | 65 | Minimum `eodDecision.agreement.value`. 65 means at least two evidence groups agree, given caps of 60 for one group and 75 for two |
+| `FLOW_MAX_AGE_SEC` | 900 | Freshness rule, the same as for signal validation |
+| `FLOW_BRIDGE_TIMEOUT_MS` | 3000 | Dispatch timeout, shared with the flow bridge |
+| `FLOW_BRIDGE_FILL_WAIT_SEC` | 120 | Stuck-ACCEPTED alert, shared with the flow bridge |
+| `FLOW_ALGO_SQUAREOFF_TIME` | unset | Square-off time printed in the intraday Algo protocol text. If unset, the text says "the Algo's configured square-off time" |
+
+### Conditions
+
+All of these must hold, checked in this order. The first one that fails is recorded as that day's
+"why not".
+
+1. The poll falls inside the window, on a weekday (Mon–Fri; the Sunday Muhurat session is excluded).
+2. The carry category is BTST or STBT. The mapping is the same `bias` mapping the flip alerts use.
+3. The category is identical on the last `CARRY_REQUIRED_POLLS` in-window polls. These are kept in
+   `nifty:carry:polls:<date>`.
+4. Agreement is at least `CARRY_MIN_AGREEMENT`.
+5. This poll carries a real NSE `underlyingValue`. The display fallback value is never used.
+6. NSE's option-chain timestamp (`records.timestamp`, IST) is parseable and no older than
+   `FLOW_MAX_AGE_SEC`.
+7. `eodDecision.stopLoss` is present and on the correct side of the reference: below it for LONG,
+   above it for SHORT.
+8. There is enough request time left. Inside the poller, the dispatch timeout is
+   `min(3000, deadline − now − 4500)`. If that is under 1 s, the scanner skips this poll and lets
+   the next one send.
+9. No previous carry is still open.
+10. The atomic daily claim `SET NX nifty:carry:claim:<date>` (3 d) is won. It is **never
+    released** once a send was attempted, whatever the outcome.
+
+### Instruction
+
+```json
+{ "v":1, "type":"CARRY_ENTRY", "id":"ct-<ms>-<8hex>", "ts":<ms>, "verdict":"BTST|STBT",
+  "dir":"LONG|SHORT", "spot":<reference>, "sl":<stop>, "score":<eod score>, "agreement":<value>, "lots":1 }
+```
+
+- Endpoint, headers and HMAC are the same as for `FLOW_ENTRY`.
+- **`spot` (the reference)** is the NSE `underlyingValue` of the dispatching poll, taken
+  between 15:31 and 15:37. By then the spot index has printed the 15:30 closing-auction close, so
+  the reference is the official auction close. It is also the `spot` that the EOD decision used.
+- **`sl`** is `eodDecision.stopLoss`. For BTST that is the floor below spot, or spot − 35 when
+  there is none. For STBT it is the roof above spot, or spot + 35.
+- **`dir`** is LONG for BTST and SHORT for STBT. **`lots`** is always 1.
+
+### Outcomes
+
+The handling matches `FLOW_ENTRY`:
+- **accepted:** `ACCEPTED`, with "sent to Algo, awaiting fill".
+- **rejected / duplicate:** `NOT_EXECUTED`. The carry is released and archived, but the daily claim is kept.
+- **non-200, timeout or anything else:** `UNKNOWN`, with a loud "check your broker". The carry is kept with no
+  expiry and is never auto-cleared.
+
+The carry record is written as `PENDING` before sending, so a function killed mid-dispatch still
+leaves it visible and owned.
+
+### Sync-back on `/api/tv-webhook`
+
+The existing secret is required, and so is a `tradeId` matching `nifty:carry:active`. Repeats of
+the same report are 200 no-ops.
+
+| Grade | Valid from | Effect |
+|---|---|---|
+| `CARRY_FILLED` `{tradeId, source, lots, optionFill, contract, mode, t, accounts, converted}` | PENDING / ACCEPTED / UNKNOWN | Becomes `FILLED`; stores the fields and `filledAt`. Telegram shows contract, average fill, accounts and whether it was converted. |
+| `CARRY_FAILED` `{tradeId, source, reason, mode, t}` | PENDING / ACCEPTED / UNKNOWN | Becomes `NOT_EXECUTED`; the carry is released and archived. A FILLED carry gets 409 `CONTRADICTORY_REPORT` with a loud Telegram. |
+| `CARRY_EXIT` `{tradeId, source, reason, spot, optionFill, lots, mode, t, accounts}` | any open state | The carry is cleared and a track-record entry is pushed to `nifty:carry:history` with `entry{spotRef, sl, score, agreement, contract, optionFill, filledAt, converted}` and `exit{reason, spot, optionFill, lots, mode, t, accounts}`. Telegram shows per-account figures as reported. |
+
+`CARRY_EXIT` reasons are `MORNING_EXIT`, `STOP_AT_OPEN` or `MANUAL_CLOSE`.
+
+The scanner answers 409 in these cases:
+
+| Error | When |
+|---|---|
+| `TRADE_ID_REQUIRED` | No `tradeId` |
+| `TRADE_ID_MISMATCH` | The `tradeId` doesn't match the open carry |
+| `CONTRADICTORY_REPORT` (with a loud Telegram) | FILLED or EXIT after FAILED, or FAILED after EXIT |
+
+The stuck-ACCEPTED alert, "NO CARRY FILL REPORT", is sent once per carry from the per-poll check.
+
+**Conversion.** When the Algo turns an intraday position into the carry, it sends a normal
+`MANUAL_CLOSE` with the intraday `tradeId` and `reason: "converted to carry"`. The reason is stored
+as `exitRecord.closeReason` and in `sync.reason`; nothing else about exits changes.
+
+### Visibility and Telegram
+
+The open carry appears in these places:
+- `GET /api/tv-webhook?status=1`, as `openCarry`;
+- the default GET;
+- every actionable intraday alert, as a "🌙 Open overnight carry" line;
+- `/api/bridge-status`: `carryEnabled` in the public view; carry settings and the open carry in
+  the authenticated `detail.carry`.
+
+Telegram messages:
+- conditions met and instruction sent: verdict, score, agreement, the polls, reference, stop and
+  id;
+- the dispatch outcome;
+- fill;
+- morning exit;
+- stuck-ACCEPTED;
+- contradictory reports;
+- at 15:38, once per weekday when the carry was enabled and nothing was sent, the condition that
+  failed last, or "no poll ran inside the window".
+
+### Intraday Telegram for Algo-owned trades
+
+When a flow signal is handed to the Algo, the entry message no longer prints the paper protocol
+("Recommended Size: 2 Lots", "Scale out 60%", "Fill at next bar open"). Instead it says:
+- the Algo buys 1 lot per account immediately;
+- it moves the stop to entry at T1;
+- it exits fully at T2;
+- it squares off at `FLOW_ALGO_SQUAREOFF_TIME`, or at "the Algo's configured square-off time" if
+  that is unset.
+
+A `NOT_EXECUTED` signal says that no position was opened. Paper trades keep the old text.

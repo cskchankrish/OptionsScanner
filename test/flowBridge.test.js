@@ -414,7 +414,7 @@ test("sync-back: T1 then T2 with matching tradeId drive the bridge-owned trade a
   assert.equal(r2.body.event, "TRADE_CLOSED");
   assert.equal(r2.body.exitRecord.exitPrice, 24830);
   assert.equal(r2.body.exitRecord.trade.id, "ft-owned-1");
-  assert.deepEqual(r2.body.exitRecord.sync, { source: "algo", tradeId: "ft-owned-1", spot: 24830, optionFill: 180, lots: 1, mode: "live", t: 1762841000000 });
+  assert.deepEqual(r2.body.exitRecord.sync, { source: "algo", tradeId: "ft-owned-1", spot: 24830, optionFill: 180, lots: 1, mode: "live", t: 1762841000000, reason: null });
   assert.equal(stored(redis), null, "flat");
 }));
 

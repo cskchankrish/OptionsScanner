@@ -42,6 +42,26 @@ import {
   getFillWaitSec,
   isStuckAccepted,
 } from "../src/flowBridge.js";
+import {
+  CARRY_ACTIVE_KEY,
+  CARRY_SYNC_GRADES,
+  handleCarrySync,
+  storeFromClient,
+  summarizeCarry,
+  isCarryOpen,
+} from "../src/carryBridge.js";
+
+/** Summary of the open overnight carry (separate key; never blocks intraday validation). */
+async function readOpenCarry(redis) {
+  if (!redis) return null;
+  try {
+    const raw = await redis.get(CARRY_ACTIVE_KEY);
+    const t = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return isCarryOpen(t) ? summarizeCarry(t) : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 export const ACTIVE_TRADE_KEY = "nifty:tv:active_trade";
 
@@ -708,6 +728,31 @@ export async function sendTelegramAlert(fused) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId) return;
 
+  const msg = formatTelegramAlert(fused);
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: msg,
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Telegram webhook error:", err.message);
+  }
+}
+
+/** One-line description of the open overnight carry for intraday alerts. */
+function describeOpenCarry(c) {
+  if (!c) return null;
+  return `🌙 *Open overnight carry:* \`${c.verdict}\` (${c.dir}) · \`${c.status}\`${c.contract ? ` · \`${mdSafe(c.contract)}\`` : ""} · ID \`${c.id}\` — the Algo rejects new entries while it holds the carry.`;
+}
+
+/** Builds the Telegram text for a fused signal (pure; exported for tests). */
+export function formatTelegramAlert(fused) {
   const isTrap = fused.grade === "BEAR_TRAP_BUY" || fused.grade === "BULL_TRAP_SELL";
   const isSynergy = fused.grade === "SYNERGY_BULL" || fused.grade === "SYNERGY_BEAR";
   const icon =
@@ -776,13 +821,22 @@ export async function sendTelegramAlert(fused) {
       ? `• *Targets (Fill-Relative):* T1: \`${fused.target1Price}\` (+${fused.target1Dist ?? "--"} pts / 1.0R) | T2: \`${fused.target2Price}\` (+${fused.target2Dist ?? "--"} pts / 2.0R)`
       : null;
 
+    // A signal handed to the Algo must not print the paper-trading protocol.
+    const algoHandled = Boolean(fused.execution);
+    const squareOff = process.env.FLOW_ALGO_SQUAREOFF_TIME ? `${process.env.FLOW_ALGO_SQUAREOFF_TIME} IST` : "the Algo's configured square-off time";
     lines = [
       `${icon} *${fused.decision}* · \`${fused.grade}\`${kindBadge} (${fused.direction})${armedBadge}`,
       `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
-      `• *Entry (Signal Close):* \`${fused.entryPrice}\` *(Fill at next bar open)*`,
+      algoHandled
+        ? `• *Signal Close (spot):* \`${fused.entryPrice}\``
+        : `• *Entry (Signal Close):* \`${fused.entryPrice}\` *(Fill at next bar open)*`,
       `• *Stop Loss:* \`${fused.stopLoss ?? "N/A"}\` (${fused.riskPoints ? fused.riskPoints + " pts, ATR-Capped" : "N/A"})`,
-      targetLine,
-      `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
+      algoHandled && fused.target1Price
+        ? `• *Targets (spot):* T1 \`${fused.target1Price}\` | T2 \`${fused.target2Price}\``
+        : targetLine,
+      algoHandled
+        ? `• *Size:* \`1 lot per account\` (Algo hard cap; scanner tier ${fused.tier})`
+        : `• *Recommended Size:* \`${fused.recommendedLots} Lot(s)\` (${fused.tier})`,
       fused.tradeId ? `• *Trade ID:* \`${fused.tradeId}\`` : null,
       fused.execution ? `• *Algo Execution:* ${describeExecution(fused.execution)}` : null,
       `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
@@ -790,7 +844,20 @@ export async function sendTelegramAlert(fused) {
       `• *Verdict:* ${fused.reasoning}`,
     ].filter(Boolean);
 
-    if ((isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
+    if (algoHandled && (isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
+      if (fused.execution.status === "NOT_EXECUTED") {
+        lines.push(`\n🤖 *ALGO:* not executed — no position was opened for this signal.`);
+      } else {
+        lines.push(
+          `\n🤖 *ALGO EXECUTION PROTOCOL:*`,
+          `1. The Algo buys *1 lot per account immediately* on acceptance (no waiting for the next bar).`,
+          `2. At T1 (\`${fused.target1Price ?? "--"}\`) it moves the stop to entry.`,
+          `3. At T2 (\`${fused.target2Price ?? "--"}\`) it exits fully.`,
+          `4. Any open position is squared off at ${squareOff}.`,
+          `Exits are reported back by the Algo; the scanner does not auto-manage this trade.`
+        );
+      }
+    } else if ((isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
       const isHtf = fused.timeframe === "125" || fused.timeframe === "D" || Number(fused.timeframe) >= 60;
       const holdProtocol = isHtf
         ? "Max 15 bars (3-5 Days Swing / Positional Hold on 125m/Daily)"
@@ -812,21 +879,9 @@ export async function sendTelegramAlert(fused) {
     lines.splice(Math.min(3, lines.length), 0, `• *Option-Chain Snapshot:* ${fused.snapshotProvenance}`);
   }
 
-  const msg = lines.join("\n");
+  if (fused.openCarry) lines.push(describeOpenCarry(fused.openCarry));
 
-  try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: msg,
-        parse_mode: "Markdown",
-      }),
-    });
-  } catch (err) {
-    console.error("Telegram webhook error:", err.message);
-  }
+  return lines.join("\n");
 }
 
 /**
@@ -1763,6 +1818,8 @@ export default async function handler(req, res) {
       }
 
       // Explicit status check endpoint
+      const openCarry = await readOpenCarry(redis);
+
       if (req.query?.action === "status" || req.query?.status === "1") {
         const isFlat = !activeTrade || !activeTrade.active;
         return res.status(200).json({
@@ -1771,6 +1828,8 @@ export default async function handler(req, res) {
           hasActiveTrade: !isFlat,
           permitsSynergyTrades: isFlat,
           activeTrade,
+          // The overnight carry is tracked separately and does not block intraday validation.
+          openCarry,
           message: isFlat
             ? "Market is FLAT. No active trades. You may take the next Trap setup or evaluate Bull/Bear Synergy."
             : `Active trade OPEN: ${activeTrade.grade} ${activeTrade.direction} @ ${activeTrade.entryPrice} (SL: ${activeTrade.stopLoss}, T1: ${activeTrade.target1Price}). Single-position lock active.`
@@ -1782,6 +1841,7 @@ export default async function handler(req, res) {
         connected: Boolean(REDIS_URL),
         istDate: queryDate,
         activeTrade,
+        openCarry,
         latestSignal,
         signals,
       });
@@ -1815,6 +1875,17 @@ export default async function handler(req, res) {
     // 1a. Algo entry outcome sync-back (contract v1.1): ENTRY_FILLED / ENTRY_FAILED.
     if (ENTRY_SYNC_GRADES.includes(payload?.grade)) {
       return await handleEntrySync({ redis, payload, res });
+    }
+
+    // 1a'. Overnight carry sync-back: CARRY_FILLED / CARRY_FAILED / CARRY_EXIT (src/carryBridge.js).
+    if (CARRY_SYNC_GRADES.includes(payload?.grade)) {
+      const d = getWebhookDeps();
+      const out = await handleCarrySync({
+        payload,
+        store: storeFromClient(redis),
+        deps: { now: d.now, sendText: d.sendText },
+      });
+      return res.status(out.status).json(out.body);
     }
 
     // 1b. Handle Trade Exit / T1 Scale-Out Webhooks directly from TradingView or Execution Bridge
@@ -1855,6 +1926,9 @@ export default async function handler(req, res) {
             lots: payload.lots ?? null,
             mode: payload.mode ?? null,
             t: payload.t ?? null,
+            // e.g. "converted to carry" on the MANUAL_CLOSE the Algo sends when it turns the
+            // intraday position into the overnight carry.
+            reason: payload.reason ?? null,
           }
         : null;
 
@@ -1928,7 +2002,8 @@ export default async function handler(req, res) {
         trade: activeTrade || { grade: payload.grade, direction: payload.dir || "LONG", entryPrice: fillPrice },
         decision: "TRADE_CLOSED_FLAT",
         recommendedLots: 0,
-        reasoning: `Trade exited (${payload.grade}) at ${fillPrice}. Realized net PnL: ${netPnl >= 0 ? "+" : ""}${netPnl} pts. Market is now FLAT.`,
+        reasoning: `Trade exited (${payload.grade}${payload.reason ? `: ${String(payload.reason).slice(0, 120)}` : ""}) at ${fillPrice}. Realized net PnL: ${netPnl >= 0 ? "+" : ""}${netPnl} pts. Market is now FLAT.`,
+        closeReason: payload.reason ?? null,
         ...(sync ? { sync } : {}),
       };
 
@@ -2148,7 +2223,11 @@ export default async function handler(req, res) {
       await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
     }
 
-    // 6. Fire Telegram Notification
+    // 6. Fire Telegram Notification (with the open overnight carry, if any, for visibility only).
+    if (isActionable) {
+      const openCarry = await readOpenCarry(redis);
+      if (openCarry) fusedVerdict.openCarry = openCarry;
+    }
     await sendTelegramAlert(fusedVerdict);
 
     // 7. Scanner-blind watchdog (live market hours only; deduped once per outage).

@@ -17,6 +17,7 @@
  */
 import { authorizeRequest, extractRequestSecret } from "../src/webhookAuth.js";
 import { inspectFlowBridgeConfig, pingAlgo, PING_TIMEOUT_MS } from "../src/flowBridge.js";
+import { getCarryConfig, describeCarryConfig, summarizeCarry, isCarryOpen, CARRY_ACTIVE_KEY } from "../src/carryBridge.js";
 
 export const STATUS_LOCK_KEY = "nifty:bridge:status:lock";
 export const STATUS_CACHE_KEY = "nifty:bridge:status:last";
@@ -41,6 +42,7 @@ async function defaultDeps() {
     setNx: (k, v, ttl) => redisRestSetNx(k, v, ttl),
     get: (k) => redisRestGet(k),
     set: (k, v, ttl) => redisRestSet(k, v, ttl),
+    getCarry: () => redisRestGet(CARRY_ACTIVE_KEY),
   };
 }
 
@@ -90,8 +92,19 @@ export function createBridgeStatusHandler(overrides = {}) {
       fillWaitSec: cfg.fillWaitSec,
     };
 
+    const carryCfg = getCarryConfig(env);
+    let openCarry = null;
+    if (authed) {
+      try {
+        const t = await deps.getCarry();
+        openCarry = isCarryOpen(t) ? summarizeCarry(t) : null;
+      } catch (e) {
+        openCarry = null;
+      }
+    }
+
     const respond = (result, cached) => {
-      const body = { ok: result.state === "OK", state: result.state, checkedAt: result.checkedAt, cached };
+      const body = { ok: result.state === "OK", state: result.state, checkedAt: result.checkedAt, cached, carryEnabled: carryCfg.enabled };
       if (authed) {
         body.detail = {
           config: configDetail,
@@ -99,6 +112,7 @@ export function createBridgeStatusHandler(overrides = {}) {
           algo: result.algo || null,
           reason: result.reason ?? null,
           guard: result.guard || null,
+          carry: { settings: describeCarryConfig(carryCfg), openCarry },
         };
       }
       return res.status(200).json(scrub(body, env));

@@ -130,7 +130,7 @@ test("OK: authenticated detail has config presence, target host, mode, accounts,
 test("public caller gets only { ok, state, checkedAt, cached }", async () => {
   const s = setup();
   const res = await s.run();
-  assert.deepEqual(Object.keys(res.body).sort(), ["cached", "checkedAt", "ok", "state"]);
+  assert.deepEqual(Object.keys(res.body).sort(), ["cached", "carryEnabled", "checkedAt", "ok", "state"]);
   assert.equal(res.body.state, "OK");
   assertClean(res.body);
 });
@@ -170,7 +170,7 @@ for (const [name, opts, state, pings, detailRe] of stateCases) {
     assertClean(res.body);
     const pub = await setup(opts).run();
     assert.equal(pub.body.state, state);
-    assert.deepEqual(Object.keys(pub.body).sort(), ["cached", "checkedAt", "ok", "state"]);
+    assert.deepEqual(Object.keys(pub.body).sort(), ["cached", "carryEnabled", "checkedAt", "ok", "state"]);
   });
 }
 
