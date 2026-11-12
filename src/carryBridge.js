@@ -14,6 +14,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { getFlowBridgeConfig, dispatchFlowEntry, getFillWaitSec } from "./flowBridge.js";
+import { parseAlgoPnl, algoPnlLines, indexMovePts } from "./algoPnl.js";
 
 export const CARRY_ACTIVE_KEY = "nifty:carry:active";
 export const CARRY_HISTORY_KEY = "nifty:carry:history";
@@ -428,9 +429,17 @@ export async function handleCarrySync({ payload, store, deps }) {
   }
 
   // CARRY_EXIT — accepted from any open state (the Algo exiting it proves it held it).
+  // The Algo's ₹ figures are the only P&L; the index move is context only.
+  const algoPnl = parseAlgoPnl(payload);
+  const move = indexMovePts(active.dir, active.spot, sync.spot);
   const record = {
     type: "CARRY_EXIT",
     id: tradeId, date: active.date, verdict: active.verdict, dir: active.dir, lots: active.lots,
+    pnlBasis: "ALGO_INR",
+    pnlInr: algoPnl?.reported ? algoPnl.pnlInr : null,
+    pnlKnown: algoPnl ? algoPnl.pnlKnown : null,
+    algoPnl,
+    indexMovePts: move,
     entry: { spotRef: active.spot, sl: active.sl, score: active.score, agreement: active.agreement, sentAt: active.sentAt,
       contract: active.execution?.contract ?? null, optionFill: active.execution?.optionFill ?? null,
       filledAt: active.execution?.filledAt ?? null, converted: active.execution?.converted ?? null, statusBeforeExit: status },
@@ -447,10 +456,13 @@ export async function handleCarrySync({ payload, store, deps }) {
   }
   await say(deps, [
     `🌅🏁 *CARRY EXITED* · ${head}`,
+    ...algoPnlLines(algoPnl),
     `• *Reason:* \`${mdSafe(sync.reason || "?")}\` | *Spot:* \`${mdSafe(sync.spot ?? "?")}\` | *Exit fill:* \`${mdSafe(sync.optionFill ?? "?")}\` | *Mode:* \`${mdSafe(sync.mode || "?")}\``,
     `• *Entry:* \`${mdSafe(record.entry.contract || "?")}\` @ \`${mdSafe(record.entry.optionFill ?? "?")}\` (ref spot \`${active.spot}\`, stop \`${active.sl}\`)`,
-    `• *Accounts (as reported):* ${fmtAccounts(sync.accounts)}`,
-  ].join("\n"));
+    // Older Algo builds: show the free-form account list as before.
+    algoPnl?.accounts?.length ? null : `• *Accounts (as reported):* ${fmtAccounts(sync.accounts)}`,
+    move !== null ? `• *Index move, reference to exit (not your P&L):* \`${move >= 0 ? "+" : ""}${move} pts\`` : null,
+  ].filter(Boolean).join("\n"));
   return { status: 200, body: { ok: true, event: grade, tradeId, record } };
 }
 

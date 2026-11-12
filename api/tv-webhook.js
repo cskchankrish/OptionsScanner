@@ -42,6 +42,7 @@ import {
   getFillWaitSec,
   isStuckAccepted,
 } from "../src/flowBridge.js";
+import { parseAlgoPnl, algoPnlLines, formatInr, indexMovePts } from "../src/algoPnl.js";
 import {
   CARRY_ACTIVE_KEY,
   CARRY_SYNC_GRADES,
@@ -920,6 +921,75 @@ export async function sendTelegramT1Alert(activeTrade, fillPrice) {
   }
 }
 
+const signedPts = (v) => (Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v}` : "N/A");
+
+/**
+ * Closing-message text (pure; exported for tests).
+ *  - Algo-owned trade: leads with the Algo's ₹ result (or "₹ P&L not reported by the Algo");
+ *    index points only as "index move, signal entry to exit (not your P&L)".
+ *  - Paper trade: the points figure, labelled "paper result in index points".
+ */
+export function formatExitAlert(exitRecord) {
+  const t = exitRecord.trade || {};
+  const lines = [`🏁 *TRADE CLOSED* · \`${t.grade}\` (${t.direction})${t.id ? ` · ID \`${t.id}\`` : ""}`];
+  if (exitRecord.algoOwned) {
+    lines.push(...algoPnlLines(exitRecord.algoPnl));
+    lines.push(`• *Exit Reason:* \`${exitRecord.exitReason}\`${exitRecord.closeReason ? ` (${mdSafe(exitRecord.closeReason)})` : ""}`);
+    lines.push(`• *Signal Entry:* \`${t.entryPrice}\` | *Exit Level (spot):* \`${exitRecord.exitPrice || "Market"}\``);
+    if (Number.isFinite(exitRecord.indexMovePts)) {
+      lines.push(`• *Index move, signal entry to exit (not your P&L):* \`${signedPts(exitRecord.indexMovePts)} pts\``);
+    }
+  } else {
+    const pnlStr = exitRecord.netPnl !== undefined && exitRecord.netPnl !== null ? signedPts(exitRecord.netPnl) : "N/A";
+    lines.push(
+      `• *Exit Reason:* \`${exitRecord.exitReason}\``,
+      `• *Entry Price:* \`${t.entryPrice}\` | *Exit Level:* \`${exitRecord.exitPrice || "Market"}\``,
+      `• *Paper result in index points:* \`${pnlStr} pts\``,
+    );
+  }
+  lines.push(
+    `• *Time Closed:* ${exitRecord.istTime}`,
+    `• *Market Status:* 🟢 *NO ACTIVE TRADES (FLAT)*`,
+    `• *Permission:* Single-position lock released. Bridge is unlocked! You may now evaluate the next Trap setup or Synergy trade.`,
+    `• *Download CSV:* https://niftyninjaa.vercel.app/api/tv-webhook?export=csv`,
+  );
+  return lines.join("\n");
+}
+
+export const LAST_EXIT_KEY = "nifty:tv:last_exit";
+
+/** Status-GET summary of a closed trade, leading with the money figure in the right unit. */
+export function summarizeExitResult(rec) {
+  if (!rec) return null;
+  const algo = Boolean(rec.algoOwned);
+  const p = rec.algoPnl || null;
+  return {
+    headline: algo
+      ? (p?.reported ? `${formatInr(p.pnlInr)}${p.pnlKnown === false ? " (incomplete: excludes accounts with unknown exit price)" : ""}` : "₹ P&L not reported by the Algo")
+      : `${signedPts(rec.netPnl)} pts (paper result in index points)`,
+    basis: rec.pnlBasis || (algo ? "ALGO_INR" : "PAPER_INDEX_POINTS"),
+    pnlInr: algo && p?.reported ? p.pnlInr : null,
+    pnlKnown: algo ? (p?.pnlKnown ?? null) : null,
+    accounts: algo ? (p?.accounts || []) : [],
+    paperIndexPts: algo ? null : (Number.isFinite(rec.netPnl) ? rec.netPnl : null),
+    indexMovePtsNotPnl: algo ? (rec.indexMovePts ?? null) : null,
+    exitReason: rec.exitReason,
+    closeReason: rec.closeReason ?? null,
+    tradeId: rec.trade?.id ?? null,
+    grade: rec.trade?.grade ?? null,
+    direction: rec.trade?.direction ?? null,
+    closedAt: rec.timestamp,
+  };
+}
+
+/** Remembers the latest closed trade for the status GET. Never throws. */
+async function recordLastExit(redis, exitRecord) {
+  if (!redis) return;
+  try {
+    await redis.set(LAST_EXIT_KEY, JSON.stringify(exitRecord), { ex: 7 * 86400 });
+  } catch (e) {}
+}
+
 /**
  * Telegram Exit Notification Helper
  */
@@ -928,26 +998,13 @@ export async function sendTelegramExitAlert(exitRecord) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!botToken || !chatId || !exitRecord?.trade) return;
 
-  const t = exitRecord.trade;
-  const pnlStr = exitRecord.netPnl !== undefined ? (exitRecord.netPnl >= 0 ? `+${exitRecord.netPnl}` : `${exitRecord.netPnl}`) : "N/A";
-  const lines = [
-    `🏁 *TRADE CLOSED* · \`${t.grade}\` (${t.direction})`,
-    `• *Exit Reason:* \`${exitRecord.exitReason}\``,
-    `• *Entry Price:* \`${t.entryPrice}\` | *Exit Level:* \`${exitRecord.exitPrice || "Market"}\``,
-    `• *Net Realized PnL:* \`${pnlStr} pts\``,
-    `• *Time Closed:* ${exitRecord.istTime}`,
-    `• *Market Status:* 🟢 *NO ACTIVE TRADES (FLAT)*`,
-    `• *Permission:* Single-position lock released. Bridge is unlocked! You may now evaluate the next Trap setup or Synergy trade.`,
-    `• *Download CSV:* https://niftyninjaa.vercel.app/api/tv-webhook?export=csv`,
-  ];
-
   try {
     await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text: lines.join("\n"),
+        text: formatExitAlert(exitRecord),
         parse_mode: "Markdown",
       }),
     });
@@ -1503,6 +1560,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
       netPnl,
       trade: activeTrade,
       decision: "EXIT_FULL_PROFIT",
+        pnlBasis: "PAPER_INDEX_POINTS",
       recommendedLots: 0,
       reasoning: `Target 2 reached (+${t2Dist} pts). Position 100% closed. Realized net PnL: +${netPnl} pts.`,
     };
@@ -1514,6 +1572,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
       ]);
     } catch (e) {}
 
+    await recordLastExit(redis, exitRecord);
     await sendTelegramExitAlert(exitRecord);
     return { event: "TARGET_2_HIT", exitRecord };
   }
@@ -1532,6 +1591,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
         netPnl,
         trade: activeTrade,
         decision: "EXIT_BREAKEVEN_RUNNER",
+        pnlBasis: "PAPER_INDEX_POINTS",
         recommendedLots: 0,
         reasoning: `Runner stopped at cost (${entry}). Secured 60% profit from T1 with net realized PnL: +${netPnl} pts.`,
       };
@@ -1543,6 +1603,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
         ]);
       } catch (e) {}
 
+      await recordLastExit(redis, exitRecord);
       await sendTelegramExitAlert(exitRecord);
       return { event: "BREAKEVEN_STOP", exitRecord };
     }
@@ -1560,6 +1621,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
         netPnl,
         trade: activeTrade,
         decision: "EXIT_STOP_LOSS",
+        pnlBasis: "PAPER_INDEX_POINTS",
         recommendedLots: 0,
         reasoning: `Stop loss hit at ${currentSl} (-${riskPts} pts). Loss realized: ${netPnl} pts.`,
       };
@@ -1571,6 +1633,7 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
         ]);
       } catch (e) {}
 
+      await recordLastExit(redis, exitRecord);
       await sendTelegramExitAlert(exitRecord);
       return { event: "STOP_LOSS_HIT", exitRecord };
     }
@@ -1645,7 +1708,12 @@ export default async function handler(req, res) {
           istTime: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }),
           exitReason,
           trade: activeTrade,
+          // Owner's manual close: no Algo ₹ figures arrive on this path.
+          algoOwned: isBridgeOwned(activeTrade),
+          algoPnl: null,
+          pnlBasis: isBridgeOwned(activeTrade) ? "ALGO_INR" : "PAPER_INDEX_POINTS",
         };
+        await recordLastExit(redis, exitRecord);
         if (redis) {
           try {
             await redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord));
@@ -1756,13 +1824,18 @@ export default async function handler(req, res) {
         }
         res.setHeader("Content-Type", "text/csv");
         res.setHeader("Content-Disposition", `attachment; filename=nifty_signals_${istDate}.csv`);
-        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,T1,T2,ExitPrice,NetPnL,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning\n";
+        // NetPnL holds PAPER index points only. Algo-owned rows leave it empty and carry the Algo's
+        // rupees in PnlInr (with PnlKnown); IndexMovePtsNotPnl is context, never P&L.
+        const header = "Timestamp,IST Time,Grade,Direction,Decision,Lots,Entry,StopLoss,RiskPts,T1,T2,ExitPrice,NetPnL,DeltaPCR,Floor,Roof,FutQuad,FutOI%,Reasoning,PnlBasis,PnlInr,PnlKnown,EntryFill,ExitFill,Qty,IndexMovePtsNotPnl,Accounts\n";
+        const csvCell = (v) => (v === null || v === undefined ? "" : v);
         const rows = allSignals.map(s => {
           const cleanReason = (s.reasoning || s.exitReason || "").replace(/"/g, '""');
           const t = s.trade || s;
           const exitP = s.exitPrice !== undefined ? s.exitPrice : "";
-          const pnlVal = s.netPnl !== undefined ? s.netPnl : "";
-          return `"${s.timestamp}","${s.istTime}","${t.grade || s.grade || s.type || ""}","${t.direction || s.direction || ""}","${s.decision || s.exitReason || s.type || ""}",${s.recommendedLots ?? 0},${t.entryPrice || ""},${t.stopLoss || ""},${t.riskPoints || ""},${t.target1Price || ""},${t.target2Price || ""},${exitP},${pnlVal},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}"`;
+          const pnlVal = s.algoOwned ? "" : csvCell(s.netPnl);
+          const p = s.algoPnl || null;
+          const accts = (p?.accounts || []).map(a => `${a.account ?? "?"}:${a.pnlInr ?? "?"}${a.exitFillSource ? `(${a.exitFillSource})` : ""}`).join("; ").replace(/"/g, '""');
+          return `"${s.timestamp}","${s.istTime}","${t.grade || s.grade || s.type || ""}","${t.direction || s.direction || ""}","${s.decision || s.exitReason || s.type || ""}",${s.recommendedLots ?? 0},${t.entryPrice || ""},${t.stopLoss || ""},${t.riskPoints || ""},${t.target1Price || ""},${t.target2Price || ""},${exitP},${pnlVal},${s.liveOptionChainMetrics?.deltaPCR ?? ""},${s.liveOptionChainMetrics?.floorStrike ?? ""},${s.liveOptionChainMetrics?.roofStrike ?? ""},"${s.chartMetrics?.futQuad ?? ""}","${s.chartMetrics?.futOiPct ?? ""}","${cleanReason}",${csvCell(s.pnlBasis)},${p?.reported ? p.pnlInr : ""},${p && p.pnlKnown !== null ? p.pnlKnown : ""},${csvCell(p?.entryFill)},${csvCell(p?.exitFill)},${csvCell(p?.qty)},${s.algoOwned ? csvCell(s.indexMovePts) : ""},"${accts}"`;
         }).join("\n");
         return res.status(200).send(header + rows);
       }
@@ -1819,10 +1892,22 @@ export default async function handler(req, res) {
 
       // Explicit status check endpoint
       const openCarry = await readOpenCarry(redis);
+      let lastResult = null;
+      if (redis) {
+        try {
+          const raw = await redis.get(LAST_EXIT_KEY);
+          lastResult = summarizeExitResult(typeof raw === "string" ? JSON.parse(raw) : raw);
+        } catch (e) {
+          lastResult = null;
+        }
+      }
 
       if (req.query?.action === "status" || req.query?.status === "1") {
         const isFlat = !activeTrade || !activeTrade.active;
         return res.status(200).json({
+          // Leads with the last closed trade's money result: ₹ from the Algo for Algo-owned
+          // trades, index points only for paper trades (labelled as such).
+          lastResult,
           success: true,
           status: isFlat ? "FLAT_NO_ACTIVE_TRADES" : "IN_TRADE",
           hasActiveTrade: !isFlat,
@@ -1837,6 +1922,7 @@ export default async function handler(req, res) {
       }
 
       return res.status(200).json({
+        lastResult,
         success: true,
         connected: Boolean(REDIS_URL),
         istDate: queryDate,
@@ -1932,7 +2018,11 @@ export default async function handler(req, res) {
           }
         : null;
 
+      // Algo-owned trade: the Algo's ₹ figures are the only P&L; index points are context only.
+      const algoOwned = isBridgeOwned(activeTrade) || payload.source === "algo";
+
       if (payload.grade === "TARGET_1_HIT") {
+        const t1AlgoOwned = algoOwned;
         if (activeTrade) {
           if (sync) activeTrade.lastSync = { grade: payload.grade, ...sync };
           // A T1 sync-back for this exact trade proves the Algo holds a filled position: resolve
@@ -1959,8 +2049,13 @@ export default async function handler(req, res) {
           exitPrice: fillPrice,
           decision: "T1_SCALED_OUT",
           recommendedLots: 0.4,
-          netPnl: activeTrade ? Number(((activeTrade.target1Dist || 0) * 0.6).toFixed(2)) : 0,
-          reasoning: `Target 1 achieved. 60% profit booked, SL moved to Cost (${activeTrade?.entryPrice || fillPrice}).`,
+          // Algo-owned: the paper 60% scale-out points are not the owner's P&L; record none.
+          netPnl: t1AlgoOwned ? null : activeTrade ? Number(((activeTrade.target1Dist || 0) * 0.6).toFixed(2)) : 0,
+          pnlBasis: t1AlgoOwned ? "ALGO_INR" : "PAPER_INDEX_POINTS",
+          algoOwned: t1AlgoOwned,
+          reasoning: t1AlgoOwned
+            ? `Target 1 reported by the Algo (stop moved to entry). ₹ result comes with the final exit.`
+            : `Target 1 achieved. 60% profit booked, SL moved to Cost (${activeTrade?.entryPrice || fillPrice}).`,
           ...(sync ? { sync } : {}),
         };
         if (redis) {
@@ -1992,20 +2087,34 @@ export default async function handler(req, res) {
         }
       }
 
+      const exitTrade = activeTrade || { grade: payload.grade, direction: payload.dir || "LONG", entryPrice: fillPrice };
+      const algoPnl = algoOwned ? parseAlgoPnl(payload) : null;
+      const move = algoOwned ? indexMovePts(exitTrade.direction, exitTrade.entryPrice, fillPrice) : null;
+      const closeNote = payload.reason ? `: ${String(payload.reason).slice(0, 120)}` : "";
       const exitRecord = {
         type: "TRADE_EXIT",
         timestamp: nowIso,
         istTime: nowIst,
         exitReason: payload.grade,
         exitPrice: fillPrice,
-        netPnl,
-        trade: activeTrade || { grade: payload.grade, direction: payload.dir || "LONG", entryPrice: fillPrice },
+        // Paper trades: index points. Algo-owned: null here — the money figure is algoPnl (₹).
+        netPnl: algoOwned ? null : netPnl,
+        pnlBasis: algoOwned ? "ALGO_INR" : "PAPER_INDEX_POINTS",
+        algoOwned,
+        algoPnl,
+        pnlInr: algoPnl?.reported ? algoPnl.pnlInr : null,
+        pnlKnown: algoPnl ? algoPnl.pnlKnown : null,
+        indexMovePts: move,
+        trade: exitTrade,
         decision: "TRADE_CLOSED_FLAT",
         recommendedLots: 0,
-        reasoning: `Trade exited (${payload.grade}${payload.reason ? `: ${String(payload.reason).slice(0, 120)}` : ""}) at ${fillPrice}. Realized net PnL: ${netPnl >= 0 ? "+" : ""}${netPnl} pts. Market is now FLAT.`,
+        reasoning: algoOwned
+          ? `Trade exited (${payload.grade}${closeNote}) at ${fillPrice}. ${algoPnl?.reported ? `Algo result ${formatInr(algoPnl.pnlInr)}${algoPnl.pnlKnown === false ? " (incomplete: excludes accounts with unknown exit price)" : ""}` : "₹ P&L not reported by the Algo"}. Index move ${move ?? "n/a"} pts (not P&L). Market is now FLAT.`
+          : `Trade exited (${payload.grade}${closeNote}) at ${fillPrice}. Paper result: ${netPnl >= 0 ? "+" : ""}${netPnl} index pts. Market is now FLAT.`,
         closeReason: payload.reason ?? null,
         ...(sync ? { sync } : {}),
       };
+      await recordLastExit(redis, exitRecord);
 
       if (redis) {
         await Promise.all([

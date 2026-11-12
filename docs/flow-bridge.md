@@ -425,3 +425,83 @@ When a flow signal is handed to the Algo, the entry message no longer prints the
   that is unset.
 
 A `NOT_EXECUTED` signal says that no position was opened. Paper trades keep the old text.
+
+## Money result of Algo trades (₹ from the Algo)
+
+For a trade executed by the Algo, the **only** P&L is what the Algo reports. The scanner's
+index-point figure (exit spot minus signal entry, with paper scale-out weights) is not the
+owner's P&L and is never presented as one.
+
+### Fields
+
+The Algo sends these on the final flow exits (`TARGET_2_HIT`, `BREAKEVEN_STOP`, `STOP_LOSS_HIT`,
+`TIME_STOP_EXIT`, `MANUAL_CLOSE`) and on `CARRY_EXIT`. Older Algo builds omit them.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `pnlInr` | number | ₹, summed over accounts, option premium on real fills, before charges |
+| `pnlKnown` | boolean | `false` when the total excludes accounts whose exit price is unknown |
+| `entryFill`, `exitFill` | number or null | Fills |
+| `qty` | number | Total units |
+| `accounts[]` | array | Each entry: `{account, grade, lots, qty, entryFill, exitFill, pnlInr, exitFillSource}`, where `exitFillSource` is `engine_order`, `broker_tradebook` or `unknown` |
+
+Validation (`src/algoPnl.js`, `parseAlgoPnl`) checks **types only**. A malformed piece becomes
+`null`, and an account entry that isn't an object is dropped. The event itself is never rejected
+because of them.
+
+### Stored
+
+- **Exit record** (archive `nifty:tv:signals:master_archive`), for an Algo-owned trade:
+  - `algoOwned: true`
+  - `pnlBasis: "ALGO_INR"`
+  - `algoPnl` (the parsed fields)
+  - `pnlInr` and `pnlKnown` (top level)
+  - `indexMovePts`
+  - `netPnl: null`
+- **Paper exits:** `pnlBasis: "PAPER_INDEX_POINTS"`, with `netPnl` in index points.
+- **Algo-owned `TARGET_1_HIT` records:** also `netPnl: null`.
+- **Carry history** (`nifty:carry:history`): `CARRY_EXIT` entries carry `pnlInr`, `pnlKnown`,
+  `algoPnl`, `pnlBasis: "ALGO_INR"` and `indexMovePts`.
+- **Latest closed trade:** kept in `nifty:tv:last_exit` (7 d) for the status GET.
+
+### CSV export (`?export=csv`)
+
+- `NetPnL` now holds **paper index points only**. Algo-owned rows leave it empty.
+- New columns at the end: `PnlBasis`, `PnlInr`, `PnlKnown`, `EntryFill`, `ExitFill`, `Qty`,
+  `IndexMovePtsNotPnl`, `Accounts` (formatted as `account:pnlInr(source)`, separated by `;`).
+
+### Telegram (closing message)
+
+- **Algo-owned trade:** the message leads with `💰 Result: +₹1,070.00`, then one line per account:
+  - lots, entry fill → exit fill, ₹ result;
+  - "exit price from broker trade book" or "exit price unknown" where relevant.
+
+  When `pnlKnown` is false, a note says the total excludes the accounts whose exit price is
+  unknown. The index figure is shown only as "Index move, signal entry to exit (not your P&L)".
+  Without the fields, the message says "₹ P&L not reported by the Algo".
+- **Paper trade:** the same points message as before, labelled "Paper result in index points".
+- **`CARRY_EXIT`:** the same ₹ treatment. The index move is labelled "reference to exit (not your
+  P&L)".
+
+### Status GET
+
+`GET /api/tv-webhook?status=1`, and the default GET, now start with `lastResult`:
+
+| Field | Meaning |
+|---|---|
+| `headline` | e.g. `+₹1,070.00`, `+₹640.00 (incomplete: …)`, `₹ P&L not reported by the Algo`, or `-74 pts (paper result in index points)` |
+| `basis` | `ALGO_INR` or `PAPER_INDEX_POINTS` |
+| `pnlInr`, `pnlKnown`, `accounts` | The Algo's figures |
+| `paperIndexPts` | Paper trades only |
+| `indexMovePtsNotPnl` | Algo-owned trades only; context, not P&L |
+| `exitReason`, `closeReason`, `tradeId`, `closedAt` | Trade details |
+
+### Running totals
+
+`pnlContribution(record)` in `src/algoPnl.js` is the rule for anything that adds up P&L:
+- an Algo-owned record counts **₹ only when `pnlKnown === true`**;
+- a paper record counts index points;
+- the two units are never summed together.
+
+No server-side running total of trade P&L exists today. The dashboard's carry win rate and net
+points come from the EOD *signal* track record (`eodHistory.gapPts`), not from executed trades.
