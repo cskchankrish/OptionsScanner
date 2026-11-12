@@ -43,6 +43,7 @@ import {
   isStuckAccepted,
 } from "../src/flowBridge.js";
 import { parseAlgoPnl, algoPnlLines, formatInr, indexMovePts } from "../src/algoPnl.js";
+import { formatEodCardLines } from "../src/eodCard.js";
 import {
   CARRY_ACTIVE_KEY,
   CARRY_SYNC_GRADES,
@@ -1062,6 +1063,10 @@ export async function sendTelegramEODAlert(eodDecision, spot, floorStrike, roofS
     lines.push(`🔀🚨 *EOD CARRY DECISION FLIP (${flip.toTime || slotTimeStr} IST) · ${fromLabel} → ${toLabel}*`);
     lines.push(`• *Decision Changed:* \`${fromLabel}\` (Score \`${fmtEodScore(flip.fromScore)}\`${flip.fromTime ? `, sent ${flip.fromTime} IST` : ""}) → \`${toLabel}\` (Score \`${fmtEodScore(flip.toScore)}\`)`);
     lines.push("");
+  }
+  // Verdict card header block (same wording as the dashboard card), before the existing detail.
+  if (eodDecision.card) {
+    lines.push(...formatEodCardLines(eodDecision.card), "");
   }
   lines.push(
     header,

@@ -21,7 +21,9 @@ import {
   getFusionQuadrantMode,
 } from "../src/flowCalc.js";
 import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
-import { getCarryConfig } from "../src/carryBridge.js";
+import { getCarryConfig, readCarryAutomation, storeFromCommand as carryStoreFromCommand } from "../src/carryBridge.js";
+import { buildEodCard, formatEodCardLines } from "../src/eodCard.js";
+export { buildEodCard, formatEodCardLines };
 import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
 
 let cache = {
@@ -2260,7 +2262,18 @@ export function calculateEODDecision({
     : null;
   if (dataQualityCaveat) action = `${dataQualityCaveat} ${action}`;
 
+  const decisionStop = (bias === "BEARISH" || isLateCallBlitz || fusion?.eodCarryVeto === "VETO_BTST") ? slShort : (bias === "BULLISH" || isLatePutBlitz || fusion?.eodCarryVeto === "VETO_STBT") ? slLong : null;
+  const card = buildEodCard({
+    bias, score, thresh, conviction, thresholdDistance, dataQualityCaveat,
+    stop: bias === "NEUTRAL" ? null : decisionStop, targetContract, isRollover,
+    a: { contribution: groupA, fullDayStatus, pcrStatus, levelStatus, levelDetail },
+    b: { contribution: groupB, pending: !closingWindowActive || closingFlowPending, unverified: groupBUnverified, coverage: closingCoverage,
+      status: closingFlowStatus, net: lastHourNetDelta, anchor: flowAnchorStr, activate: minsToHHMM(flowActivateMins) },
+    c: { contribution: groupC, unverified: groupCUnverified, quadrant, basisPts, quadDir, basisDetail },
+  });
+
   return {
+    card,
     unverifiedGroups,
     dataQualityCaveat,
     verdict,
@@ -3056,6 +3069,21 @@ export async function refreshLiveSnapshot({
       ? panel(false, turnTracker.coverage?.text)
       : turnTracker.status === "OK" ? panel(true) : panel(null, turnTracker.message);
     if (eodDecision.card) eodDecision.card.turnTracker = turnTracker.message; // card detail only, not scored
+
+    // EOD verdict card: data row and the carry automation status in plain words (display only).
+    if (eodDecision.card) {
+      const gapTxt = dataQuality.gaps?.length ? ` · gaps ${dataQuality.gaps.map(g => `${g.from}–${g.to}`).join(", ")}` : "";
+      eodDecision.card.dataLine = `NSE data ${v3Data.records?.timestamp || "time unknown"} · coverage ${dataQuality.coveragePct ?? "?"}% since ${dataQuality.sessionStart}${gapTxt}`;
+      try {
+        eodDecision.card.automation = await readCarryAutomation({
+          store: REDIS_URL && REDIS_TOKEN ? carryStoreFromCommand(redisRestCommand) : null,
+          nowMins: getISTMinutes(),
+          date: getISTIsoDateStr(),
+        });
+      } catch (e) {
+        eodDecision.card.automation = { state: "UNKNOWN", text: "status unavailable" };
+      }
+    }
 
     // Collector alerts: one Telegram per newly closed ≥5-min gap; on non-poller refreshes also a
     // poller-heartbeat check (the poller may be down while browser loads keep data "fresh").

@@ -12,6 +12,7 @@ import {
 import { isSpotFrozenAt } from "./flowCalc.js";
 import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
+import { EodVerdictCard } from "./EodVerdictCard.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -2467,6 +2468,12 @@ export function NiftyFlowView({ t, isDark }) {
             {/* TAB 1: CURRENT SESSION DECISION */}
             {eodTab === "decision" && (
               <>
+                {/* VERDICT CARD — final verdict and results first; the long audit below is collapsed */}
+                <EodVerdictCard card={eod.card} t={t} isDark={isDark} isMobile={isMobile} />
+                <details open={!eod.card} style={{ marginBottom: 8 }}>
+                  <summary style={{ cursor: "pointer", fontSize: isMobile ? 11.5 : 12.5, fontWeight: 800, color: t.textSub, padding: "4px 0", marginBottom: 6 }}>
+                    Full EOD audit and detail
+                  </summary>
                 {/* Conviction & Sizing Status Pill */}
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
                   <span style={{ fontSize: isMobile ? 11 : 12, color: t.textSub, fontWeight: 700 }}>
@@ -2681,6 +2688,8 @@ export function NiftyFlowView({ t, isDark }) {
                   <span>⏱️ <strong>Execution:</strong> Enter between 15:10 – 15:25 IST as post-market auction settles.</span>
                   <span>⛔ <strong>Stop / Invalidation:</strong> Exit at morning open if Nifty breaks Floor ({oiData?.floor}) or Roof ({oiData?.roof}).</span>
                 </div>
+
+                </details>
 
                 {/* Quick Link to Track Record */}
                 <div

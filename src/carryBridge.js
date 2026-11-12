@@ -472,6 +472,55 @@ export async function handleCarrySync({ payload, store, deps }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Carry automation status in plain words (EOD verdict card / EOD Telegram header)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @param {{ cfg, nowMins, date, claim, active, block, lastHistory }} s  (all read-only state)
+ * @returns {{ state: string, text: string }}
+ */
+export function describeCarryAutomation({ cfg, nowMins, date, claim = null, active = null, block = null, lastHistory = null }) {
+  if (!cfg?.enabled) return { state: "OFF", text: "Carry automation off" };
+  const inr = (v) => (Number.isFinite(Number(v)) ? `${Number(v) < 0 ? "-" : "+"}₹${Math.abs(Number(v)).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : null);
+  if (isCarryOpen(active)) {
+    const ex = active.execution;
+    if (ex.status === "FILLED") return { state: "FILLED", text: `Filled: ${active.verdict} ${ex.contract || ""}${ex.optionFill != null ? ` @ ${ex.optionFill}` : ""} (id ${active.id})`.replace(/\s+/g, " ") };
+    if (ex.status === "UNKNOWN") return { state: "UNKNOWN", text: `Instruction sent — outcome UNKNOWN, check the broker (id ${active.id})` };
+    if (ex.status === "ACCEPTED") return { state: "SENT", text: `Instruction sent (${active.verdict}) — awaiting fill (id ${active.id})` };
+    return { state: "SENT", text: `Instruction sent (${active.verdict}) — awaiting Algo reply (id ${active.id})` };
+  }
+  const lastExitTxt = lastHistory?.type === "CARRY_EXIT"
+    ? `last carry (${lastHistory.date}) exited ${lastHistory.pnlInr != null ? inr(lastHistory.pnlInr) : "— ₹ not reported"}${lastHistory.pnlKnown === false ? " (incomplete)" : ""}`
+    : null;
+  if (claim) {
+    if (lastHistory && lastHistory.id === claim.id) {
+      if (lastHistory.type === "CARRY_EXIT") return { state: "EXITED", text: `Exited: ${lastHistory.pnlInr != null ? inr(lastHistory.pnlInr) : "₹ not reported"}` };
+      const reason = lastHistory.execution?.reason || lastHistory.sync?.reason || lastHistory.execution?.outcome || "no reason given";
+      return { state: "NOT_EXECUTED", text: `Not executed: ${reason}` };
+    }
+    return { state: "SENT", text: "Instruction sent today" };
+  }
+  const hh = minsToHHMM;
+  if (nowMins < cfg.windowStartMins) return { state: "WAITING", text: `Waiting for ${hh(cfg.windowStartMins)}${lastExitTxt ? ` · ${lastExitTxt}` : ""}` };
+  if (nowMins <= cfg.windowEndMins) return { state: "WATCHING", text: `Watching ${hh(cfg.windowStartMins)}–${hh(cfg.windowEndMins)}: ${block?.reason || "no reading yet"}` };
+  return { state: "NOT_SENT", text: `Not sent: ${block?.reason || `no poll ran inside ${hh(cfg.windowStartMins)}–${hh(cfg.windowEndMins)}`}` };
+}
+
+/** Reads the state describeCarryAutomation needs (store adapter with get + lrange). Never throws. */
+export async function readCarryAutomation({ store, env = process.env, nowMins, date }) {
+  const cfg = getCarryConfig(env);
+  if (!cfg.enabled || !store) return describeCarryAutomation({ cfg, nowMins, date });
+  const safe = async (fn) => { try { return await fn(); } catch (e) { return null; } };
+  const [claim, active, block, hist] = await Promise.all([
+    safe(() => store.get(carryClaimKey(date))),
+    safe(() => store.get(CARRY_ACTIVE_KEY)),
+    safe(() => store.get(carryBlockKey(date))),
+    safe(() => (store.lrange ? store.lrange(CARRY_HISTORY_KEY, 0, 0) : null)),
+  ]);
+  return describeCarryAutomation({ cfg, nowMins, date, claim, active, block, lastHistory: Array.isArray(hist) ? hist[0] || null : null });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Store adapters
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -492,6 +541,7 @@ export function storeFromClient(redis) {
     del: async (k) => redis.del(k),
     lpush: async (k, v) => redis.lpush(k, enc(v)),
     ltrim: async (k, a, b) => redis.ltrim(k, a, b),
+    lrange: async (k, a, b) => ((await redis.lrange(k, a, b)) || []).map(dec),
   };
 }
 
@@ -504,5 +554,6 @@ export function storeFromCommand(cmd) {
     del: async (k) => cmd(["DEL", k]),
     lpush: async (k, v) => cmd(["LPUSH", k, enc(v)]),
     ltrim: async (k, a, b) => cmd(["LTRIM", k, String(a), String(b)]),
+    lrange: async (k, a, b) => ((await cmd(["LRANGE", k, String(a), String(b)])) || []).map(dec),
   };
 }
