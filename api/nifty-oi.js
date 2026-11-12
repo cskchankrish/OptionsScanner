@@ -22,6 +22,7 @@ import {
 } from "../src/flowCalc.js";
 import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
 import { getCarryConfig } from "../src/carryBridge.js";
+import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
 
 let cache = {
   data: null,
@@ -1136,7 +1137,7 @@ function getISTTimeStr() {
   return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-function buildTimeline(totPut, totCall, spot, futuresMetrics) {
+function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
   const today = getISTDateStr();
   const now = Date.now();
   const nowMins = getISTMinutes();
@@ -1155,6 +1156,8 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
     futQuadrant: futuresMetrics.quadrant || undefined,
     futQuadrantSource: futuresMetrics.quadrantSource || undefined,
   } : {};
+  // Floor / roof strikes at this tick (used by the Turn Tracker for strike migration since an extreme).
+  const lv = levels && Number(levels.floor) > 0 && Number(levels.roof) > 0 ? { floor: Number(levels.floor), roof: Number(levels.roof) } : {};
 
   // 1. Outside Live Market Hours (Weekends, Evenings, Nights, Pre-market)
   // Preserve settled session timeline until the new market session actually opens
@@ -1234,6 +1237,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
       isLiveTick: true,
       ...(isSpotFrozenAt(capMins) && !isSunday ? { spotFrozen: true } : {}),
       ...fut,
+      ...lv,
     });
     didUpdate = true;
   } else if (last) {
@@ -1245,6 +1249,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics) {
     last.isLiveTick = true;
     if (isSpotFrozenAt(capMins) && !isSunday) last.spotFrozen = true;
     if (fut.futPrice !== undefined) Object.assign(last, fut);
+    Object.assign(last, lv);
     didUpdate = true;
   }
 
@@ -2984,7 +2989,7 @@ export async function refreshLiveSnapshot({
     // session even when history is empty). Any other expiry: read-only copy of the real
     // near-expiry history (possibly empty) — never synthetic ticks, never a mutation.
     const timeline = (targetExpiry === nearExpiry)
-      ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics)
+      ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics, { floor: floorStrike, roof: roofStrike })
       : (Array.isArray(intradayHistory) ? intradayHistory.map(pt => ({ ...pt })) : []);
 
     // Compute Smart Money / Institutional Analysis
@@ -3043,6 +3048,15 @@ export async function refreshLiveSnapshot({
       eod: panel(!(eodDecision.unverifiedGroups || []).length, eodDecision.dataQualityCaveat),
     };
 
+    // Turn Tracker (Part 4): swing-extreme futures + options legs, stages NO TURN / EARLY / LIKELY
+    // TURN / CONFIRMED. DISPLAY AND TELEGRAM ONLY — computed after fusion, vetoes, EOD scoring and
+    // the snapshot fields the webhook reads; nothing reads it back. Never sent to the Algo.
+    const turnTracker = computeTurnTracker({ timeline });
+    dataQuality.panels.turnTracker = turnTracker.status === "INSUFFICIENT_DATA"
+      ? panel(false, turnTracker.coverage?.text)
+      : turnTracker.status === "OK" ? panel(true) : panel(null, turnTracker.message);
+    if (eodDecision.card) eodDecision.card.turnTracker = turnTracker.message; // card detail only, not scored
+
     // Collector alerts: one Telegram per newly closed ≥5-min gap; on non-poller refreshes also a
     // poller-heartbeat check (the poller may be down while browser loads keep data "fresh").
     if (REDIS_URL && REDIS_TOKEN && sessionInfo.isLiveMarket && !isEodTest) {
@@ -3058,6 +3072,13 @@ export async function refreshLiveSnapshot({
         await alertNewGaps({ dataQuality: { ...dataQuality, _gapMins: dqGapMins }, istDateStr: getISTIsoDateStr(), deps: alertDeps });
         if (source !== "poller") {
           await checkPollerHeartbeat({ nowMs: Date.now(), isLiveMarket: true, trigger: source, deps: alertDeps });
+        }
+        if (turnTracker.stage === "LIKELY_TURN" || turnTracker.stage === "CONFIRMED") {
+          await dispatchTurnAlert({
+            tracker: turnTracker,
+            istDateStr: getISTIsoDateStr(),
+            deps: { ...alertDeps, get: (k) => redisRestGet(k), set: (k, v, ttl) => redisRestSet(k, v, ttl) },
+          });
         }
       } catch (e) {
         console.error("Collector alert error:", e?.message);
@@ -3158,6 +3179,7 @@ export async function refreshLiveSnapshot({
       eodHistory,
       intradayTimeline: timeline,
       dataQuality,
+      turnTracker,
       hasRedis: Boolean(REDIS_URL),
       rollover: {
         isExpiryDay,

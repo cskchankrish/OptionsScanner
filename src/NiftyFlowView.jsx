@@ -11,6 +11,7 @@ import {
 } from "./smartMoneyFusion.js";
 import { isSpotFrozenAt } from "./flowCalc.js";
 import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
+import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -2033,122 +2034,28 @@ export function NiftyFlowView({ t, isDark }) {
               </div>
             </div>
 
-            {/* 4 Compact Fusion Cells */}
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: isMobile ? "1fr 1fr" : isTablet ? "repeat(2, 1fr)" : "repeat(4, 1fr)",
-              gap: isMobile ? 8 : 10,
-            }}>
-              {/* Cell 1: Nifty Futures LTP & Basis */}
-              <div style={{
-                background: isDark ? "#0d1b2e" : "#ffffff",
-                border: `1px solid ${t.border}`,
-                borderRadius: 8,
-                padding: isMobile ? "9px 10px" : "11px 13px",
-              }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
-                    Nifty Futures (LTP)
-                  </span>
-                  <span style={{ fontSize: 9.5, fontWeight: 800, color: (fut?.priceChange || 0) >= 0 ? "#16a34a" : "#ef4444" }} title={fut?.priceChangeBase === "SESSION_OPEN" ? "Change vs today's session open" : "Change vs previous close"}>
-                    {(fut?.priceChange || 0) >= 0 ? "+" : ""}{fut?.priceChange ?? "0"} ({(fut?.priceChangePct || 0) >= 0 ? "+" : ""}{fut?.priceChangePct ?? "0"}%) {fut?.priceChangeBase === "SESSION_OPEN" ? "vs open" : "vs prev close"}
-                  </span>
-                </div>
-                <div style={{ fontFamily: "monospace", fontSize: isMobile ? 15 : 18, fontWeight: 900, color: t.text, margin: "2px 0" }}>
-                  ₹{(fut?.lastPrice || spot).toLocaleString("en-IN", { minimumFractionDigits: 1, maximumFractionDigits: 2 })}
-                </div>
-                <div style={{ fontSize: isMobile ? 10 : 11, color: basisColor, fontWeight: 700 }}>
-                  Basis: {fut?.rawBasis >= 0 ? `+${fut?.rawBasis}` : `${fut?.rawBasis ?? "0"}`} pts {isBasisPos ? "(Premium)" : "(Discount)"}
-                  {fut?.adjustedBasisSpread !== undefined && (
-                    <span style={{ fontSize: 9.5, color: t.textSub, marginLeft: 4, fontWeight: 500 }}>
-                      · Spread: {fut.adjustedBasisSpread >= 0 ? `+${fut.adjustedBasisSpread}` : fut.adjustedBasisSpread}
-                    </span>
-                  )}
-                </div>
-              </div>
+            {/* TURN TRACKER — primary reading (display only; nothing here drives fusion, vetoes, sizing, EOD or carry) */}
+            <TurnTrackerPanel tracker={oiData?.turnTracker} t={t} isDark={isDark} isMobile={isMobile} />
+            <PanelDataMarker panel={oiData?.dataQuality?.panels?.turnTracker} isDark={isDark} isMobile={isMobile} />
 
-              {/* Cell 2: Futures 4-Quadrant Buildup */}
-              <div style={{
-                background: isDark ? "#0d1b2e" : "#ffffff",
-                border: `1px solid ${t.border}`,
-                borderRadius: 8,
-                padding: isMobile ? "9px 10px" : "11px 13px",
-              }}>
-                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
-                  Futures Flow Buildup
-                </div>
-                <div style={{
-                  display: "inline-block",
-                  fontSize: isMobile ? 11.5 : 13,
-                  fontWeight: 900,
-                  color: quadrant?.color || "#94a3b8",
-                  margin: "3px 0",
-                }}>
-                  {quadrant?.label || "NEUTRAL / CONSOLIDATION"}
-                </div>
-                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
-                  Combined ΔOI: <strong>{fut?.combinedChgOI >= 0 ? `+${formatLotsAbs(fut?.combinedChgOI)}` : `-${formatLotsAbs(fut?.combinedChgOI || 0)}`}</strong> ({fut?.combinedOiChangePct >= 0 ? `+${fut?.combinedOiChangePct}` : `${fut?.combinedOiChangePct || 0}`}%) · DTE: <strong>{fut?.dte ?? "—"}d</strong>
-                </div>
-                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3, marginTop: 3 }}>
-                  Used by fusion: <strong>{fusion?.quadrantSourceLabel || (fusion?.quadrantSource === "INTRADAY" ? "30m intraday" : "day")}</strong>
-                  {fusion?.quadrantSource === "INTRADAY" && fusion?.quadrantDay?.label && (
-                    <span> · Day ({fusion.quadrantDay.base || "prev close"}): {fusion.quadrantDay.label}</span>
-                  )}
-                </div>
-                {fusion?.quadrantSource === "DAY" && fusion?.quadrantIntraday?.available && (
-                  <div style={{ fontSize: isMobile ? 9 : 10, color: t.textMuted, lineHeight: 1.3, marginTop: 2 }} title="Shown for information only: does not drive fusion, vetoes, sizing or the EOD score (set FUSION_QUADRANT_MODE=intraday to opt in).">
-                    Last {fusion.quadrantIntraday.windowMins} min, informational: <strong style={{ color: fusion.quadrantIntraday.color || t.textSub }}>{fusion.quadrantIntraday.label}</strong> ({fusion.quadrantIntraday.window})
-                  </div>
-                )}
-                <PanelDataMarker panel={oiData?.dataQuality?.panels?.intradayQuadrant} isDark={isDark} isMobile={isMobile} />
-              </div>
-
-              {/* Cell 3: Smart Money Fusion Matrix Scenario */}
-              <div style={{
-                background: isDark ? "#0d1b2e" : "#ffffff",
-                border: `1px solid ${t.border}`,
-                borderRadius: 8,
-                padding: isMobile ? "9px 10px" : "11px 13px",
-              }}>
-                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
-                  Fusion Alignment
-                </div>
-                <div style={{
-                  fontSize: isMobile ? 11.5 : 13,
-                  fontWeight: 900,
-                  color: fusion?.color || t.text,
-                  margin: "3px 0",
-                }}>
-                  {fusion?.badge || "⚪ BALANCED FLOW"}
-                </div>
-                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
-                  {fusion?.headline || "Futures & Options flow aligned"}
-                </div>
-              </div>
-
-              {/* Cell 4: Actionable EOD / Intraday Verdict */}
-              <div style={{
-                background: isDark ? "#0d1b2e" : "#ffffff",
-                border: `1px solid ${t.border}`,
-                borderRadius: 8,
-                padding: isMobile ? "9px 10px" : "11px 13px",
-              }}>
-                <div style={{ fontSize: isMobile ? 10 : 11, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>
-                  Institutional Action
-                </div>
-                <div style={{
-                  fontSize: isMobile ? 11.5 : 13,
-                  fontWeight: 900,
-                  color: fusion?.eodCarryVeto ? "#f59e0b" : (fusion?.scoreBoost > 0 ? "#16a34a" : fusion?.scoreBoost < 0 ? "#ef4444" : t.text),
-                  margin: "3px 0",
-                }}>
-                  {fusion?.actionableVerdict || "Trade Normal"}
-                </div>
-                <div style={{ fontSize: isMobile ? 9.5 : 10.5, color: t.textSub, lineHeight: 1.3 }}>
-                  {fusion?.eodCarryVeto ? `Veto: ${fusion.eodCarryVeto.replace("_", " ")}` : (fusion?.rationale || "Balanced leverage")}
-                </div>
-              </div>
+            {/* Whole-day reading — small reference line (still what fusion, vetoes, sizing and EOD use) */}
+            <div style={{ fontSize: isMobile ? 10 : 11, color: t.textSub, lineHeight: 1.45, marginTop: 6, paddingTop: 6, borderTop: `1px dashed ${t.border}` }}
+              title="Whole-day reading: quadrant vs previous close / session open and the fusion scenario. This is what the webhook validation, vetoes, sizing and the EOD score use.">
+              <strong style={{ color: t.textMuted, textTransform: "uppercase", fontSize: isMobile ? 9.5 : 10 }}>Whole day (reference):</strong>{" "}
+              Futures ₹{(fut?.lastPrice || spot).toLocaleString("en-IN", { maximumFractionDigits: 2 })}{" "}
+              ({(fut?.priceChange || 0) >= 0 ? "+" : ""}{fut?.priceChange ?? "0"} pts {fut?.priceChangeBase === "SESSION_OPEN" ? "vs open" : "vs prev close"}) ·{" "}
+              <strong style={{ color: quadrant?.color || t.textSub }}>{quadrant?.label || "NEUTRAL / CONSOLIDATION"}</strong>{" "}
+              (ΔOI {fut?.combinedOiChangePct >= 0 ? "+" : ""}{fut?.combinedOiChangePct ?? 0}%) · basis {fut?.rawBasis ?? "—"} ·{" "}
+              Fusion: <strong style={{ color: fusion?.color || t.text }}>{fusion?.badge || "⚪ BALANCED FLOW"}</strong>
+              {fusion?.eodCarryVeto ? ` · Veto: ${fusion.eodCarryVeto.replace("_", " ")}` : fusion?.actionableVerdict ? ` · ${fusion.actionableVerdict}` : ""}
+              {fut?.isStale ? " · cached snapshot" : ""}
             </div>
+            {fusion?.quadrantSource === "DAY" && fusion?.quadrantIntraday?.available && (
+              <div style={{ fontSize: isMobile ? 9.5 : 10, color: t.textMuted, lineHeight: 1.4, marginTop: 2 }} title="Shown for information only: does not drive fusion, vetoes, sizing or the EOD score (set FUSION_QUADRANT_MODE=intraday to opt in).">
+                Last {fusion.quadrantIntraday.windowMins} min (reference): <strong style={{ color: fusion.quadrantIntraday.color || t.textSub }}>{fusion.quadrantIntraday.label}</strong> ({fusion.quadrantIntraday.window})
+              </div>
+            )}
+            <PanelDataMarker panel={oiData?.dataQuality?.panels?.intradayQuadrant} isDark={isDark} isMobile={isMobile} />
 
             {/* TradingView v4.3 Real-Time Webhook Bridge Live Strip */}
             {tvSignal && (
@@ -2393,6 +2300,7 @@ export function NiftyFlowView({ t, isDark }) {
             </div>
           )}
           <PanelDataMarker panel={oiData?.dataQuality?.panels?.radar30} isDark={isDark} isMobile={isMobile} />
+          <TurnRadarRow tracker={oiData?.turnTracker} isDark={isDark} isMobile={isMobile} t={t} />
         </div>
       )}
 
