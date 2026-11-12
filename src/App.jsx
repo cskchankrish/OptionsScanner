@@ -4,6 +4,7 @@ import { hasConvictionMetrics, readConvictionMetrics } from "./convictionMetrics
 import { isTradableSourceRow } from "./sourceHealth.js";
 import { compareStocks } from "./stockSort.js";
 import { NiftyFlowView } from "./NiftyFlowView.jsx";
+import { ScorecardView } from "./ScorecardView.jsx";
 
 // ─── LIVE GOOGLE SHEETS LINK ──────────────────────────────────────────────────
 const CSV_URL    = (typeof import.meta !== "undefined" && import.meta.env?.VITE_GOOGLE_SHEETS_CSV_URL) || "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ7ytHIka0TPfS3uN4rVXKf0uGAKXLAp4q0vtHI6aPX4J0qDsz1jKHhRKs_jmlTKfkY85I-npDSihrU/pub?output=csv";
@@ -1025,6 +1026,7 @@ export default function App() {
     { id:"setups", label:`🎯 All (${stocks.length})` },
     { id:"top",    label:`⭐ Top (${topPicks.length})` },
     { id:"nifty",  label:"📊 Nifty Flow Data" },
+    { id:"scorecard", label:"🧮 Scorecard" },
     { id:"guide",  label:"📐 Scoring" },
   ];
 
@@ -1108,6 +1110,9 @@ export default function App() {
       <div style={{ display: activeTab==="nifty" ? "block" : "none" }}>
         <NiftyFlowView t={t} isDark={isDark} />
       </div>
+      <div style={{ display: activeTab==="scorecard" ? "block" : "none" }}>
+        {activeTab==="scorecard" && <ScorecardView t={t} isDark={isDark} />}
+      </div>
       <div style={{ display: activeTab==="guide" ? "block" : "none" }}>
         <ScoringGuide t={t} isDark={isDark} />
       </div>
@@ -1133,8 +1138,8 @@ export default function App() {
         }}>
           {TABS.map(tab => {
             const isActive = activeTab === tab.id;
-            const icon = tab.id === "setups" ? "🎯" : tab.id === "top" ? "⭐" : tab.id === "nifty" ? "📊" : "📐";
-            const shortLabel = tab.id === "setups" ? `All (${stocks.length})` : tab.id === "top" ? `Top (${topPicks.length})` : tab.id === "nifty" ? "Nifty Flow Data" : "Scoring";
+            const icon = tab.id === "setups" ? "🎯" : tab.id === "top" ? "⭐" : tab.id === "nifty" ? "📊" : tab.id === "scorecard" ? "🧮" : "📐";
+            const shortLabel = tab.id === "setups" ? `All (${stocks.length})` : tab.id === "top" ? `Top (${topPicks.length})` : tab.id === "nifty" ? "Nifty Flow Data" : tab.id === "scorecard" ? "Scorecard" : "Scoring";
             return (
               <button
                 key={tab.id}

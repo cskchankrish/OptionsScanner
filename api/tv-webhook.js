@@ -44,6 +44,15 @@ import {
 } from "../src/flowBridge.js";
 import { parseAlgoPnl, algoPnlLines, formatInr, indexMovePts } from "../src/algoPnl.js";
 import { formatEodCardLines } from "../src/eodCard.js";
+import { recordEvent as scRecordEvent, scStoreFromClient, buildSignalEvent, buildTradeEvent, istOf as scIstOf } from "../src/scorecard.js";
+
+/** Appends one scorecard event (measurement only; never throws, never changes a response). */
+async function scRecord(redis, event) {
+  try {
+    if (!redis || !event) return;
+    await scRecordEvent({ store: scStoreFromClient(redis), date: scIstOf(event.t).date, event });
+  } catch (e) { /* measurement only */ }
+}
 import {
   CARRY_ACTIVE_KEY,
   CARRY_SYNC_GRADES,
@@ -1978,6 +1987,11 @@ export default async function handler(req, res) {
         store: storeFromClient(redis),
         deps: { now: d.now, sendText: d.sendText },
       });
+      // Scorecard (measurement only): carry exit with the Algo's rupee result.
+      if (out.status === 200 && out.body?.event === "CARRY_EXIT" && !out.body.duplicate && out.body.record) {
+        const rec = out.body.record;
+        await scRecord(redis, buildTradeEvent({ kind: "CARRY", tradeId: rec.id, exitGrade: rec.exit?.reason || "CARRY_EXIT", direction: rec.dir, entry: rec.entry?.spotRef, exitPrice: rec.exit?.spot, pnlInr: rec.pnlInr, pnlKnown: rec.pnlKnown, accountsCount: rec.algoPnl?.accounts?.length ?? null, nowMs: d.now() }));
+      }
       return res.status(out.status).json(out.body);
     }
 
@@ -2129,6 +2143,10 @@ export default async function handler(req, res) {
           activeTrade?.id ? releaseActiveTradeIfOwned(redis, activeTrade.id) : redis.del("nifty:tv:active_trade"),
           redis.lpush("nifty:tv:signals:master_archive", JSON.stringify(exitRecord)),
         ]);
+      }
+      // Scorecard (measurement only): Algo-owned trade exit with the Algo's rupee result.
+      if (algoOwned) {
+        await scRecord(redis, buildTradeEvent({ kind: "FLOW", tradeId: exitTrade.id, exitGrade: payload.grade, direction: exitTrade.direction, entry: exitTrade.entryPrice, exitPrice: fillPrice, pnlInr: algoPnl?.reported ? algoPnl.pnlInr : null, pnlKnown: algoPnl ? algoPnl.pnlKnown : null, accountsCount: algoPnl?.accounts?.length ?? null, nowMs: Date.now() }));
       }
       await sendTelegramExitAlert(exitRecord);
       await runExitWatchdog();
@@ -2345,6 +2363,11 @@ export default async function handler(req, res) {
       if (openCarry) fusedVerdict.openCarry = openCarry;
     }
     await sendTelegramAlert(fusedVerdict);
+
+    // Scorecard (measurement only): the signal as received and decided, after every decision above.
+    if (isActionable) {
+      await scRecord(redis, buildSignalEvent(fusedVerdict, deps.now()));
+    }
 
     // 7. Scanner-blind watchdog (live market hours only; deduped once per outage).
     if (isLiveMarket === null) {

@@ -23,6 +23,12 @@ import {
 import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
 import { getCarryConfig, readCarryAutomation, storeFromCommand as carryStoreFromCommand } from "../src/carryBridge.js";
 import { buildEodCard, formatEodCardLines } from "../src/eodCard.js";
+import { recordReading, completePendingEod, finaliseDay, scStoreFromCommand, settingsSnapshot, SC_CLOSE_MEASURE_MINS } from "../src/scorecard.js";
+import { getTurnConfig } from "../src/turnTracker.js";
+import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "../src/smartMoneyFusion.js";
+import { INTRADAY_PRICE_DEADBAND_PCT, INTRADAY_OI_DEADBAND_PCT, getIntradayQuadrantWindowMins } from "../src/flowCalc.js";
+import { getFlowBridgeConfig } from "../src/flowBridge.js";
+import { describeCarryConfig } from "../src/carryBridge.js";
 export { buildEodCard, formatEodCardLines };
 import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
 
@@ -1157,6 +1163,8 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
     futBasis: Number(futuresMetrics.adjustedBasisSpread != null ? futuresMetrics.adjustedBasisSpread : futuresMetrics.rawBasis) || undefined,
     futQuadrant: futuresMetrics.quadrant || undefined,
     futQuadrantSource: futuresMetrics.quadrantSource || undefined,
+    // Cumulative traded futures volume (near month) at this tick — recorded for the scorecard.
+    ...(Number(futuresMetrics.volume) > 0 ? { futVolume: Number(futuresMetrics.volume) } : {}),
   } : {};
   // Floor / roof strikes at this tick (used by the Turn Tracker for strike migration since an extreme).
   const lv = levels && Number(levels.floor) > 0 && Number(levels.roof) > 0 ? { floor: Number(levels.floor), roof: Number(levels.roof) } : {};
@@ -1682,6 +1690,49 @@ export const EOD_GROUP_CAPS = { A: 2, B: 3, C: 2 };
 // One group can be wrong for one reason (60); each further independent confirmation adds 15;
 // never above 90 because these are hand-set rules, not a calibrated hit rate.
 export const EOD_AGREEMENT_CAPS = { 0: 30, 1: 60, 2: 75, 3: 90 };
+
+/**
+ * Scorecard reading from values the refresh core already computed (nothing computed here feeds
+ * any decision). Pure.
+ */
+export function buildScorecardReading({ nowMs, minutes, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn, eodDecision }) {
+  return {
+    t: nowMs,
+    minutes,
+    futPrice: futuresMetrics && !futuresMetrics.isStale && Number(futuresMetrics.lastPrice) > 0 ? Number(futuresMetrics.lastPrice) : null,
+    spot,
+    futuresExpiry: futuresMetrics?.expiryDate || null,
+    dq: { state: dataQuality?.state || null, coveragePct: dataQuality?.coveragePct ?? null },
+    fusion: { quadrant: fusion?.quadrantInfo?.quadrant || null, scenario: fusion?.scenarioId || null },
+    turn: turnTracker || null,
+    radar: macroTurn || null,
+    eod: eodDecision ? {
+      verdict: eodDecision.verdict, bias: eodDecision.bias, score: eodDecision.score,
+      groups: { A: eodDecision.groups?.A?.contribution ?? null, B: eodDecision.groups?.B?.contribution ?? null, C: eodDecision.groups?.C?.contribution ?? null },
+      unverifiedGroups: eodDecision.unverifiedGroups || [],
+      slot: getEodSlotMinutes(minutes),
+      category: getEodCarryCategory(eodDecision),
+      stopLoss: eodDecision.stopLoss ?? null,
+    } : null,
+  };
+}
+
+/** Every threshold / setting in effect (non-secret values only), for the scorecard snapshot. */
+export function scorecardSettings(env = process.env) {
+  const flow = getFlowBridgeConfig(env);
+  return settingsSnapshot({
+    env,
+    constants: {
+      turnTracker: getTurnConfig(env),
+      radar: { minTicksPerCandle: MACRO_MIN_TICKS_PER_CANDLE, anchorToleranceMins: MACRO_ANCHOR_TOLERANCE_MINS, bullTrap: { minPricePts: 22, maxNetDelta: -26000, c1NetBelow: -7000, c2NetBelow: -14000 }, bearTrap: { maxPricePts: -22, minNetDelta: 28000, c1NetAbove: 7000, c2NetAbove: 14000 } },
+      fusion: { dayPriceDeadbandPct: PRICE_DEADBAND_PCT, dayOiDeadbandPct: OI_DEADBAND_PCT, intradayPriceDeadbandPct: INTRADAY_PRICE_DEADBAND_PCT, intradayOiDeadbandPct: INTRADAY_OI_DEADBAND_PCT, intradayWindowMins: getIntradayQuadrantWindowMins(), quadrantMode: getFusionQuadrantMode() },
+      eod: { groupCaps: EOD_GROUP_CAPS, agreementCaps: EOD_AGREEMENT_CAPS, carryThreshold: { weekday: 3, friday: 4 }, closingTiers: { full: 75000, two: 30000, one: 10000 }, alertWindow: minsToHHMM(EOD_WINDOW_START_MINS) + "–" + minsToHHMM(EOD_WINDOW_END_MINS) },
+      carry: describeCarryConfig(getCarryConfig(env)),
+      flowBridge: { enabled: flow.enabled, decisions: flow.decisions, timeoutMs: flow.timeoutMs },
+      flowMaxAgeSec: Number(env.FLOW_MAX_AGE_SEC) > 0 ? Number(env.FLOW_MAX_AGE_SEC) : 900,
+    },
+  });
+}
 export const EOD_AGREEMENT_LABEL = "Agreement score (rule-based, not a probability)";
 const OPPOSING_GROUP_PENALTY = 10;
 
@@ -3110,6 +3161,42 @@ export async function refreshLiveSnapshot({
         }
       } catch (e) {
         console.error("Collector alert error:", e?.message);
+      }
+    }
+
+    // Daily scorecard (src/scorecard.js) — MEASUREMENT ONLY. Runs after every decision above has
+    // been made, reads only values already computed, makes no NSE call, and swallows its errors.
+    // Weekday sessions only (the measurement windows assume the 09:15–15:40 schedule).
+    if (REDIS_URL && REDIS_TOKEN && !isEodTest && targetExpiry === nearExpiry && sessionInfo.isLiveMarket && !sessionInfo.isSunday) {
+      try {
+        const scStore = scStoreFromCommand(redisRestCommand);
+        const scMins = getISTMinutes();
+        const scDate = getISTIsoDateStr();
+        const scSend = async (text) => {
+          const { sendTelegramText } = await import("./tv-webhook.js");
+          return sendTelegramText(text);
+        };
+        await recordReading({
+          store: scStore,
+          date: scDate,
+          reading: buildScorecardReading({ nowMs: Date.now(), minutes: scMins, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn: smartMoney.macroTurn, eodDecision }),
+        });
+        await completePendingEod({ store: scStore, today: scDate, timeline, nowMins: scMins, futuresExpiry: futuresMetrics?.expiryDate || null, send: scSend });
+        if (scMins >= SC_CLOSE_MEASURE_MINS) {
+          await finaliseDay({
+            store: scStore,
+            date: scDate,
+            futuresExpiry: futuresMetrics?.expiryDate || null,
+            deps: {
+              getTimeline: async () => timeline,
+              computeDataQuality: (tl) => computeDataQuality({ timeline: tl, nowMins: Math.min(scMins, 940), isSunday: false, isLive: false }),
+              settings: scorecardSettings(),
+              send: scSend,
+            },
+          });
+        }
+      } catch (e) {
+        console.error("Scorecard error:", e?.message);
       }
     }
 
