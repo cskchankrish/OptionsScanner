@@ -3,7 +3,10 @@
  * Every rate is shown with its sample size, and "too few to judge" below the minimum sample.
  * Data: GET /api/scorecard?date=… and ?days=30 (public view; rupee results need the secret).
  */
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { isSessionLiveNow } from "./marketCalendar.js";
+import { useAutoRefresh } from "./useAutoRefresh.js";
+import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", TRADE: "Algo trades (₹)" };
 
@@ -33,18 +36,40 @@ export function ScorecardView({ t, isDark }) {
   const [days, setDays] = useState(30);
   const [err, setErr] = useState(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  // Same two fetches as before; a sequence number drops responses for a superseded date/days.
+  const seqRef = useRef(0);
+  const load = async () => {
+    const seq = ++seqRef.current;
     setErr(null);
-    Promise.all([
-      fetch(`/api/scorecard?date=${date}`).then((r) => (r.ok ? r.json() : null)),
-      fetch(`/api/scorecard?days=${days}`).then((r) => (r.ok ? r.json() : null)),
-    ]).then(([d, a]) => {
-      if (cancelled) return;
+    try {
+      const [d, a] = await Promise.all([
+        fetch(`/api/scorecard?date=${date}`).then((r) => (r.ok ? r.json() : null)),
+        fetch(`/api/scorecard?days=${days}`).then((r) => (r.ok ? r.json() : null)),
+      ]);
+      if (seq !== seqRef.current) return { ok: true };
       setDay(d);
       setAgg(a);
-    }).catch((e) => !cancelled && setErr(e.message));
-    return () => { cancelled = true; };
+      return d === null || a === null ? { ok: false, error: "HTTP error" } : { ok: true };
+    } catch (e) {
+      if (seq === seqRef.current) setErr(e.message);
+      return { ok: false, error: e.message };
+    }
+  };
+
+  // Live polling only while the market session is live AND the selected date is today (IST).
+  const isLiveToday = date === istToday() && isSessionLiveNow(Date.now());
+  const auto = useAutoRefresh({
+    refresh: load,
+    intervalSec: 60,
+    enabled: () => date === istToday() && isSessionLiveNow(Date.now()),
+    finalRefreshDelayMs: null, // no polling outside the live session
+  });
+
+  useEffect(() => {
+    // Through the hook so the freshness time and schedule start here; if an auto refresh for the
+    // previous selection is still in flight, load directly (its stale response is dropped).
+    auto.refreshNow(load).then((r) => { if (r?.skipped) load(); });
+    return () => { seqRef.current += 1; };
   }, [date, days]);
 
   const cell = { padding: "6px 8px", borderBottom: `1px solid ${t.border}`, fontSize: 12, verticalAlign: "top" };
@@ -64,6 +89,8 @@ export function ScorecardView({ t, isDark }) {
         <a href={`/api/scorecard?date=${date}&format=csv`} style={{ fontSize: 12, color: t.accent }}>day CSV</a>
         <a href={`/api/scorecard?days=${days}&format=csv`} style={{ fontSize: 12, color: t.accent }}>rolling CSV</a>
         <span style={{ fontSize: 11, color: t.textMuted }}>Measurement only — nothing here changes a decision.</span>
+        <DataFreshnessBadge t={t} isDark={isDark} isMobile={false} auto={auto} live={isLiveToday} />
+        {isLiveToday && <span style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace" }}>auto {Math.floor(auto.remainingSec / 60)}:{String(auto.remainingSec % 60).padStart(2, "0")}</span>}
       </div>
       {err && <div style={{ color: "#ef4444" }}>{err}</div>}
 

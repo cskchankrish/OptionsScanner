@@ -204,8 +204,143 @@ function getWebhookDeps() {
     // Flow execution bridge (src/flowBridge.js): HTTP client and trade-id generator.
     bridgeFetch: (...args) => globalThis.fetch(...args),
     newTradeId: defaultNewTradeId,
+    // Background continuation after an early TradingView ack: a working waitUntil, or null.
+    getWaitUntil: resolveVercelWaitUntil,
   };
   return { ...defaults, ...(_webhookDepsOverride || {}) };
+}
+
+// ── TradingView ack deadline ────────────────────────────────────────────────────────────────
+// TradingView abandons a webhook after ~3s and logs "Webhook delivery failed" even when the
+// alert is processed fine afterwards. For the Pine-alert pipeline only, if no response has been
+// written TV_ACK_DEADLINE_MS after the request started, the handler answers 200
+// ACCEPTED_PROCESSING and the pipeline keeps running unchanged, kept alive by Vercel's waitUntil.
+// Fail safe: without a confirmed waitUntil the handler never acks early (an order dispatch must
+// never run in an instance that may be frozen once the response is sent).
+
+/** TV_ACK_DEADLINE_MS: default 2000, clamped to 500..2800; "0" disables the early ack. */
+export function getTvAckDeadlineMs(env = process.env) {
+  const raw = env.TV_ACK_DEADLINE_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 2000;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return 2000;
+  if (v === 0) return 0;
+  return Math.min(2800, Math.max(500, v));
+}
+
+// @vercel/functions locates the per-request context through this global (get-context.js:
+// globalThis[Symbol.for("@vercel/request-context")]?.get?.() ?? {}), and its waitUntil is
+// `getContext().waitUntil?.(promise)` — a SILENT no-op when the context is absent. So the package
+// export alone cannot prove that background work will be kept alive; the context is checked here.
+const VERCEL_REQUEST_CONTEXT = Symbol.for("@vercel/request-context");
+
+/**
+ * Returns a waitUntil(promise) bound to this request's Vercel context, or null when that cannot
+ * be confirmed (no request context, no waitUntil on it, or @vercel/functions fails to load).
+ * Must be called inside the request's async context. Never throws.
+ */
+export async function resolveVercelWaitUntil() {
+  let ctx = null;
+  try {
+    ctx = globalThis[VERCEL_REQUEST_CONTEXT]?.get?.() ?? null;
+  } catch (e) {
+    ctx = null;
+  }
+  if (!ctx || typeof ctx.waitUntil !== "function") return null;
+  try {
+    const mod = await import("@vercel/functions");
+    const pkgWaitUntil = mod?.waitUntil ?? mod?.default?.waitUntil;
+    if (typeof pkgWaitUntil !== "function") return null;
+  } catch (e) {
+    console.warn("[tv-webhook] @vercel/functions unavailable; early TradingView ack disabled:", e?.message || e);
+    return null;
+  }
+  // Same call the package makes (getContext().waitUntil(promise)), bound to the context confirmed
+  // above so it cannot silently become a no-op later.
+  return (promise) => ctx.waitUntil(promise);
+}
+
+/**
+ * Runs `run(res)` (the Pine-alert pipeline). When the deadline is enabled and a waitUntil is
+ * confirmed, `run` writes through a guarded response: if it has not responded by the deadline the
+ * pipeline promise is registered with waitUntil, then 200 ACCEPTED_PROCESSING is sent; the
+ * pipeline's own later write is swallowed (logged). Otherwise this is exactly `run(res)`.
+ */
+export async function runWithAckDeadline({ res, run, requestStartMs, deadlineMs, getWaitUntil, buildAck = () => ({}) }) {
+  if (!(deadlineMs > 0) || typeof getWaitUntil !== "function") return run(res);
+  let waitUntil = null;
+  try {
+    waitUntil = await getWaitUntil();
+  } catch (e) {
+    waitUntil = null;
+  }
+  if (typeof waitUntil !== "function") return run(res);
+
+  let acked = false;
+  let responded = false;
+  const guarded = {
+    setHeader(...args) {
+      if (!acked) res.setHeader(...args);
+      return guarded;
+    },
+    status(code) {
+      const write = (method) => (body) => {
+        if (acked) {
+          const decision = body && typeof body === "object" ? body.decision || body.error || "" : "";
+          console.log(`[tv-webhook] pipeline finished ${Date.now() - requestStartMs}ms after request start (already acked early); final ${code}${decision ? ` ${decision}` : ""}`);
+          return guarded;
+        }
+        responded = true;
+        res.status(code);
+        return res[method](body);
+      };
+      return { json: write("json"), send: write("send"), end: write("end") };
+    },
+  };
+
+  const pipeline = Promise.resolve()
+    .then(() => run(guarded))
+    .catch((err) => {
+      if (!acked) throw err; // before an ack: propagate exactly as today
+      console.error("[tv-webhook] Pipeline error after early TradingView ack:", err);
+    });
+
+  let timer = null;
+  const ackSent = new Promise((resolve) => {
+    const remaining = Math.max(0, deadlineMs - (Date.now() - requestStartMs));
+    timer = setTimeout(() => {
+      if (responded || res.headersSent || res.writableEnded) return;
+      try {
+        waitUntil(pipeline); // registered BEFORE the response goes out
+      } catch (e) {
+        console.error("[tv-webhook] waitUntil registration failed; not acknowledging early:", e?.message || e);
+        return;
+      }
+      acked = true;
+      const elapsedMs = Date.now() - requestStartMs;
+      let info = {};
+      try { info = buildAck() || {}; } catch (e) { info = {}; }
+      console.log(`[tv-webhook] early ack ACCEPTED_PROCESSING after ${elapsedMs}ms (grade=${info.grade ?? "?"}${info.tradeId ? `, tradeId=${info.tradeId}` : ""}); pipeline continues in background`);
+      try {
+        res.status(200).json({
+          ok: true,
+          status: "ACCEPTED_PROCESSING",
+          grade: info.grade ?? null,
+          ...(info.tradeId ? { tradeId: info.tradeId } : {}),
+          elapsedMs,
+        });
+      } catch (e) {
+        console.error("[tv-webhook] early ack write failed:", e?.message || e);
+      }
+      resolve();
+    }, remaining);
+  });
+
+  try {
+    await Promise.race([pipeline, ackSent]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Runs the refresh core once, bounded by timeoutMs. Never throws. */
@@ -2153,246 +2288,266 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, event: "TRADE_CLOSED", exitRecord });
     }
 
-    // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis.
-    //    Actionable grades may only be verified against the live `nifty:flow:latest`
-    //    snapshot; the 14-day session payload is an informational fallback for other grades.
-    const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
-    const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
-    const isActionable = isTrap || isSynergy;
-    const deps = getWebhookDeps();
-    const maxAgeSec = getFlowMaxAgeSec();
-    const isStale = (snap, atMs) => {
-      const age = getSnapshotAgeSec(snap, atMs);
-      return !snap || age === null || age > maxAgeSec;
-    };
-
-    let liveScanner = await readFlowSnapshot(redis, { allowSessionFallback: !isActionable });
-
-    // 2b. Self-refresh: an actionable alert against a missing/stale snapshot triggers ONE bounded
-    //     on-demand refresh (live market hours only), then the snapshot is re-read and re-validated.
-    let isLiveMarket = null;
-    let refreshInfo = null;
-    if (isActionable && isStale(liveScanner, deps.now())) {
+    // Steps 2-7 (the Pine-alert fusion pipeline) run as one unit. It is unchanged; it only writes
+    // through `res` handed in here, which is the real response unless the TradingView ack deadline
+    // applies (see runWithAckDeadline): then a response written after an early ack is swallowed.
+    const ackInfo = { grade: payload.grade ?? null, tradeId: null };
+    const runPipeline = async (res) => {
       try {
-        isLiveMarket = await deps.isLiveMarket();
-      } catch (e) {
-        isLiveMarket = false;
-      }
-      if (!isLiveMarket) {
-        refreshInfo = { attempted: false, ok: false, error: "outside live market hours" };
-      } else {
-        refreshInfo = await attemptOnDemandRefresh({
-          refresh: deps.refresh,
-          timeoutMs: getFlowRefreshTimeoutMs(),
-          nowMs: deps.now(),
-        });
-        if (refreshInfo.ok) {
-          liveScanner = await readFlowSnapshot(redis);
-          if (isStale(liveScanner, deps.now())) {
-            refreshInfo.ok = false;
-            refreshInfo.stage = "reread";
-            refreshInfo.error = liveScanner
-              ? "refresh reported success but the re-read snapshot is still not fresh"
-              : "refresh reported success but nifty:flow:latest could not be re-read";
-          }
-        }
-      }
-    }
-    const refreshedNow = Boolean(refreshInfo?.attempted && refreshInfo.ok);
-
-    // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
-    const nowMs = deps.now();
-    const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner, nowMs);
-
-    // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
-    const snapshotAgeSec = fusedVerdict.liveOptionChainMetrics.snapshotAgeSec;
-    const isSnapshotStale = !liveScanner || snapshotAgeSec === null || snapshotAgeSec > maxAgeSec;
-
-    if (isActionable) {
-      const sourceLabel = liveScanner ? describeSnapshotSource(liveScanner, refreshedNow) : "none";
-      fusedVerdict.liveOptionChainMetrics.snapshotSource = liveScanner?.snapshotSource || null;
-      fusedVerdict.snapshotProvenance = liveScanner
-        ? `${sourceLabel} · age ${snapshotAgeSec === null ? "unknown" : `${snapshotAgeSec}s`}`
-        : "missing";
-      if (refreshInfo) {
-        fusedVerdict.snapshotRefresh = refreshInfo;
-        if (refreshInfo.attempted && !refreshInfo.ok) {
-          fusedVerdict.snapshotProvenance += ` · on-demand refresh failed (${refreshInfo.error})`;
-        }
-      }
-    }
-
-    if (isActionable && isSnapshotStale) {
-      // Fail closed: never open a position without a fresh, live option-chain snapshot.
-      fusedVerdict.decision = "VETO_STALE_OPTION_CHAIN";
-      fusedVerdict.recommendedLots = 0;
-      fusedVerdict.tier = "VETOED_STALE_DATA";
-      fusedVerdict.liveOptionChainMetrics.maxAgeSec = maxAgeSec;
-      fusedVerdict.reasoning = !liveScanner
-        ? `VETOED: No live option-chain snapshot (nifty:flow:latest) available to verify ${payload.grade}. Snapshot age: unknown (missing). 0 Lots.`
-        : snapshotAgeSec === null
-        ? `VETOED: Option-chain snapshot has no snapshotAt timestamp, so its freshness cannot be verified for ${payload.grade}. Snapshot age: unknown. 0 Lots.`
-        : `VETOED: Option-chain snapshot is stale (age ${snapshotAgeSec}s > max ${maxAgeSec}s); cannot verify ${payload.grade}. 0 Lots.`;
-      if (refreshInfo?.attempted) {
-        fusedVerdict.reasoning += ` On-demand refresh attempted (${refreshInfo.durationMs}ms) and failed: ${refreshInfo.error}.`;
-      } else if (refreshInfo) {
-        fusedVerdict.reasoning += ` No on-demand refresh attempted (${refreshInfo.error}).`;
-      }
-    } else if (!isActionable) {
-      // Non-actionable signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
-      fusedVerdict.decision = "LOG_ONLY";
-      fusedVerdict.recommendedLots = 0;
-      fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward paper trading executes Traps and Verified Synergy.`;
-    } else {
-      // Check Single-Position Rule for Traps & Synergy. The read below only shapes the BLOCKED
-      // message; the actual lock is the atomic SET NX claim further down.
-      let activeTrade = null;
-      if (redis) {
-        try {
-          const raw = await redis.get("nifty:tv:active_trade");
-          activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
-        } catch (e) {}
-      }
-      const blockAsActive = (t) => {
-        fusedVerdict.decision = "BLOCKED_BY_ACTIVE_TRADE";
-        fusedVerdict.recommendedLots = 0;
-        fusedVerdict.reasoning = t
-          ? `BLOCKED: Active trade already open (${t.grade} ${t.direction} @ ${t.entryPrice}${t.id ? `, id ${t.id}` : ""}). The tested system strictly enforces one position at a time.`
-          : `BLOCKED: Another trade claimed the single-position lock at the same moment. The tested system strictly enforces one position at a time.`;
-      };
-
-      if (activeTrade && activeTrade.active) {
-        if (isBridgeOwned(activeTrade)) await checkStuckAcceptedTrade(redis, activeTrade, deps);
-        blockAsActive(activeTrade);
-      } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
-        const isHtf = fusedVerdict.timeframe === "125" || fusedVerdict.timeframe === "D" || Number(fusedVerdict.timeframe) >= 60 || fusedVerdict.grade?.includes("SYNERGY");
-        const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
-        const activeData = {
-          active: true,
-          grade: fusedVerdict.grade,
-          direction: fusedVerdict.direction,
-          timeframe: fusedVerdict.timeframe,
-          swingTimeframe: fusedVerdict.swingTimeframe,
-          entryPrice: fusedVerdict.entryPrice,
-          stopLoss: fusedVerdict.stopLoss,
-          riskPoints: fusedVerdict.riskPoints,
-          target1Price: fusedVerdict.target1Price,
-          target2Price: fusedVerdict.target2Price,
-          target1Dist: fusedVerdict.target1Dist,
-          target2Dist: fusedVerdict.target2Dist,
-          timestamp: fusedVerdict.timestamp,
-          istTime: fusedVerdict.istTime,
+        // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis.
+        //    Actionable grades may only be verified against the live `nifty:flow:latest`
+        //    snapshot; the 14-day session payload is an informational fallback for other grades.
+        const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
+        const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
+        const isActionable = isTrap || isSynergy;
+        const deps = getWebhookDeps();
+        const maxAgeSec = getFlowMaxAgeSec();
+        const isStale = (snap, atMs) => {
+          const age = getSnapshotAgeSec(snap, atMs);
+          return !snap || age === null || age > maxAgeSec;
         };
-        const bridgeConfig = getFlowBridgeConfig();
-        const dispatchPlanned = shouldDispatch(bridgeConfig, fusedVerdict);
-        const tradeId = deps.newTradeId(nowMs);
-        activeData.id = tradeId;
-        if (dispatchPlanned) activeData.execution = { status: "PENDING", at: new Date(nowMs).toISOString() };
 
-        // Atomic single-position claim: exactly one of several concurrent alerts gets "OK".
-        let claim = "NO_REDIS";
-        if (redis) {
+        let liveScanner = await readFlowSnapshot(redis, { allowSessionFallback: !isActionable });
+
+        // 2b. Self-refresh: an actionable alert against a missing/stale snapshot triggers ONE bounded
+        //     on-demand refresh (live market hours only), then the snapshot is re-read and re-validated.
+        let isLiveMarket = null;
+        let refreshInfo = null;
+        if (isActionable && isStale(liveScanner, deps.now())) {
           try {
-            const r = await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { nx: true, ex: activeTtl });
-            claim = r === "OK" ? "CLAIMED" : "TAKEN";
+            isLiveMarket = await deps.isLiveMarket();
           } catch (e) {
-            claim = "ERROR";
+            isLiveMarket = false;
           }
-        }
-
-        if (claim === "TAKEN") {
-          let holder = null;
-          try {
-            holder = parseMaybeJson(await redis.get("nifty:tv:active_trade"));
-          } catch (e) {}
-          blockAsActive(holder);
-        } else {
-          fusedVerdict.tradeId = tradeId;
-          if (dispatchPlanned) {
-            if (claim !== "CLAIMED") {
-              // Without a held lock a real order could double up: never dispatch.
-              fusedVerdict.execution = {
-                status: "NOT_EXECUTED",
-                outcome: "NOT_SENT",
-                reason: `not dispatched: position lock unavailable (${claim === "NO_REDIS" ? "Redis not configured" : "Redis error"})`,
-                mode: null,
-                orderRef: null,
-                at: new Date(deps.now()).toISOString(),
-              };
-              try {
-                await deps.sendText(`⚠️ *APPROVED BUT NOT EXECUTED* · \`${fusedVerdict.grade}\` · Trade ID \`${tradeId}\`\n• *Reason:* ${fusedVerdict.execution.reason}`);
-              } catch (e) {}
-            } else {
-              fusedVerdict.execution = await runBridgeDispatch({
-                redis,
-                config: bridgeConfig,
-                fused: fusedVerdict,
-                activeData,
-                activeTtl,
-                deps,
-                requestStartMs,
-              });
+          if (!isLiveMarket) {
+            refreshInfo = { attempted: false, ok: false, error: "outside live market hours" };
+          } else {
+            refreshInfo = await attemptOnDemandRefresh({
+              refresh: deps.refresh,
+              timeoutMs: getFlowRefreshTimeoutMs(),
+              nowMs: deps.now(),
+            });
+            if (refreshInfo.ok) {
+              liveScanner = await readFlowSnapshot(redis);
+              if (isStale(liveScanner, deps.now())) {
+                refreshInfo.ok = false;
+                refreshInfo.stage = "reread";
+                refreshInfo.error = liveScanner
+                  ? "refresh reported success but the re-read snapshot is still not fresh"
+                  : "refresh reported success but nifty:flow:latest could not be re-read";
+              }
             }
           }
         }
+        const refreshedNow = Boolean(refreshInfo?.attempted && refreshInfo.ok);
+
+        // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
+        const nowMs = deps.now();
+        const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner, nowMs);
+
+        // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
+        const snapshotAgeSec = fusedVerdict.liveOptionChainMetrics.snapshotAgeSec;
+        const isSnapshotStale = !liveScanner || snapshotAgeSec === null || snapshotAgeSec > maxAgeSec;
+
+        if (isActionable) {
+          const sourceLabel = liveScanner ? describeSnapshotSource(liveScanner, refreshedNow) : "none";
+          fusedVerdict.liveOptionChainMetrics.snapshotSource = liveScanner?.snapshotSource || null;
+          fusedVerdict.snapshotProvenance = liveScanner
+            ? `${sourceLabel} · age ${snapshotAgeSec === null ? "unknown" : `${snapshotAgeSec}s`}`
+            : "missing";
+          if (refreshInfo) {
+            fusedVerdict.snapshotRefresh = refreshInfo;
+            if (refreshInfo.attempted && !refreshInfo.ok) {
+              fusedVerdict.snapshotProvenance += ` · on-demand refresh failed (${refreshInfo.error})`;
+            }
+          }
+        }
+
+        if (isActionable && isSnapshotStale) {
+          // Fail closed: never open a position without a fresh, live option-chain snapshot.
+          fusedVerdict.decision = "VETO_STALE_OPTION_CHAIN";
+          fusedVerdict.recommendedLots = 0;
+          fusedVerdict.tier = "VETOED_STALE_DATA";
+          fusedVerdict.liveOptionChainMetrics.maxAgeSec = maxAgeSec;
+          fusedVerdict.reasoning = !liveScanner
+            ? `VETOED: No live option-chain snapshot (nifty:flow:latest) available to verify ${payload.grade}. Snapshot age: unknown (missing). 0 Lots.`
+            : snapshotAgeSec === null
+            ? `VETOED: Option-chain snapshot has no snapshotAt timestamp, so its freshness cannot be verified for ${payload.grade}. Snapshot age: unknown. 0 Lots.`
+            : `VETOED: Option-chain snapshot is stale (age ${snapshotAgeSec}s > max ${maxAgeSec}s); cannot verify ${payload.grade}. 0 Lots.`;
+          if (refreshInfo?.attempted) {
+            fusedVerdict.reasoning += ` On-demand refresh attempted (${refreshInfo.durationMs}ms) and failed: ${refreshInfo.error}.`;
+          } else if (refreshInfo) {
+            fusedVerdict.reasoning += ` No on-demand refresh attempted (${refreshInfo.error}).`;
+          }
+        } else if (!isActionable) {
+          // Non-actionable signals (MEGA, SIGNAL, VBO_BREAK, SWING_BOTTOM, etc.) are informational only
+          fusedVerdict.decision = "LOG_ONLY";
+          fusedVerdict.recommendedLots = 0;
+          fusedVerdict.reasoning = `Informational ${payload.grade || "SIGNAL"} alert logged for review. Forward paper trading executes Traps and Verified Synergy.`;
+        } else {
+          // Check Single-Position Rule for Traps & Synergy. The read below only shapes the BLOCKED
+          // message; the actual lock is the atomic SET NX claim further down.
+          let activeTrade = null;
+          if (redis) {
+            try {
+              const raw = await redis.get("nifty:tv:active_trade");
+              activeTrade = typeof raw === "string" ? JSON.parse(raw) : raw;
+            } catch (e) {}
+          }
+          const blockAsActive = (t) => {
+            fusedVerdict.decision = "BLOCKED_BY_ACTIVE_TRADE";
+            fusedVerdict.recommendedLots = 0;
+            fusedVerdict.reasoning = t
+              ? `BLOCKED: Active trade already open (${t.grade} ${t.direction} @ ${t.entryPrice}${t.id ? `, id ${t.id}` : ""}). The tested system strictly enforces one position at a time.`
+              : `BLOCKED: Another trade claimed the single-position lock at the same moment. The tested system strictly enforces one position at a time.`;
+          };
+
+          if (activeTrade && activeTrade.active) {
+            if (isBridgeOwned(activeTrade)) await checkStuckAcceptedTrade(redis, activeTrade, deps);
+            blockAsActive(activeTrade);
+          } else if (fusedVerdict.decision.startsWith("EXECUTE")) {
+            const isHtf = fusedVerdict.timeframe === "125" || fusedVerdict.timeframe === "D" || Number(fusedVerdict.timeframe) >= 60 || fusedVerdict.grade?.includes("SYNERGY");
+            const activeTtl = isHtf ? 604800 : 28800; // 7 days for 125m/Daily/Synergy, 8 hours for 15m intraday
+            const activeData = {
+              active: true,
+              grade: fusedVerdict.grade,
+              direction: fusedVerdict.direction,
+              timeframe: fusedVerdict.timeframe,
+              swingTimeframe: fusedVerdict.swingTimeframe,
+              entryPrice: fusedVerdict.entryPrice,
+              stopLoss: fusedVerdict.stopLoss,
+              riskPoints: fusedVerdict.riskPoints,
+              target1Price: fusedVerdict.target1Price,
+              target2Price: fusedVerdict.target2Price,
+              target1Dist: fusedVerdict.target1Dist,
+              target2Dist: fusedVerdict.target2Dist,
+              timestamp: fusedVerdict.timestamp,
+              istTime: fusedVerdict.istTime,
+            };
+            const bridgeConfig = getFlowBridgeConfig();
+            const dispatchPlanned = shouldDispatch(bridgeConfig, fusedVerdict);
+            const tradeId = deps.newTradeId(nowMs);
+            activeData.id = tradeId;
+            if (dispatchPlanned) activeData.execution = { status: "PENDING", at: new Date(nowMs).toISOString() };
+
+            // Atomic single-position claim: exactly one of several concurrent alerts gets "OK".
+            let claim = "NO_REDIS";
+            if (redis) {
+              try {
+                const r = await redis.set("nifty:tv:active_trade", JSON.stringify(activeData), { nx: true, ex: activeTtl });
+                claim = r === "OK" ? "CLAIMED" : "TAKEN";
+              } catch (e) {
+                claim = "ERROR";
+              }
+            }
+
+            if (claim === "TAKEN") {
+              let holder = null;
+              try {
+                holder = parseMaybeJson(await redis.get("nifty:tv:active_trade"));
+              } catch (e) {}
+              blockAsActive(holder);
+            } else {
+              fusedVerdict.tradeId = tradeId;
+              ackInfo.tradeId = tradeId; // reported in an early TradingView ack (no effect on the decision)
+              if (dispatchPlanned) {
+                if (claim !== "CLAIMED") {
+                  // Without a held lock a real order could double up: never dispatch.
+                  fusedVerdict.execution = {
+                    status: "NOT_EXECUTED",
+                    outcome: "NOT_SENT",
+                    reason: `not dispatched: position lock unavailable (${claim === "NO_REDIS" ? "Redis not configured" : "Redis error"})`,
+                    mode: null,
+                    orderRef: null,
+                    at: new Date(deps.now()).toISOString(),
+                  };
+                  try {
+                    await deps.sendText(`⚠️ *APPROVED BUT NOT EXECUTED* · \`${fusedVerdict.grade}\` · Trade ID \`${tradeId}\`\n• *Reason:* ${fusedVerdict.execution.reason}`);
+                  } catch (e) {}
+                } else {
+                  fusedVerdict.execution = await runBridgeDispatch({
+                    redis,
+                    config: bridgeConfig,
+                    fused: fusedVerdict,
+                    activeData,
+                    activeTtl,
+                    deps,
+                    requestStartMs,
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        // 5. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
+        const signalKey = `nifty:tv:signals:${istDate}`;
+        const archiveKey = "nifty:tv:signals:master_archive";
+        if (redis) {
+          try {
+            await Promise.all([
+              redis.lpush(signalKey, JSON.stringify(fusedVerdict)),
+              redis.ltrim(signalKey, 0, 99),
+              redis.lpush(archiveKey, JSON.stringify(fusedVerdict)),
+              redis.ltrim(archiveKey, 0, 999), // Keep up to 1,000 historical signals forever
+              redis.set("nifty:tv:latest_signal", JSON.stringify(fusedVerdict), { ex: 86400 }),
+            ]);
+          } catch (e) {
+            await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
+          }
+        } else {
+          await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
+        }
+
+        // 6. Fire Telegram Notification (with the open overnight carry, if any, for visibility only).
+        if (isActionable) {
+          const openCarry = await readOpenCarry(redis);
+          if (openCarry) fusedVerdict.openCarry = openCarry;
+        }
+        await sendTelegramAlert(fusedVerdict);
+
+        // Scorecard (measurement only): the signal as received and decided, after every decision above.
+        if (isActionable) {
+          await scRecord(redis, buildSignalEvent(fusedVerdict, deps.now()));
+        }
+
+        // 7. Scanner-blind watchdog (live market hours only; deduped once per outage).
+        if (isLiveMarket === null) {
+          try {
+            isLiveMarket = await deps.isLiveMarket();
+          } catch (e) {
+            isLiveMarket = false;
+          }
+        }
+        const watchdog = await runWebhookWatchdog({
+          redis,
+          // Actionable alerts only ever read nifty:flow:latest; for others the snapshot may be the
+          // un-stamped session payload, so let the watchdog re-read nifty:flow:latest itself.
+          snapshotAt: Number(liveScanner?.snapshotAt) > 0 ? liveScanner.snapshotAt : (isActionable ? null : undefined),
+          isLiveMarket,
+          lastError: refreshInfo?.attempted && !refreshInfo.ok ? refreshInfo.error : null,
+          deps,
+        });
+
+        return res.status(200).json({
+          ok: true,
+          decision: fusedVerdict.decision,
+          recommendedLots: fusedVerdict.recommendedLots,
+          fusedVerdict,
+          watchdog: watchdog.status,
+        });
+      } catch (err) {
+        console.error("[tv-webhook] Error processing TradingView alert:", err);
+        return res.status(500).json({ error: "Internal Server Error", details: err.message });
       }
-    }
-
-    // 5. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
-    const signalKey = `nifty:tv:signals:${istDate}`;
-    const archiveKey = "nifty:tv:signals:master_archive";
-    if (redis) {
-      try {
-        await Promise.all([
-          redis.lpush(signalKey, JSON.stringify(fusedVerdict)),
-          redis.ltrim(signalKey, 0, 99),
-          redis.lpush(archiveKey, JSON.stringify(fusedVerdict)),
-          redis.ltrim(archiveKey, 0, 999), // Keep up to 1,000 historical signals forever
-          redis.set("nifty:tv:latest_signal", JSON.stringify(fusedVerdict), { ex: 86400 }),
-        ]);
-      } catch (e) {
-        await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
-      }
-    } else {
-      await redisRestSet("nifty:tv:latest_signal", fusedVerdict, 86400);
-    }
-
-    // 6. Fire Telegram Notification (with the open overnight carry, if any, for visibility only).
-    if (isActionable) {
-      const openCarry = await readOpenCarry(redis);
-      if (openCarry) fusedVerdict.openCarry = openCarry;
-    }
-    await sendTelegramAlert(fusedVerdict);
-
-    // Scorecard (measurement only): the signal as received and decided, after every decision above.
-    if (isActionable) {
-      await scRecord(redis, buildSignalEvent(fusedVerdict, deps.now()));
-    }
-
-    // 7. Scanner-blind watchdog (live market hours only; deduped once per outage).
-    if (isLiveMarket === null) {
-      try {
-        isLiveMarket = await deps.isLiveMarket();
-      } catch (e) {
-        isLiveMarket = false;
-      }
-    }
-    const watchdog = await runWebhookWatchdog({
-      redis,
-      // Actionable alerts only ever read nifty:flow:latest; for others the snapshot may be the
-      // un-stamped session payload, so let the watchdog re-read nifty:flow:latest itself.
-      snapshotAt: Number(liveScanner?.snapshotAt) > 0 ? liveScanner.snapshotAt : (isActionable ? null : undefined),
-      isLiveMarket,
-      lastError: refreshInfo?.attempted && !refreshInfo.ok ? refreshInfo.error : null,
-      deps,
-    });
-
-    return res.status(200).json({
-      ok: true,
-      decision: fusedVerdict.decision,
-      recommendedLots: fusedVerdict.recommendedLots,
-      fusedVerdict,
-      watchdog: watchdog.status,
+    };
+    return await runWithAckDeadline({
+      res,
+      run: runPipeline,
+      requestStartMs,
+      deadlineMs: getTvAckDeadlineMs(),
+      getWaitUntil: getWebhookDeps().getWaitUntil,
+      buildAck: () => ({ grade: ackInfo.grade, tradeId: ackInfo.tradeId }),
     });
   } catch (err) {
     console.error("[tv-webhook] Error processing TradingView alert:", err);

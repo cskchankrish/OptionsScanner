@@ -79,6 +79,106 @@ test("regression 12-Nov: null-futures 09:15 tick no longer produces 'basis … �
   assert.doesNotMatch(detail, /Δ \d/);
 });
 
+// ── 13-Nov: stale carry-over futures quote at the open ──
+
+const NOV13 = [
+  ["09:15", 25314, 25209.85, 216128],
+  ["09:16", 25314, 25152.95, 216128],
+  ["09:17", 25170, 25135.75, 212215],
+  ["09:18", 25165.9, 25111.95, 212638],
+  ["09:19", 25163, 25124.05, 212638],
+  ["09:20", 25155, 25128.7, 212782],
+  ["09:21", 25155, 25115.85, 212979],
+  ["09:22", 25123, 25088.75, 212922],
+  ["09:23", 25123, 25078.3, 212922],
+  ["09:24", 25111, 25095.05, 212872],
+  ["09:25", 25116.7, 25119.75, 212872],
+  ["09:26", 25145, 25123.5, 213130],
+].map(([time, futPrice, spot, futCombinedOI]) => {
+  const [h, m] = time.split(":").map(Number);
+  return { time, minutes: h * 60 + m, futPrice, spot, futCombinedOI };
+});
+
+test("anchor 13-Nov: the stale 09:15/09:16 carry-over quote is skipped; anchor is 09:17", () => {
+  const a = pickSessionFuturesAnchor({ timeline: NOV13 });
+  assert.equal(a.source, "timeline");
+  assert.equal(a.time, "09:17");
+  assert.equal(a.futPrice, 25170);
+  assert.equal(a.futCombinedOI, 212215);
+  assert.equal(a.rawBasis, 34.25);
+  assert.equal(a.provisional, false);
+  assert.equal(a.skippedStaleTicks, 2);
+  // Order of the input does not matter.
+  assert.equal(pickSessionFuturesAnchor({ timeline: NOV13.slice().reverse() }).time, "09:17");
+});
+
+test("anchor 13-Nov: provisional at the open, self-corrects to 09:17 as ticks arrive", () => {
+  for (const n of [1, 2, 3]) {
+    const a = pickSessionFuturesAnchor({ timeline: NOV13.slice(0, n) });
+    assert.equal(a.time, "09:15", `${n} tick(s)`);
+    assert.equal(a.provisional, true, `${n} tick(s)`);
+    assert.equal(a.skippedStaleTicks, 0);
+    assert.ok(a.reason);
+  }
+  // 4–5 ticks: 09:15 (then 09:16) can already be judged stale; the next candidate is still unconfirmed.
+  const a4 = pickSessionFuturesAnchor({ timeline: NOV13.slice(0, 4) });
+  assert.deepEqual([a4.time, a4.provisional, a4.skippedStaleTicks], ["09:16", true, 1]);
+  const a5 = pickSessionFuturesAnchor({ timeline: NOV13.slice(0, 5) });
+  assert.deepEqual([a5.time, a5.provisional, a5.skippedStaleTicks], ["09:17", true, 2]);
+  for (let n = 6; n <= NOV13.length; n++) {
+    const a = pickSessionFuturesAnchor({ timeline: NOV13.slice(0, n) });
+    assert.deepEqual([a.time, a.provisional, a.skippedStaleTicks, a.rawBasis], ["09:17", false, 2, 34.25], `${n} ticks`);
+  }
+});
+
+const series = (n, basisAt, oiAt, start = 555) =>
+  Array.from({ length: n }, (_, i) => {
+    const futPrice = Number((25200 + 3 * Math.sin(i)).toFixed(2));
+    return { time: hm(start + i), minutes: start + i, futPrice, spot: Number((futPrice - basisAt(i)).toFixed(2)), futCombinedOI: Math.round(oiAt(i)) };
+  });
+
+test("anchor: a normal open (basis within a few points, OI drift < 0.3%) anchors on the first tick", () => {
+  const tl = series(20, (i) => 40 + (i % 3) - 1, (i) => 210000 * (1 + 0.00012 * i));
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.deepEqual([a.time, a.provisional, a.skippedStaleTicks], ["09:15", false, 0]);
+  assert.equal(a.reason, undefined);
+});
+
+test("anchor: a volatile but live open (basis ±20 pts, OI moving 0.5%) is not rejected", () => {
+  const swing = [20, -15, 5, -20, 10, -5, 18, -12, 0, 15, -18, 8, -3, 12, -8, 20, -20, 4, -6, 16];
+  const tl = series(20, (i) => 45 + swing[i], (i) => 210000 * (1 + (i % 2 ? 0.005 : 0) + 0.0001 * i));
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.deepEqual([a.time, a.provisional, a.skippedStaleTicks], ["09:15", false, 0]);
+});
+
+test("anchor: when every early candidate looks stale, fall back to the first valid tick (provisional, with a reason) — never null", () => {
+  // OI alternating ±2% every tick: each candidate disagrees with the median of its followers.
+  const tl = series(30, () => 40, (i) => 210000 * (i % 2 ? 0.98 : 1.02));
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.notEqual(a, null);
+  assert.equal(a.time, "09:15");
+  assert.equal(a.futCombinedOI, 214200);
+  assert.equal(a.provisional, true);
+  assert.match(a.reason, /all first 15 valid ticks disagreed/);
+});
+
+test("anchor: sparse capture (fewer than 3 ticks within 10 min, window closed) accepts the tick as before", () => {
+  const tl = [
+    { time: "09:15", minutes: 555, spot: 25200, futPrice: 25240, futCombinedOI: 210000 },
+    { time: "09:30", minutes: 570, spot: 25210, futPrice: 25251, futCombinedOI: 210300 },
+  ];
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.deepEqual([a.time, a.provisional, a.skippedStaleTicks], ["09:15", false, 0]);
+});
+
+test("anchor: a timeline anchor always wins over the Redis baseline", () => {
+  const stale = { openOI: 216128, openBasis: 104.15, openPrice: 25314, openSpot: 25209.85, time: "09:15" };
+  const a = pickSessionFuturesAnchor({ timeline: NOV13, cachedBase: stale });
+  assert.deepEqual([a.source, a.time], ["timeline", "09:17"]);
+  const early = pickSessionFuturesAnchor({ timeline: NOV13.slice(0, 1), cachedBase: stale });
+  assert.equal(early.source, "timeline");
+});
+
 // ── 2.2 NO CARRY: no agreement percentage ──
 
 const closing = (callEnd) => {

@@ -87,6 +87,19 @@ export function isMuhuratTomorrow(nowMs = Date.now()) {
 }
 
 /**
+ * True while a market session is live at nowMs (IST, inclusive bounds, minute resolution):
+ * Mon–Fri 09:15–15:40, a Muhurat weekend date 14:00–16:00, any other weekend day closed.
+ * Exchange holidays are not modelled (same as the rest of this module).
+ */
+export function isSessionLiveNow(nowMs = Date.now()) {
+  const p = istParts(nowMs);
+  const kind = getSessionKindForDate(p.date);
+  if (kind === "WEEKDAY") return p.minutes >= 555 && p.minutes <= 940;
+  if (kind === "MUHURAT") return p.minutes >= 840 && p.minutes <= 960;
+  return false;
+}
+
+/**
  * Calendar-gated day of week for session logic: 0 ONLY on a Muhurat session day (the legacy
  * "Sunday = Muhurat" value), 6 on any closed weekend day (the legacy "Saturday = weekend closed"
  * value), the real 1..5 on weekdays.

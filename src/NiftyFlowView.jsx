@@ -14,6 +14,8 @@ import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 import { EodVerdictCard } from "./EodVerdictCard.jsx";
 import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
+import { useAutoRefresh } from "./useAutoRefresh.js";
+import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -1482,7 +1484,6 @@ export function NiftyFlowView({ t, isDark }) {
   const [syncingDoc, setSyncingDoc] = useState(false);
   const [docSyncMsg, setDocSyncMsg] = useState("");
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 1-min (60s) or 2-min (120s) auto-refresh
-  const [countdown, setCountdown] = useState(60);
   const [marketStatus, setMarketStatus] = useState(getMarketSessionStatus());
 
   // EOD Overnight Carry Track Record & History State
@@ -1557,8 +1558,9 @@ export function NiftyFlowView({ t, isDark }) {
   }, []);
 
   // Check market status every 5 seconds without triggering re-render if unchanged
+  // (also re-checked at once when the tab becomes visible / regains focus after a suspension)
   useEffect(() => {
-    const statusTimer = setInterval(() => {
+    const recheck = () => {
       setMarketStatus(prev => {
         const next = getMarketSessionStatus();
         if (prev.isAutoActive !== next.isAutoActive || prev.reason !== next.reason) {
@@ -1566,13 +1568,22 @@ export function NiftyFlowView({ t, isDark }) {
         }
         return prev;
       });
-    }, 5000);
-    return () => clearInterval(statusTimer);
+    };
+    const statusTimer = setInterval(recheck, 5000);
+    document.addEventListener("visibilitychange", recheck);
+    window.addEventListener("focus", recheck);
+    window.addEventListener("pageshow", recheck);
+    return () => {
+      clearInterval(statusTimer);
+      document.removeEventListener("visibilitychange", recheck);
+      window.removeEventListener("focus", recheck);
+      window.removeEventListener("pageshow", recheck);
+    };
   }, []);
 
+  // The auto-refresh hook restarts its countdown when the interval changes.
   const changeInterval = (sec) => {
     setRefreshIntervalSec(sec);
-    setCountdown(sec);
   };
 
   const [selectedExpiryTab, setSelectedExpiryTab] = useState("auto");
@@ -1681,9 +1692,13 @@ export function NiftyFlowView({ t, isDark }) {
             return merged;
           });
         }
+        return { ok: true };
       }
+      // Reported to the auto-refresh freshness badge (nothing else changes on failure).
+      return { ok: false, error: `HTTP ${res.status}` };
     } catch (e) {
       console.error("Failed to load /api/nifty-oi:", e);
+      return { ok: false, error: e?.message || "network error" };
     }
   };
 
@@ -1774,10 +1789,23 @@ export function NiftyFlowView({ t, isDark }) {
     }
   };
 
+  // Auto-refresh of the option chain (src/useAutoRefresh.js): wall-clock schedule, active only
+  // while the market session is live, immediate refresh on tab resume / session open, one final
+  // refresh shortly after the close. Always calls the latest fetchNiftyOi (current expiry tab).
+  const autoRefresh = useAutoRefresh({
+    refresh: () => fetchNiftyOi(),
+    intervalSec: refreshIntervalSec,
+    enabled: marketStatus.isAutoActive,
+  });
+
+  // Manual Refresh / initial load: same fetches as before, through the auto-refresh guard so the
+  // schedule restarts from here and requests never overlap.
   const loadAll = async () => {
     setRefreshing(true);
-    await Promise.all([fetchNiftyOi(), fetchArgon()]);
-    setCountdown(refreshIntervalSec);
+    await autoRefresh.refreshNow(async () => {
+      const [oiResult] = await Promise.all([fetchNiftyOi(), fetchArgon()]);
+      return oiResult;
+    });
     setRefreshing(false);
     setLoading(false);
   };
@@ -1786,21 +1814,7 @@ export function NiftyFlowView({ t, isDark }) {
     loadAll();
   }, []);
 
-  // Live 1-second interval to tick down and auto-refresh at 0 (ACTIVE ONLY 09:00 AM to 04:00 PM IST)
-  useEffect(() => {
-    if (!marketStatus.isAutoActive) return;
-
-    const timer = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) {
-          fetchNiftyOi();
-          return refreshIntervalSec;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [marketStatus.isAutoActive, refreshIntervalSec]);
+  const countdown = autoRefresh.remainingSec;
 
   const maxBarVal = useMemo(() => {
     if (!oiData?.strikes?.length) return 100000;
@@ -1920,6 +1934,9 @@ export function NiftyFlowView({ t, isDark }) {
                 ⏸️ {marketStatus.reason}
               </div>
             )}
+
+            {/* DATA FRESHNESS (Updated HH:MM:SS IST · age; amber/red stale state in market hours) */}
+            <DataFreshnessBadge t={t} isDark={isDark} isMobile={isMobile} auto={autoRefresh} live={marketStatus.isAutoActive} />
 
             <button onClick={loadAll} disabled={refreshing} style={{
               background: t.accentBg, border: `1px solid ${t.accent}`,

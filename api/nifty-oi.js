@@ -73,31 +73,93 @@ export function describeFloorRoofShift({ previous = {}, nowMins, floor, roof }) 
   };
 }
 
+// Stale-open detection for the session anchor. Evidence 13-Nov-2026: the 09:15 and 09:16 ticks
+// carried a carry-over futures quote (25314, OI 216128) while spot was live — basis 104 / 161 vs
+// 16–54 on every later tick, OI 1.6–1.8% above every later reading. Anchoring there pinned the day
+// quadrant at LONG_UNWINDING for 377 of 378 minutes. A candidate is stale when, against the median
+// of the valid ticks that follow it, its basis differs by more than max(30 pts, 0.12% of price) or
+// its combined OI differs by more than 1%.
+export const ANCHOR_STALE_BASIS_MIN_PTS = 30;
+export const ANCHOR_STALE_BASIS_PCT = 0.12; // % of the futures price
+export const ANCHOR_STALE_OI_PCT = 1; // % of the followers' median combined OI
+export const ANCHOR_FOLLOWERS_MAX = 5; // compare with up to the next 5 valid ticks …
+export const ANCHOR_FOLLOWERS_WINDOW_MIN = 10; // … within 10 minutes of the candidate
+export const ANCHOR_FOLLOWERS_MIN = 3; // fewer followers → cannot judge yet (provisional)
+export const ANCHOR_MAX_CANDIDATES = 15; // bounded search before falling back to the first valid tick
+
+const anchorMedian = (xs) => {
+  const s = xs.slice().sort((a, b) => a - b);
+  const n = s.length;
+  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+};
+
 /**
  * "Since open" futures anchor for the intraday basis delta, session OI change and session price
- * change. The first timeline tick with a valid futures price, futures OI and spot (> 0, not a
- * frozen-auction spot, not a synthetic placeholder); otherwise a stored Redis baseline that passes
- * the same checks (|basis| < 2% of price, so a reading taken with futPrice 0 is rejected).
- * Returns null when no valid anchor exists — callers must then report "unavailable", never 0.
- * Pure.
+ * change. Valid ticks have a futures price, futures OI and spot (> 0, not a frozen-auction spot,
+ * not a synthetic placeholder, |basis| < 2% of price). The anchor is the first valid tick whose
+ * futures quote is plausibly LIVE — consistent in basis and OI with the valid ticks that follow it
+ * (see ANCHOR_STALE_*); stale carry-over quotes at the open are skipped (`skippedStaleTicks`).
+ * `provisional: true` when the chosen tick could not yet be checked (too few ticks so far) or when
+ * every early candidate failed and the first valid tick is used as a fallback (`reason` says why).
+ * Recomputed from the timeline on every call, so a provisional anchor self-corrects.
+ * Otherwise a stored Redis baseline that passes the validity checks (a reading taken with
+ * futPrice 0 is rejected). Returns null when no valid anchor exists — callers must then report
+ * "unavailable", never 0. Pure.
  */
 export function pickSessionFuturesAnchor({ timeline = [], cachedBase = null } = {}) {
   const ok = (fut, spot) => Number(fut) > 0 && Number(spot) > 0 && Math.abs(Number(fut) - Number(spot)) < 0.02 * Number(fut);
-  const ticks = (Array.isArray(timeline) ? timeline : [])
+  const valid = (Array.isArray(timeline) ? timeline : [])
     .filter((p) => p && Number.isFinite(Number(p.minutes)) && p.synthetic !== true && !p.spotFrozen)
+    .filter((p) => ok(p.futPrice, p.spot) && Number(p.futCombinedOI) > 0)
     .slice()
     .sort((a, b) => a.minutes - b.minutes);
-  const t = ticks.find((p) => ok(p.futPrice, p.spot) && Number(p.futCombinedOI) > 0);
-  if (t) {
-    return {
-      source: "timeline",
-      time: t.time || dqHhmm(t.minutes),
-      minutes: t.minutes,
-      futPrice: Number(t.futPrice),
-      spot: Number(t.spot),
-      futCombinedOI: Number(t.futCombinedOI),
-      rawBasis: Number((Number(t.futPrice) - Number(t.spot)).toFixed(2)),
-    };
+  const build = (t, extra) => ({
+    source: "timeline",
+    time: t.time || dqHhmm(t.minutes),
+    minutes: t.minutes,
+    futPrice: Number(t.futPrice),
+    spot: Number(t.spot),
+    futCombinedOI: Number(t.futCombinedOI),
+    rawBasis: Number((Number(t.futPrice) - Number(t.spot)).toFixed(2)),
+    ...extra,
+  });
+  if (valid.length) {
+    const basisOf = (p) => Number(p.futPrice) - Number(p.spot);
+    const lastMin = Number(valid[valid.length - 1].minutes);
+    const limit = Math.min(valid.length, ANCHOR_MAX_CANDIDATES);
+    for (let i = 0; i < limit; i++) {
+      const c = valid[i];
+      const cMin = Number(c.minutes);
+      const followers = valid
+        .slice(i + 1, i + 1 + ANCHOR_FOLLOWERS_MAX)
+        .filter((p) => Number(p.minutes) - cMin <= ANCHOR_FOLLOWERS_WINDOW_MIN);
+      if (followers.length < ANCHOR_FOLLOWERS_MIN) {
+        // Window still filling (start of session) → best guess so far, re-judged on the next call.
+        if (lastMin - cMin < ANCHOR_FOLLOWERS_WINDOW_MIN) {
+          return build(c, {
+            provisional: true,
+            skippedStaleTicks: i,
+            reason: `only ${followers.length} tick(s) after ${c.time || dqHhmm(cMin)} so far — anchor not yet confirmed live`,
+          });
+        }
+        // Sparse capture: the window has closed with too few ticks to judge — accept as before.
+        return build(c, { provisional: false, skippedStaleTicks: i, reason: "too few ticks in the following window to check for a stale quote" });
+      }
+      const price = Number(c.futPrice);
+      const basisTol = Math.max(ANCHOR_STALE_BASIS_MIN_PTS, (ANCHOR_STALE_BASIS_PCT / 100) * price);
+      const basisOff = Math.abs(basisOf(c) - anchorMedian(followers.map(basisOf)));
+      const medOi = anchorMedian(followers.map((p) => Number(p.futCombinedOI)));
+      const oiOffPct = (Math.abs(Number(c.futCombinedOI) - medOi) / medOi) * 100;
+      if (basisOff <= basisTol && oiOffPct <= ANCHOR_STALE_OI_PCT) {
+        return build(c, { provisional: false, skippedStaleTicks: i });
+      }
+    }
+    // Every early candidate looked stale — never lose the anchor over a noisy open.
+    return build(valid[0], {
+      provisional: true,
+      skippedStaleTicks: 0,
+      reason: `all first ${limit} valid ticks disagreed with the ticks after them — using the first valid tick`,
+    });
   }
   const b = cachedBase;
   if (b && Number(b.openPrice) > 0 && Number(b.openOI) > 0 && Number.isFinite(Number(b.openBasis)) &&
@@ -125,6 +187,8 @@ let previousState = {
 
 let intradayHistory = [];
 let sessionDate = "";
+// Last confirmed timeline anchor written to the Redis futures baseline (dedupes the write only).
+let lastSavedAnchorBaselineKey = "";
 
 // Upstash Redis / Vercel KV REST integration (Zero extra npm packages needed)
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL || process.env.REDIS_REST_URL || process.env.UPSTASH_REDIS_URL;
@@ -2834,8 +2898,9 @@ export async function refreshLiveSnapshot({
 
     // Parse Nifty Futures with Rollover Protection & Graceful Degradation
     let futuresMetrics = null;
-    // Session ("since open") anchor: the first tick with a VALID futures price, OI and spot — never
-    // a null/0 tick (12-Nov: a 09:15 tick with futPrice null made the basis delta Δ 25302).
+    // Session ("since open") anchor: the first tick with a VALID, live futures price, OI and spot —
+    // never a null/0 tick (12-Nov: a 09:15 tick with futPrice null made the basis delta Δ 25302) and
+    // never a stale carry-over quote (13-Nov). A timeline anchor always wins over the Redis baseline.
     let cachedBase = null;
     let sessionAnchor = pickSessionFuturesAnchor({ timeline: intradayHistory });
     if (!sessionAnchor && REDIS_URL) {
@@ -2858,11 +2923,34 @@ export async function refreshLiveSnapshot({
         );
         if (futuresMetrics) {
           futuresMetrics.intradayBasisAnchor = sessionAnchor
-            ? { time: sessionAnchor.time, source: sessionAnchor.source, rawBasis: sessionAnchor.rawBasis }
+            ? {
+                time: sessionAnchor.time,
+                source: sessionAnchor.source,
+                rawBasis: sessionAnchor.rawBasis,
+                provisional: sessionAnchor.provisional ?? null,
+                skippedStaleTicks: sessionAnchor.skippedStaleTicks ?? null,
+                ...(sessionAnchor.reason ? { reason: sessionAnchor.reason } : {}),
+              }
             : null;
         }
         if (futuresMetrics && REDIS_URL) {
           saveRedisFuturesSnapshot(futuresMetrics).catch(() => {});
+          // A confirmed (non-provisional) timeline anchor replaces the stored baseline, which may
+          // have been written from a stale first reading (13-Nov). Once per instance per anchor.
+          if (sessionAnchor?.source === "timeline" && sessionAnchor.provisional === false) {
+            const key = `${today}|${sessionAnchor.time}|${sessionAnchor.futPrice}|${sessionAnchor.futCombinedOI}`;
+            if (key !== lastSavedAnchorBaselineKey) {
+              lastSavedAnchorBaselineKey = key;
+              saveRedisFuturesBaseline(today, {
+                openOI: sessionAnchor.futCombinedOI,
+                openBasis: sessionAnchor.rawBasis,
+                openPrice: sessionAnchor.futPrice,
+                openSpot: sessionAnchor.spot,
+                time: sessionAnchor.time,
+                timestamp: Date.now(),
+              }).catch(() => {});
+            }
+          }
           // Only a fully valid reading may become the day's baseline.
           if (!sessionAnchor && futuresMetrics.combinedOI > 0 && futuresMetrics.lastPrice > 0 && futuresMetrics.spotPrice > 0) {
             saveRedisFuturesBaseline(today, {
