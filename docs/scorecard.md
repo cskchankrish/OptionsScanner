@@ -104,7 +104,7 @@ These are fixed in code (`HIT_RULES`) and decided before any data was seen.
 
 | Section | A hit is… |
 |---|---|
-| Fusion, Turn Tracker, radar, EOD slots | Futures reach +0.20% in the event's direction before −0.20%, within 60 minutes. "Neither" counts as not a hit. If the 60-minute window is cut by the close before either band is reached, the outcome is unmeasurable. |
+| Fusion, Turn Tracker, radar, trap shadow, EOD slots | Futures reach +0.20% in the event's direction before −0.20%, within 60 minutes. "Neither" counts as not a hit. If the 60-minute window is cut by the close before either band is reached, the outcome is unmeasurable. |
 | EOD final, BTST/STBT | The next session's 09:20 futures price is beyond the final reading's reference, in the verdict's direction. |
 | EOD final, NO CARRY | The next session's 09:20 futures price is within ±0.35% of the reference: no carry-worthy move was missed. |
 | TradingView signals | The futures-equivalent T1 is reached before the stop, in the same session. |
@@ -118,6 +118,51 @@ Why these rules:
 
 The raw numbers (every horizon, the excursions, open and 09:20) are stored, so any other rule can
 be evaluated later without re-recording.
+
+## Trap rules — current vs tighter (shadow)
+
+Section `TRAP_SHADOW` measures the live Bear Trap / Bull Trap rules side by side with a tighter
+version. **It changes no decision**: it is computed after fusion, the EOD decision and the Turn
+Tracker (`src/trapShadow.js`, called from `refreshLiveSnapshot`), from values already computed, and
+only the scorecard and a display-only `trapShadow` field of the API response receive it. It sends
+no Telegram and is not part of the daily scorecard message. `TRAP_SHADOW_ENABLED=false` (or `0`)
+turns the capture off.
+
+Four variants are recorded, each once on its rising edge (re-armed only after it has been false for
+10 minutes, `TRAP_SHADOW_REARM_MIN`, so a flickering label counts once):
+
+| Variant | Fires when |
+|---|---|
+| `BEAR_TRAP_BASE` (bullish) | exactly the live rule: quadrant LONG_UNWINDING and (floor put-writing blitz or ΔPCR ≥ 1.30) |
+| `BEAR_TRAP_STRICT` | base and all five conditions below pass |
+| `BULL_TRAP_BASE` (bearish) | exactly the live rule: quadrant SHORT_COVERING and (roof call-writing blitz or ΔPCR ≤ 0.75) |
+| `BULL_TRAP_STRICT` | base and all five mirrored conditions pass |
+
+The five conditions (bear trap; the bull trap is the mirror with call writing, the roof and a rise):
+
+| Condition | Default | Env override |
+|---|---|---|
+| **strength** — the day's writing is one-sided | ΔPCR ≥ 1.35 and put − call writing > 0 (bull: ΔPCR ≤ 0.70 and net < 0) | `TRAP_SHADOW_BEAR_MIN_DELTA_PCR`, `TRAP_SHADOW_BULL_MAX_DELTA_PCR` |
+| **recent** — the writing is happening now | net writing (put − call) changed by ≥ +28,000 over the last 30 min (bull: ≤ −26,000) | `TRAP_SHADOW_RECENT_WINDOW_MIN`, `TRAP_SHADOW_BEAR_MIN_NET_CHANGE`, `TRAP_SHADOW_BULL_MAX_NET_CHANGE` |
+| **relative** — writing is large next to the futures position change | \|net writing change\| / max(\|futures combined-OI change\|, 1) ≥ 3 over the same 30 min | `TRAP_SHADOW_MIN_RELATIVE_RATIO` |
+| **proximity** — price is within reach of the defended strike | −25 ≤ spot − floor ≤ 75 points (bull: −25 ≤ roof − spot ≤ 75) | `TRAP_SHADOW_MAX_DISTANCE_PTS`, `TRAP_SHADOW_MAX_BREAK_PTS` |
+| **stalled** — the move has stopped | the lowest futures price of the last 20 min is ≥ 5 min old and the current price is ≥ 0.03% above it (bull: the high, and below it) | `TRAP_SHADOW_STALL_WINDOW_MIN`, `TRAP_SHADOW_STALL_MIN_AGE_MIN`, `TRAP_SHADOW_STALL_MIN_BOUNCE_PCT` |
+
+Windows use real (non-synthetic) ticks only and need a tick within 3 minutes of the window start
+and no hole over 5 minutes (`TRAP_SHADOW_WINDOW_START_TOL_MIN`, `TRAP_SHADOW_WINDOW_MAX_GAP_MIN`).
+A condition that cannot be evaluated (missing strike, gappy window) is listed as `unverified` and
+counts as not passed, so the strict variant cannot fire on missing data. Every event stores each
+condition's raw values (ΔPCR, net writing change, futures-OI change and ratio, distance to the
+strike, the extreme's price/time and the bounce), so the thresholds can be re-fitted later from
+recorded events without re-recording. The settings snapshot includes the shadow config.
+
+**Reading it after 20–30 sessions.** In the rolling table the section has one row per variant.
+Compare each STRICT row with its BASE row: a tighter rule is worth switching to only if its hit
+rate is clearly higher — its Wilson interval should sit above the base's, not just overlap it — and
+it still fires often enough to matter (look at the event count, and ignore any row marked "too few
+to judge"). If strict fires on almost nothing, look at which conditions fail most in the day CSVs
+(`failed` / `unverified` in each event) before loosening any one of them. Nothing switches
+automatically; changing the live rule is a separate, deliberate code change.
 
 ## Finalisation and messages
 

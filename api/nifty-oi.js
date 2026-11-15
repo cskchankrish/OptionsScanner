@@ -25,6 +25,7 @@ import { getCarryConfig, readCarryAutomation, storeFromCommand as carryStoreFrom
 import { buildEodCard, formatEodCardLines } from "../src/eodCard.js";
 import { recordReading, completePendingEod, finaliseDay, scStoreFromCommand, settingsSnapshot, SC_CLOSE_MEASURE_MINS } from "../src/scorecard.js";
 import { getTurnConfig } from "../src/turnTracker.js";
+import { evaluateShadowTraps, getTrapShadowConfig, compactTrapShadow } from "../src/trapShadow.js";
 import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "../src/smartMoneyFusion.js";
 import { INTRADAY_PRICE_DEADBAND_PCT, INTRADAY_OI_DEADBAND_PCT, getIntradayQuadrantWindowMins } from "../src/flowCalc.js";
 import { getFlowBridgeConfig } from "../src/flowBridge.js";
@@ -1783,8 +1784,10 @@ export const EOD_AGREEMENT_CAPS = { 0: 30, 1: 60, 2: 75, 3: 90 };
  * Scorecard reading from values the refresh core already computed (nothing computed here feeds
  * any decision). Pure.
  */
-export function buildScorecardReading({ nowMs, minutes, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn, eodDecision }) {
+export function buildScorecardReading({ nowMs, minutes, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn, eodDecision, trapShadow = null }) {
   return {
+    // Shadow trap rules (src/trapShadow.js) — measured by the scorecard only.
+    trapShadow: trapShadow || null,
     t: nowMs,
     minutes,
     futPrice: futuresMetrics && !futuresMetrics.isStale && Number(futuresMetrics.lastPrice) > 0 ? Number(futuresMetrics.lastPrice) : null,
@@ -1812,6 +1815,7 @@ export function scorecardSettings(env = process.env) {
     env,
     constants: {
       turnTracker: getTurnConfig(env),
+      trapShadow: getTrapShadowConfig(env),
       radar: { minTicksPerCandle: MACRO_MIN_TICKS_PER_CANDLE, anchorToleranceMins: MACRO_ANCHOR_TOLERANCE_MINS, bullTrap: { minPricePts: 22, maxNetDelta: -26000, c1NetBelow: -7000, c2NetBelow: -14000 }, bearTrap: { maxPricePts: -22, minNetDelta: 28000, c1NetAbove: 7000, c2NetAbove: 14000 } },
       fusion: { dayPriceDeadbandPct: PRICE_DEADBAND_PCT, dayOiDeadbandPct: OI_DEADBAND_PCT, intradayPriceDeadbandPct: INTRADAY_PRICE_DEADBAND_PCT, intradayOiDeadbandPct: INTRADAY_OI_DEADBAND_PCT, intradayWindowMins: getIntradayQuadrantWindowMins(), quadrantMode: getFusionQuadrantMode() },
       eod: { groupCaps: EOD_GROUP_CAPS, agreementCaps: EOD_AGREEMENT_CAPS, carryThreshold: { weekday: 3, friday: 4 }, closingTiers: { full: 75000, two: 30000, one: 10000 }, alertWindow: minsToHHMM(EOD_WINDOW_START_MINS) + "–" + minsToHHMM(EOD_WINDOW_END_MINS) },
@@ -3240,6 +3244,28 @@ export async function refreshLiveSnapshot({
       : turnTracker.status === "OK" ? panel(true) : panel(null, turnTracker.message);
     if (eodDecision.card) eodDecision.card.turnTracker = turnTracker.message; // card detail only, not scored
 
+    // SHADOW trap rules (src/trapShadow.js) — MEASUREMENT ONLY. Computed after fusion, EOD and the
+    // Turn Tracker from values already computed; no network call; errors swallowed. Only the
+    // scorecard reading and a display-only payload field receive it; no decision reads it.
+    let trapShadow = null;
+    try {
+      const tsCfg = getTrapShadowConfig(process.env);
+      if (tsCfg.enabled) {
+        trapShadow = evaluateShadowTraps({
+          quadrant: fusion?.quadrantInfo?.quadrant || null,
+          optionsMetrics,
+          spot,
+          floorStrike,
+          roofStrike,
+          timeline,
+          nowMins: currentTickMins,
+          config: tsCfg,
+        });
+      }
+    } catch (e) {
+      trapShadow = null;
+    }
+
     // EOD verdict card: data row and the carry automation status in plain words (display only).
     if (eodDecision.card) {
       const gapTxt = dataQuality.gaps?.length ? ` · gaps ${dataQuality.gaps.map(g => `${g.from}–${g.to}`).join(", ")}` : "";
@@ -3298,7 +3324,7 @@ export async function refreshLiveSnapshot({
         await recordReading({
           store: scStore,
           date: scDate,
-          reading: buildScorecardReading({ nowMs: Date.now(), minutes: scMins, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn: smartMoney.macroTurn, eodDecision }),
+          reading: buildScorecardReading({ nowMs: Date.now(), minutes: scMins, futuresMetrics, spot, dataQuality, fusion, turnTracker, macroTurn: smartMoney.macroTurn, eodDecision, trapShadow }),
         });
         await completePendingEod({ store: scStore, today: scDate, timeline, nowMins: scMins, futuresExpiry: futuresMetrics?.expiryDate || null, send: scSend });
         if (scMins >= SC_CLOSE_MEASURE_MINS) {
@@ -3418,6 +3444,7 @@ export async function refreshLiveSnapshot({
       intradayTimeline: timeline,
       dataQuality,
       turnTracker,
+      trapShadow: compactTrapShadow(trapShadow), // display only — nothing server-side reads it
       hasRedis: Boolean(REDIS_URL),
       rollover: {
         isExpiryDay,

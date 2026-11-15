@@ -8,7 +8,8 @@ import { isSessionLiveNow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
-const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", TRADE: "Algo trades (₹)" };
+const VARIANT_LABEL = { BEAR_TRAP_BASE: "Bear trap — current rule", BEAR_TRAP_STRICT: "Bear trap — tighter (shadow)", BULL_TRAP_BASE: "Bull trap — current rule", BULL_TRAP_STRICT: "Bull trap — tighter (shadow)" };
+const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", TRADE: "Algo trades (₹)" };
 
 function istToday() {
   const d = new Date(Date.now() + 330 * 60000);
@@ -112,9 +113,9 @@ export function ScorecardView({ t, isDark }) {
                 <td style={cell}>{pts(s.meanExcursion60.mfePts)}</td>
                 <td style={cell}>{pts(s.meanExcursion60.maePts)}</td>
               </tr>,
-              ...Object.entries(s.byStage || s.byDecision || {}).map(([k, v]) => (
+              ...Object.entries(s.byStage || s.byDecision || s.byVariant || {}).map(([k, v]) => (
                 <tr key={`${sec}:${k}`} style={{ color: t.textSub }}>
-                  <td style={{ ...cell, paddingLeft: 22 }}>{k.replace(/_/g, " ")}</td>
+                  <td style={{ ...cell, paddingLeft: 22 }}>{VARIANT_LABEL[k] || k.replace(/_/g, " ")}</td>
                   <td style={cell}><Rate s={v} t={t} /></td>
                   <td style={cell}>{v.excludedUnmeasurable}</td>
                   <td style={cell}>{v.events}</td>

@@ -20,6 +20,7 @@
  */
 import { windowCoverage, hhmm, DQ_GAP_LIST_MIN, DQ_GAP_ALERT_MIN, DQ_WINDOW_MAX_GAP_MIN, DQ_WINDOW_MIN_COVERAGE_PCT, DQ_STALE_AFTER_SEC } from "./dataQuality.js";
 import { getSessionKindForDate } from "./marketCalendar.js";
+import { TRAP_SHADOW_ENV_KEYS } from "./trapShadow.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -63,6 +64,7 @@ export const HIT_RULES = {
   FUSION: "Directional: futures reach +band in the event's direction before −band, within 60 minutes (band 0.20%).",
   TURN: "Directional: futures reach +band in the event's direction before −band, within 60 minutes (band 0.20%).",
   RADAR: "Directional: futures reach +band in the event's direction before −band, within 60 minutes (band 0.20%).",
+  TRAP_SHADOW: "Directional: futures reach +band in the event's direction before −band, within 60 minutes (band 0.20%). Shadow trap rules (current vs tighter) — no decision uses them.",
   EOD_SLOT: "Directional: futures reach +band in the verdict's direction before −band, within 60 minutes (band 0.20%).",
   EOD: "BTST/STBT: next session's 09:20 futures price is beyond the final reading's reference in the verdict's direction. NO CARRY: |09:20 − reference| < 0.35%.",
   SIGNAL: "Futures-equivalent T1 is reached before the stop, within the same session (approved and vetoed alike).",
@@ -79,6 +81,7 @@ const ENV_WHITELIST = [
   "FLOW_BRIDGE_ENABLED", "FLOW_BRIDGE_DECISIONS", "FLOW_BRIDGE_TIMEOUT_MS", "FLOW_BRIDGE_FILL_WAIT_SEC", "FLOW_ALGO_SQUAREOFF_TIME",
   "CARRY_BRIDGE_ENABLED", "CARRY_WINDOW_START", "CARRY_WINDOW_END", "CARRY_REPORT_TIME", "CARRY_REQUIRED_POLLS", "CARRY_MIN_AGREEMENT", "CARRY_MIN_POLL_GAP_SEC",
   "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT",
+  ...TRAP_SHADOW_ENV_KEYS,
 ];
 
 /**
@@ -195,8 +198,49 @@ export function captureEvents(prev, reading) {
       s.eod.last = { ...data, minutes: reading.minutes, t: reading.t, futPrice: r2(reading.futPrice), spot: r2(reading.spot), futuresExpiry: reading.futuresExpiry || null, dq: eodDq };
     }
   }
+
+  // Shadow trap rules (src/trapShadow.js): rising edge per variant; re-armed only after the variant
+  // has been false for rearmMin minutes (first false reading → a false reading ≥ rearmMin later),
+  // so a flickering label is counted once.
+  const ts = reading.trapShadow;
+  if (ts && ts.enabled !== false && Number.isFinite(Number(reading.minutes))) {
+    const m = Number(reading.minutes);
+    const rearm = Number(ts.rearmMin) > 0 ? Number(ts.rearmMin) : TRAP_SHADOW_REARM_MIN;
+    if (!s.trapShadow || typeof s.trapShadow !== "object") s.trapShadow = {};
+    for (const [variant, sideKey, mode] of TRAP_SHADOW_VARIANTS) {
+      const side = ts[sideKey];
+      if (!side) continue;
+      const on = Boolean(side[mode]);
+      const st = s.trapShadow[variant] || { armed: true, falseSince: null };
+      if (on) {
+        if (st.armed) {
+          const strikeKey = sideKey === "bearTrap" ? "floorStrike" : "roofStrike";
+          events.push(baseEvent(reading, "TRAP_SHADOW", variant, side.direction || (sideKey === "bearTrap" ? "BULLISH" : "BEARISH"), {
+            variant, base: Boolean(side.base), strict: Boolean(side.strict),
+            conditions: side.conditions || null, failed: side.failed || [], unverified: side.unverified || [],
+            quadrant: ts.quadrant ?? null, deltaPcr: ts.deltaPcr ?? null, [strikeKey]: ts[strikeKey] ?? null, spotAtEvent: ts.spot ?? null,
+          }, sessionDq, variant));
+          st.armed = false;
+        }
+        st.falseSince = null;
+      } else if (!st.armed) {
+        if (st.falseSince === null) st.falseSince = m;
+        if (m - st.falseSince >= rearm) { st.armed = true; st.falseSince = null; }
+      }
+      s.trapShadow[variant] = st;
+    }
+  }
   return { events, state: s };
 }
+
+export const TRAP_SHADOW_REARM_MIN = 10;
+/** [variant, side in the shadow result, which flag] */
+export const TRAP_SHADOW_VARIANTS = [
+  ["BEAR_TRAP_BASE", "bearTrap", "base"],
+  ["BEAR_TRAP_STRICT", "bearTrap", "strict"],
+  ["BULL_TRAP_BASE", "bullTrap", "base"],
+  ["BULL_TRAP_STRICT", "bullTrap", "strict"],
+];
 
 /** FINAL EOD event from the state's last reading at or before 15:38. */
 export function finalEodEvent(state) {
@@ -483,7 +527,7 @@ export function statsFor(rows, { minSample = SC_MIN_SAMPLE } = {}) {
   };
 }
 
-const SECTIONS = ["FUSION", "TURN", "RADAR", "EOD", "EOD_SLOT", "SIGNAL", "TRADE"];
+const SECTIONS = ["FUSION", "TURN", "RADAR", "TRAP_SHADOW", "EOD", "EOD_SLOT", "SIGNAL", "TRADE"];
 
 /** Rolling aggregate over day documents. */
 export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = true } = {}) {
@@ -498,6 +542,7 @@ export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = tru
     const r = rows.filter((x) => x.event.section === sec);
     out.sections[sec] = { rule: HIT_RULES[sec], ...statsFor(r, { minSample }) };
     if (sec === "TURN") out.sections[sec].byStage = Object.fromEntries(["EARLY", "LIKELY_TURN", "CONFIRMED"].map((st) => [st, statsFor(r.filter((x) => x.event.type === st), { minSample })]));
+    if (sec === "TRAP_SHADOW") out.sections[sec].byVariant = Object.fromEntries(TRAP_SHADOW_VARIANTS.map(([v]) => [v, statsFor(r.filter((x) => x.event.type === v), { minSample })]));
     if (sec === "SIGNAL") out.sections[sec].byDecision = Object.fromEntries(["APPROVED", "VETOED", "NOT_EXECUTED", "BLOCKED", "DOWNGRADED"].map((c) => [c, statsFor(r.filter((x) => x.event.data?.category === c), { minSample })]));
   }
   return out;
@@ -612,6 +657,7 @@ export function aggregateToCsv(agg) {
     out.push(line(sec, "all", s).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byStage || {})) out.push(line(sec, `stage:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byDecision || {})) out.push(line(sec, `decision:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byVariant || {})) out.push(line(sec, `variant:${k}`, v).map(csvEsc).join(","));
   }
   return out.join("\n");
 }
