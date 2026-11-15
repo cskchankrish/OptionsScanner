@@ -1,7 +1,9 @@
 /**
  * GET /api/scorecard
  *   ?date=YYYY-MM-DD   one day in full detail (finalises the day lazily and idempotently when the
- *                      session is over and nothing finalised it at 15:38)
+ *                      session is over and nothing finalised it at 15:38). A date with no session
+ *                      (closed weekend day, or no ticks and no events) returns 200 { noSession: true }
+ *                      and is never written or sent to Telegram.
  *   ?days=30           rolling aggregate per section (1–180), Wilson 95% intervals, "too few to judge"
  *   &format=csv        CSV of either
  *   POST {action:"backfill", day:{...}} (authenticated) — writes one prepared backfilled day document
@@ -15,7 +17,9 @@ import { computeDataQuality } from "../src/dataQuality.js";
 import {
   keys, finaliseDay, aggregate, publicDayView, dayToCsv, aggregateToCsv, istOf, timelineKeysFor,
   scStoreFromCommand, measureEvent, compactSeries, finalEodEvent, getScorecardConfig, SC_CLOSE_MEASURE_MINS, SC_TTL_SEC,
+  isEmptyDayDoc, isSessionDayDoc, NO_SESSION_REASON_WEEKEND, NO_SESSION_REASON_EMPTY,
 } from "../src/scorecard.js";
+import { getSessionKindForDate } from "../src/marketCalendar.js";
 
 async function defaultDeps() {
   const { redisRestCommand, scorecardSettings } = await import("./nifty-oi.js");
@@ -77,7 +81,18 @@ export function createScorecardHandler(overrides = {}) {
     if (req.query?.date !== undefined) {
       const date = String(req.query.date);
       if (!isoOk(date)) return res.status(400).json({ ok: false, error: "date must be YYYY-MM-DD" });
+      // No session on this date (closed weekend day, or nothing was ever recorded): a clear,
+      // non-persisted answer instead of a fabricated 0% day; nothing written, no Telegram.
+      const noSession = (reason) => {
+        if (csv) {
+          res.setHeader("Content-Type", "text/csv");
+          return res.status(200).send(dayToCsv({ date, events: [] }, { authed }));
+        }
+        return res.status(200).json({ ok: true, authenticated: authed, date, noSession: true, persisted: false, reason, events: [], outcomes: {}, eodFinal: null, eodOutcome: null, dataQuality: null, seriesPoints: 0 });
+      };
+      if (getSessionKindForDate(date) === "CLOSED") return noSession(NO_SESSION_REASON_WEEKEND);
       let doc = await store.get(keys.day(date));
+      if (doc && isEmptyDayDoc(doc)) return noSession(NO_SESSION_REASON_EMPTY);
       const over = date < today.date || (date === today.date && today.minutes >= SC_CLOSE_MEASURE_MINS);
       if (!doc?.finalisedAt && over) {
         const r = await finaliseDay({
@@ -90,6 +105,7 @@ export function createScorecardHandler(overrides = {}) {
             now: deps.now,
           },
         });
+        if (r.status === "NO_SESSION") return noSession(r.reason || NO_SESSION_REASON_EMPTY);
         doc = r.doc || doc;
       }
       if (!doc) {
@@ -121,7 +137,9 @@ export function createScorecardHandler(overrides = {}) {
     for (let i = 0; i < n; i++) dates.push(shiftDate(today.date, -i));
     let docs = [];
     try {
-      docs = (await store.mget(dates.map((d) => keys.day(d)))).filter((d) => d && d.date);
+      // Stored documents that measured nothing (zero ticks and zero events, e.g. the lazily
+      // finalised weekend days) or dated on a closed weekend day are not sessions.
+      docs = (await store.mget(dates.map((d) => keys.day(d)))).filter((d) => d && d.date && isSessionDayDoc(d));
     } catch (e) {
       docs = [];
     }

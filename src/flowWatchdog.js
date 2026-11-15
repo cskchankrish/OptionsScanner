@@ -14,6 +14,8 @@
  * All I/O is injected; this module never throws to its caller.
  */
 
+import { getSessionKindForDate } from "./marketCalendar.js";
+
 export const BLIND_KEY = "nifty:watchdog:blind";
 const BLIND_KEY_TTL_SEC = 86400;
 const IST_OFFSET_MIN = 330;
@@ -23,11 +25,14 @@ export function getFlowBlindAlertSec() {
   return Number.isFinite(v) && v > 0 ? v : 180;
 }
 
-/** Epoch ms of today's session open in IST (Sun 14:00 Muhurat, otherwise 09:15). */
+/**
+ * Epoch ms of today's session open in IST: 14:00 on a Muhurat date (src/marketCalendar.js),
+ * otherwise 09:15 (an ordinary Sunday is closed, not a Muhurat session).
+ */
 export function getSessionOpenMs(nowMs) {
   const istMs = nowMs + IST_OFFSET_MIN * 60000;
   const ist = new Date(istMs);
-  const openMins = ist.getUTCDay() === 0 ? 840 : 555;
+  const openMins = getSessionKindForDate(ist.toISOString().slice(0, 10)) === "MUHURAT" ? 840 : 555;
   const istMidnight = Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate());
   return istMidnight + openMins * 60000 - IST_OFFSET_MIN * 60000;
 }

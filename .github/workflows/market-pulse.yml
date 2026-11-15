@@ -8,10 +8,12 @@ name: Market Hours OI Pulse
 
 on:
   schedule:
-    # Every 5 minutes:
-    # Mon-Fri: 03:45 - 10:15 UTC (09:15 - 15:45 IST)
-    # Sunday (Diwali Muhurat Trading): 08:30 - 10:30 UTC (14:00 - 16:00 IST)
-    - cron: "*/5 3-11 * * 0-5"
+    # Every 5 minutes, Mon-Fri only: 03:00 - 11:55 UTC, polled only 09:15 - 15:40 IST below.
+    # Weekends are closed. The once-a-year Diwali Muhurat session (a weekend date in the Muhurat
+    # list, src/marketCalendar.js / env MUHURAT_DATES) is covered by a one-off QStash schedule or a
+    # manual authenticated call to /api/poll; the endpoint itself gates by that date list and returns
+    # MARKET_CLOSED on every other Saturday/Sunday.
+    - cron: "*/5 3-11 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -33,13 +35,9 @@ jobs:
             if [ "$IST_TIME" -ge "0915" ] && [ "$IST_TIME" -le "1540" ]; then
               IS_ACTIVE=true
             fi
-          # Sunday Diwali Muhurat Trading exception (0=Sun): 14:00 to 16:00 IST
-          elif [ "$IST_DOW" -eq 0 ]; then
-            if [ "$IST_TIME" -ge "1400" ] && [ "$IST_TIME" -le "1600" ]; then
-              IS_ACTIVE=true
-              echo "🪔 Diwali Muhurat Trading session active (14:00 - 16:00 IST)!"
-            fi
           fi
+          # No weekend branch: weekends are closed. A Muhurat day is polled by a one-off QStash
+          # schedule or a manual run; the endpoint decides liveness from the Muhurat date list.
 
           if [ "$IS_ACTIVE" != true ]; then
             echo "Outside market window. Skipping poll to protect EOD settlement integrity."

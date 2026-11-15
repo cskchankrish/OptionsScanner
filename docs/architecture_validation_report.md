@@ -82,7 +82,7 @@ flowchart LR
 
 | Aspect | Assessment | Details |
 |---|---|---|
-| **Schedule** | ✅ Correct | `*/5 3-11 * * 0-5` covers Mon–Fri 09:15–15:40 IST and Sunday Diwali 14:00–16:00 IST. |
+| **Schedule** | ✅ Correct | `*/5 3-11 * * 1-5` covers Mon–Fri 09:15–15:40 IST. (Updated: weekends are closed; the Diwali Muhurat date is in an explicit list, `src/marketCalendar.js` / `MUHURAT_DATES`, and is polled by a one-off QStash schedule — every other Sunday is not a session.) |
 | **IST Time Gating** | ✅ Correct | Shell script checks `$IST_DOW` and `$IST_TIME` before pinging. Skips outside market hours to protect EOD settlement integrity. |
 | **Resilience** | ✅ Correct | `curl -s -m 12 ... > /dev/null || true` — fire-and-forget, never fails the workflow. |
 

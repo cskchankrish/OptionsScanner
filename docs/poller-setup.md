@@ -40,11 +40,15 @@ Upstash console → QStash → Schedules → Create:
 - **Headers:** none. QStash adds `Upstash-Signature`, and the endpoint verifies it with the
   signing keys above. Do **not** put the webhook secret in the URL.
 - **Cron (UTC):** `* 3-10 * * 1-5` (every minute, 08:30–16:29 IST, Mon–Fri). The endpoint does the
-  exact gating itself: outside Mon–Fri 09:15–15:40 IST (and Sun 14:00–16:00 IST for Muhurat) it
-  returns `200 {"status":"MARKET_CLOSED"}` without touching NSE. If you want fewer wasted calls, use three
-  tighter schedules covering 09:14–15:40 IST: `44-59 3 * * 1-5`, `* 4-9 * * 1-5` and
-  `0-10 10 * * 1-5`.
-  For a Sunday Muhurat session, add a one-off schedule `* 8-10 * * 0` on that day.
+  exact gating itself: outside Mon–Fri 09:15–15:40 IST it returns `200 {"status":"MARKET_CLOSED"}`
+  without touching NSE. Weekends are closed: a Saturday or Sunday is live (14:00–16:00 IST) only
+  when its IST date is in the Muhurat date list (`src/marketCalendar.js`, default `2026-11-08`;
+  add more with the env var `MUHURAT_DATES`, comma-separated `YYYY-MM-DD`). If you want fewer wasted
+  calls, use three tighter schedules covering 09:14–15:40 IST: `44-59 3 * * 1-5`, `* 4-9 * * 1-5`
+  and `0-10 10 * * 1-5`.
+  For a Muhurat session, make sure its date is in the list and add a one-off schedule
+  `* 8-10 * * 0` (Sunday) for that day only; remove it afterwards. The GitHub backup cron runs
+  Mon–Fri only.
 - **Retries:** 2 or 3. The endpoint returns 502 when NSE fails and 503 when the Redis write fails,
   so QStash retries real failures and never retries a `MARKET_CLOSED` response.
 - **Timeout:** 15s (the Vercel function limit).

@@ -13,6 +13,7 @@ import { isSpotFrozenAt } from "./flowCalc.js";
 import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 import { EodVerdictCard } from "./EodVerdictCard.jsx";
+import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
 let globalOiCache = null;
@@ -67,11 +68,17 @@ function formatLotsAbs(n) {
   return `${abs.toLocaleString("en-IN")}`;
 }
 
+// Calendar-gated (src/marketCalendar.js): true only on a weekend date in the Muhurat list.
+function isMuhuratSessionToday() {
+  return getSessionKind(Date.now()) === "MUHURAT";
+}
+
 function getMarketSessionStatus() {
   const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const day = nowIst.getDay(); // 0 = Sunday, 6 = Saturday
-  const isSunday = day === 0;
-  const isSaturday = day === 6;
+  // Weekends are closed unless the date is in the Muhurat list (src/marketCalendar.js).
+  const isSunday = isMuhuratSessionToday(); // "the Muhurat session", not merely a calendar Sunday
+  const isSaturday = !isSunday && (day === 0 || day === 6); // any closed weekend day
   const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
 
   // Sunday Diwali Muhurat Trading Window: 14:00 to 16:00 IST (mins 840 to 960)
@@ -88,7 +95,10 @@ function getMarketSessionStatus() {
 
   // Saturday
   if (isSaturday) {
-    return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST (Friday Settled Preserved)" };
+    if (isMuhuratTomorrow(Date.now())) {
+      return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST (Friday Settled Preserved)" };
+    }
+    return { isAutoActive: false, reason: `${day === 0 ? "Sunday" : "Saturday"} · Weekend Closed · Resumes Monday 09:15 AM (Friday Settled Preserved)` };
   }
 
   // Weekday (Mon-Fri)
@@ -446,7 +456,7 @@ function NiftyIntradayLineChart({
   const plotW = svgWidth - padLeft - padRight;
   const plotH = svgHeight - padTop - padBottom;
 
-  const isSundayChart = (new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })).getDay() === 0) ||
+  const isSundayChart = isMuhuratSessionToday() ||
     (points.length > 0 && points.every(p => (p.minutes || 0) >= 800));
 
   const startMin = isSundayChart ? 840 : 555; // 14:00 on Sunday Muhurat, 09:15 on weekdays
@@ -1402,7 +1412,7 @@ function mergeTimelineArrays(localArr = [], serverArr = []) {
   const sessionStatus = getMarketSessionStatus();
   const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const nowMins = nowIst.getHours() * 60 + nowIst.getMinutes();
-  const isSunday = nowIst.getDay() === 0;
+  const isSunday = isMuhuratSessionToday(); // the Muhurat session, not any calendar Sunday
   const openMins = isSunday ? 840 : 555;
   const closeMins = isSunday ? 960 : 940;
   const isLive = sessionStatus.isAutoActive;
@@ -1578,7 +1588,7 @@ export function NiftyFlowView({ t, isDark }) {
         const sessionStatus = getMarketSessionStatus();
         const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
         const nowMins = nowIst.getHours() * 60 + nowIst.getMinutes();
-        const isSunday = nowIst.getDay() === 0;
+        const isSunday = isMuhuratSessionToday(); // the Muhurat session, not any calendar Sunday
         const openMins = isSunday ? 840 : 555;
         let finalTimeline = data.intradayTimeline || [];
 

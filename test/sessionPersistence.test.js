@@ -32,13 +32,12 @@ test("getActiveExpiryDate returns active November weekly expiry and rejects expi
 });
 
 test("getMarketSessionInfo identifies Saturday weekend and schedules next open for Sunday Diwali Muhurat", () => {
-  const sessionInfo = getMarketSessionInfo();
-  // Today is Saturday Nov 7
-  if (sessionInfo.isSaturday) {
-    assert.equal(sessionInfo.isLiveMarket, false);
-    assert.equal(sessionInfo.isPostMarketSettled, true);
-    assert.ok(sessionInfo.nextOpenDescription.includes("Diwali Muhurat"));
-  }
+  // Pinned to Saturday 2026-11-07 11:16 IST, the eve of the 2026-11-08 Muhurat session.
+  const sessionInfo = getMarketSessionInfo(Date.UTC(2026, 10, 7, 5, 46));
+  assert.equal(sessionInfo.isSaturday, true);
+  assert.equal(sessionInfo.isLiveMarket, false);
+  assert.equal(sessionInfo.isPostMarketSettled, true);
+  assert.ok(sessionInfo.nextOpenDescription.includes("Diwali Muhurat"));
 });
 
 test("getCanonicalSettledTimeline provides verified closing window (14:15 to 15:30) with +1.0L closing flow", () => {

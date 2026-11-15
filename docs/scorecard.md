@@ -123,6 +123,11 @@ be evaluated later without re-recording.
 
 - **When a day is finalised.** At the first refresh at or after 15:38. If nothing refreshed then,
   it happens idempotently on the first `GET /api/scorecard?date=` for that day.
+- **Days with no session are never finalised.** A closed weekend day (any Saturday/Sunday not in
+  the Muhurat date list, `src/marketCalendar.js` / `MUHURAT_DATES`) or a day with no timeline ticks
+  and no recorded events (e.g. an exchange holiday) writes no day document and sends no Telegram;
+  `?date=` answers `200 { noSession: true }`. Stored documents with zero ticks and zero events, or
+  dated on a closed weekend day, are not counted as sessions in the rolling aggregate.
 - **Daily Telegram.** One compact message per session:
   - data coverage;
   - per section: events, hits / measurable, and the most notable hit and miss;

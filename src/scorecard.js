@@ -19,6 +19,7 @@
  * expire, incr, mget).
  */
 import { windowCoverage, hhmm, DQ_GAP_LIST_MIN, DQ_GAP_ALERT_MIN, DQ_WINDOW_MAX_GAP_MIN, DQ_WINDOW_MIN_COVERAGE_PCT, DQ_STALE_AFTER_SEC } from "./dataQuality.js";
+import { getSessionKindForDate } from "./marketCalendar.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -660,14 +661,43 @@ export async function recordEvent({ store, date, event, env = process.env }) {
   }
 }
 
+export const NO_SESSION_REASON_WEEKEND = "weekend closed (not a Muhurat date): no session to measure";
+export const NO_SESSION_REASON_EMPTY = "no timeline ticks and no recorded events (holiday or no session): nothing to measure";
+
+/**
+ * True for a stored day document that measured nothing: no events, no final EOD verdict and no
+ * ticks. Such documents (e.g. lazily finalised weekend days) are not sessions.
+ */
+export function isEmptyDayDoc(doc) {
+  if (!doc) return true;
+  const events = Array.isArray(doc.events) ? doc.events.length : 0;
+  const ticks = Math.max(Number(doc.series?.m?.length) || 0, Number(doc.dataQuality?.ticksToday) || 0);
+  return events === 0 && !doc.eodFinal && ticks === 0;
+}
+
+/**
+ * Whether a stored day document counts as a session in the rolling aggregate: not empty and not
+ * dated on a closed weekend day. Real weekday sessions count, including backfilled and
+ * low-coverage ones.
+ */
+export function isSessionDayDoc(doc) {
+  if (!doc || !doc.date) return false;
+  if (getSessionKindForDate(doc.date) === "CLOSED") return false;
+  return !isEmptyDayDoc(doc);
+}
+
 /**
  * Finalises a day (idempotent): measures every event on the day's series and writes the day doc;
+ * returns { status: "NO_SESSION" } without writing or sending when the date is a closed weekend
+ * day or the day has no ticks and no recorded events;
  * queues the FINAL EOD verdict for next-session measurement; sends the daily Telegram once.
  * deps = { getTimeline(date) -> ticks[], computeDataQuality?(timeline) -> dq, settings, send?, now }
  */
 export async function finaliseDay({ store, date, deps, env = process.env, futuresExpiry = null, force = false }) {
   try {
     if (!store) return { status: "NO_STORE" };
+    // A closed weekend day (not a Muhurat date) is never a session: nothing to finalise.
+    if (getSessionKindForDate(date) === "CLOSED") return { status: "NO_SESSION", reason: NO_SESSION_REASON_WEEKEND };
     const cfg = getScorecardConfig(env);
     const existing = await store.get(keys.day(date));
     if (existing?.finalisedAt && !force) return { status: "ALREADY_FINAL", doc: existing };
@@ -677,6 +707,11 @@ export async function finaliseDay({ store, date, deps, env = process.env, future
     const final = finalEodEvent(state);
     const timeline = (await deps.getTimeline(date)) || [];
     const series = compactSeries(timeline);
+    // No ticks and nothing recorded (weekend, exchange holiday): no day document, no Telegram.
+    if (!series.m.length && !events.length && !final) {
+      await store.del(keys.finLock(date));
+      return { status: "NO_SESSION", reason: NO_SESSION_REASON_EMPTY };
+    }
     const dq = deps.computeDataQuality ? deps.computeDataQuality(timeline) : null;
     const nowMs = deps.now ? deps.now() : Date.now();
     const settings = { ...(deps.settings || {}), takenAt: new Date(nowMs).toISOString() };

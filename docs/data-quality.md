@@ -50,6 +50,8 @@ When a group is UNVERIFIED, the EOD verdict carries a data caveat.
   failure, and keeps the last 100 failures and the last 100 successes.
 - **`GET /api/collector-status`.** The public view is a coarse summary:
   `{ state, snapshotAgeSec, lastTickTime, ticksToday, expectedTicks, coveragePct, maxGapMin, gaps, lastOkBySource }`.
+  On a closed weekend day (not a Muhurat date, `src/marketCalendar.js`) `state` is `CLOSED`, with
+  no expected ticks and no gaps.
   With the webhook secret it also returns the failure and success lists, each source's records,
   the heartbeat and the poller-down flag.
 - **Browser and webhook refreshes.** These check the poller heartbeat. If it is older than

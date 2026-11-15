@@ -31,6 +31,7 @@ import { getFlowBridgeConfig } from "../src/flowBridge.js";
 import { describeCarryConfig } from "../src/carryBridge.js";
 export { buildEodCard, formatEodCardLines };
 import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
+import { istParts, getSessionKindForDate, isMuhuratTomorrow, getSessionDayOfWeek } from "../src/marketCalendar.js";
 
 let cache = {
   data: null,
@@ -527,12 +528,28 @@ export function extractOptionChainMetrics(records = [], spot = 25000) {
   };
 }
 
-export function getMarketSessionInfo() {
-  const day = getISTDayOfWeek(); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
-  const mins = getISTMinutes();
-  const isSunday = (day === 0);
-  const isSaturday = (day === 6);
-  const isWeekday = (day >= 1 && day <= 5);
+/**
+ * Session state from the market calendar (src/marketCalendar.js). Weekends are closed unless the
+ * IST date is in the Muhurat date list.
+ *
+ * Legacy field semantics (read by many consumers): `isSunday` means "this is the Muhurat session"
+ * (14:00–16:00 IST), `isSaturday` means "weekend closed, reviewing Friday's settled session". An
+ * ordinary Sunday is therefore isSunday=false, isSaturday=true. Prefer the explicit
+ * `isMuhuratSession` / `isWeekendClosed` / `sessionKind` fields in new code.
+ *
+ * @param {number} [nowMs] epoch ms (defaults to now; injectable for tests)
+ */
+export function getMarketSessionInfo(nowMs = Date.now()) {
+  const ist = istParts(nowMs);
+  const day = ist.dow; // calendar day: 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
+  const mins = ist.minutes;
+  const sessionKind = getSessionKindForDate(ist.date);
+  const isMuhuratSession = sessionKind === "MUHURAT";
+  const isWeekendClosed = sessionKind === "CLOSED";
+  const muhuratTomorrow = isMuhuratTomorrow(nowMs);
+  const isSunday = isMuhuratSession;
+  const isSaturday = isWeekendClosed;
+  const isWeekday = sessionKind === "WEEKDAY";
 
   let isLiveMarket = false;
   let isPostMarketSettled = false;
@@ -552,7 +569,9 @@ export function getMarketSessionInfo() {
     isPostMarketSettled = true; // Reviewing Friday's settled session
     isPreMarket = false;
     tradingWindow = "Closed (Weekend)";
-    nextOpenDescription = "🪔 Diwali Muhurat Tomorrow (Sunday) 14:00 - 16:00 IST";
+    nextOpenDescription = muhuratTomorrow
+      ? "🪔 Diwali Muhurat Tomorrow (Sunday) 14:00 - 16:00 IST"
+      : "Monday 09:15 IST";
   } else {
     // Weekday (Mon - Fri)
     isLiveMarket = (mins >= 555 && mins <= 940);
@@ -566,6 +585,12 @@ export function getMarketSessionInfo() {
     isSunday,
     isSaturday,
     isWeekday,
+    isMuhuratSession,
+    isWeekendClosed,
+    isMuhuratTomorrow: muhuratTomorrow,
+    sessionKind,
+    calendarDayOfWeek: day,
+    istDate: ist.date,
     isLiveMarket,
     isPostMarketSettled,
     isPreMarket,
@@ -799,7 +824,7 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   const dayName = new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" });
   const timeStr = `${getISTTimeStr()} IST`;
   const nowMins = getISTMinutes();
-  const dayOfWeek = getISTDayOfWeek();
+  const dayOfWeek = getSessionDayOfWeek(); // calendar-gated: 0 only on a Muhurat day
   const isSunday = (dayOfWeek === 0);
   const openMins = isSunday ? 840 : 555;
   const closeMins = isSunday ? 960 : 940;
@@ -811,6 +836,10 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   }
   if (!Array.isArray(history) || history.length === 0) {
     history = [...CANONICAL_EOD_SEED_HISTORY];
+  }
+  // A closed weekend day has no session: never resolve outcomes or record a "today" entry.
+  if (dayOfWeek === 6) {
+    return history;
   }
 
   // 1. If previous session is PENDING and market has opened today, auto-resolve next morning open outcome
@@ -1113,11 +1142,6 @@ async function syncRedisHistory(today) {
 function getISTMinutes() {
   const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   return istDate.getHours() * 60 + istDate.getMinutes();
-}
-
-function getISTDayOfWeek() {
-  const istDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  return istDate.getDay();
 }
 
 function getISTIsoDateStr() {
@@ -1756,6 +1780,10 @@ export function calculateEODDecision({
   futuresQuadrant = null,
   futuresMetrics = null,
   macroTurn = null,
+  // Only the weekend-closed status label reads this: true when tomorrow is a Muhurat date
+  // (src/marketCalendar.js). dayOfWeek must be calendar-gated by the caller: 0 = the Muhurat
+  // session, 6 = a closed weekend day (Saturday or an ordinary Sunday).
+  muhuratTomorrow = false,
 }) {
   const audit = [];
   const detailAudit = [];
@@ -2192,7 +2220,9 @@ export function calculateEODDecision({
 
   let statusLabel = "EARLY MONITORING";
   if (isSaturday) {
-    statusLabel = "WEEKEND CLOSED · PREVIOUS SESSION SETTLED (🪔 Diwali Muhurat Tomorrow 14:00 - 16:00 IST)";
+    statusLabel = muhuratTomorrow
+      ? "WEEKEND CLOSED · PREVIOUS SESSION SETTLED (🪔 Diwali Muhurat Tomorrow 14:00 - 16:00 IST)"
+      : "WEEKEND CLOSED · PREVIOUS SESSION SETTLED (Next session Monday 09:15 IST)";
   } else if (isSunday) {
     if (isDecisionWindow) {
       statusLabel = "🪔 DIWALI MUHURAT EXECUTION WINDOW (15:00 - 15:20 IST)";
@@ -3076,7 +3106,8 @@ export async function refreshLiveSnapshot({
       pcr: (isAfternoonRollover && nextMetrics) ? nextMetrics.pcr : pcr,
       deltaPcr: (isAfternoonRollover && nextMetrics) ? nextMetrics.deltaPcr : deltaPcr,
       timeline,
-      dayOfWeek: getISTDayOfWeek(),
+      dayOfWeek: getSessionDayOfWeek(), // calendar-gated: 0 only on a Muhurat day, 6 on a closed weekend
+      muhuratTomorrow: Boolean(sessionInfo.isMuhuratTomorrow),
       nowMins: getISTMinutes(),
       fusion,
       targetContract: targetExpiry,
@@ -3207,8 +3238,12 @@ export async function refreshLiveSnapshot({
       eodDecision,
     });
 
+    // A closed weekend day (Saturday or an ordinary Sunday; src/marketCalendar.js) has no session:
+    // a forced / specific-expiry refresh then sends no lifecycle, EOD radar or carry message.
+    const weekendClosed = Boolean(sessionInfo?.isWeekendClosed);
+
     // Automatic lifecycle check on active TradingView trade against live spot
-    try {
+    if (!weekendClosed) try {
       const { evaluateActiveTradeLifecycle } = await import("./tv-webhook.js");
       await evaluateActiveTradeLifecycle(spot);
     } catch (e) {}
@@ -3216,7 +3251,7 @@ export async function refreshLiveSnapshot({
     // Automatic BTST / STBT Carry Radar + flip alerts (14:15 to 15:38 IST; see dispatchEodRadarAlert)
     const istMinutes = getISTMinutes();
     const istDateStr = getISTIsoDateStr();
-    try {
+    if (!weekendClosed || isEodTest) try { // the authorised ?test=eod_alert stays a manual test
       await dispatchEodRadarAlert({
         istMinutes,
         istDateStr,
@@ -3232,14 +3267,14 @@ export async function refreshLiveSnapshot({
 
     // Overnight carry bridge (BTST/STBT → Algo, src/carryBridge.js). Inert unless
     // CARRY_BRIDGE_ENABLED=true and the flow-bridge URL + secret are set.
-    if (!isEodTest) {
+    if (!isEodTest && !weekendClosed) {
       try {
         const { runCarryDispatch, storeFromCommand, newCarryId } = await import("../src/carryBridge.js");
         const rawSpot = Number(v3Data.records?.underlyingValue);
         await runCarryDispatch({
           istMinutes,
           istDateStr,
-          dayOfWeek: getISTDayOfWeek(),
+          dayOfWeek: getSessionDayOfWeek(), // calendar-gated: a closed weekend day is never a weekday
           eodDecision,
           // The real NSE print only (never the hard-coded fallback used for display).
           spot: Number.isFinite(rawSpot) && rawSpot > 0 ? rawSpot : null,
@@ -3324,6 +3359,8 @@ export async function refreshLiveSnapshot({
         riskWarning: "Strictly avoid naked OTM option buying overnight due to binary gap risk. Spreads or Deep ITM (Delta >= 0.70) are mandatory.",
       },
       sessionWindow: {
+        // Calendar-gated (src/marketCalendar.js): isSundayDiwali only on a Muhurat date,
+        // isSaturday on any closed weekend day (Saturday or an ordinary Sunday).
         isSundayDiwali: sessionInfo.isSunday,
         isSaturday: sessionInfo.isSaturday,
         isWeekday: sessionInfo.isWeekday,
@@ -3545,6 +3582,7 @@ function getFallbackData(requestedExpiry = null) {
       nextExpiryMetrics: null,
     },
     sessionWindow: {
+      // Calendar-gated: isSundayDiwali only on a Muhurat date, isSaturday on any closed weekend day.
       isSundayDiwali: sessionInfo.isSunday,
       isSaturday: sessionInfo.isSaturday,
       isWeekday: sessionInfo.isWeekday,

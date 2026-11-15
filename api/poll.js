@@ -8,8 +8,10 @@
  *     QSTASH_NEXT_SIGNING_KEY (no secret in the URL).
  *
  * Behaviour:
- *   - Outside the live session (getMarketSessionInfo().isLiveMarket: Mon–Fri 09:15–15:40 IST,
- *     Sunday Muhurat 14:00–16:00 IST) → 200 { ok: true, status: "MARKET_CLOSED" }, no NSE call.
+ *   - Outside the live session (getMarketSessionInfo().isLiveMarket: Mon–Fri 09:15–15:40 IST, and
+ *     14:00–16:00 IST only on a weekend date in the Muhurat list — src/marketCalendar.js, default
+ *     2026-11-08, extendable with MUHURAT_DATES; every other Saturday/Sunday is closed)
+ *     → 200 { ok: true, status: "MARKET_CLOSED" }, no NSE call.
  *   - Otherwise always runs the shared refresh core (no 5s memory cache), awaits the Redis
  *     `nifty:flow:latest` write, then:
  *       200 { ok: true, status: "LIVE_POLL_SUCCESS", snapshotAt, ageSec, ticks, ... } and writes the
@@ -150,7 +152,9 @@ export function createPollHandler(overrides = {}) {
       }
     }
 
-    const sessionInfo = deps.getMarketSessionInfo();
+    // The gate for every poller: a closed weekend day (any Saturday/Sunday not in the Muhurat date
+    // list) is never live, so no NSE call, tick, heartbeat or Telegram happens on it.
+    const sessionInfo = deps.getMarketSessionInfo(deps.now());
     if (!sessionInfo.isLiveMarket) {
       return res.status(200).json({
         ok: true,

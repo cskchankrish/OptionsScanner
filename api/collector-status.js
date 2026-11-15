@@ -14,6 +14,7 @@
 import { authorizeRequest, extractRequestSecret } from "../src/webhookAuth.js";
 import { computeDataQuality } from "../src/dataQuality.js";
 import { POLLER_DOWN_KEY } from "../src/collectorAlerts.js";
+import { getSessionKindForDate } from "../src/marketCalendar.js";
 
 const SOURCES = ["vm", "qstash", "github-actions", "secret"];
 const HEARTBEAT_KEY = "nifty:poller:last_ok";
@@ -44,10 +45,14 @@ async function defaultDeps() {
   };
 }
 
-/** Live session by IST clock: Mon–Fri 09:15–15:40, Sunday (Muhurat) 14:00–16:00. */
-function isLiveAt(p) {
-  if (p.dow === 0) return p.minutes >= 840 && p.minutes <= 960;
-  if (p.dow === 6) return false;
+/**
+ * Live session by IST clock: Mon–Fri 09:15–15:40; 14:00–16:00 only on a weekend date in the
+ * Muhurat list (src/marketCalendar.js); every other Saturday/Sunday is closed.
+ */
+export function isLiveAt(p) {
+  const kind = getSessionKindForDate(p.date);
+  if (kind === "MUHURAT") return p.minutes >= 840 && p.minutes <= 960;
+  if (kind === "CLOSED") return false;
   return p.minutes >= 555 && p.minutes <= 940;
 }
 
@@ -73,7 +78,12 @@ export function createCollectorStatusHandler(overrides = {}) {
     // Only today's ticks count: a snapshot from an earlier session says nothing about today.
     const sameDay = Number.isFinite(snapAt) && istParts(snapAt).date === now.date;
     const timeline = sameDay && Array.isArray(snap?.intradayTimeline) ? snap.intradayTimeline : [];
-    const dq = computeDataQuality({ timeline, nowMins: now.minutes, isSunday: now.dow === 0, isLive, snapshotAgeSec });
+    // A closed weekend day has no session: no expected ticks and no gaps to report.
+    // isSunday = "the Muhurat session" (14:00–16:00 window), never merely a calendar Sunday.
+    const kind = getSessionKindForDate(now.date);
+    const dq = kind === "CLOSED"
+      ? { state: "CLOSED", lastTickTime: null, ticksToday: 0, expectedTicks: 0, coveragePct: null, maxGapMin: 0, gaps: [], summary: "market closed (weekend; not a Muhurat date)" }
+      : computeDataQuality({ timeline, nowMins: now.minutes, isSunday: kind === "MUHURAT", isLive, snapshotAgeSec });
 
     const sourceOk = {};
     const sourceFail = {};
