@@ -666,6 +666,34 @@ test("getActiveMonthlyExpiry selects current month <=15th and rolls to next mont
   assert.equal(getActiveMonthlyExpiry(expiries, dateAfter15), "29-Dec-2026");
 });
 
+const NSE_LONG_DATED_EXPIRIES = [
+  "17-Nov-2026", "23-Nov-2026", "24-Nov-2026", "01-Dec-2026", "29-Dec-2026",
+  "26-Jan-2027", "30-Mar-2027", "29-Jun-2027", "28-Dec-2027", "26-Dec-2028", "31-Dec-2030"
+];
+
+test("getActiveMonthlyExpiry ignores long-dated contracts in the same month name", () => {
+  assert.equal(getActiveMonthlyExpiry(NSE_LONG_DATED_EXPIRIES, new Date("2026-11-16T10:00:00+05:30")), "29-Dec-2026");
+  assert.equal(getActiveMonthlyExpiry(NSE_LONG_DATED_EXPIRIES, new Date("2026-11-09T10:00:00+05:30")), "24-Nov-2026");
+  assert.equal(getActiveMonthlyExpiry(NSE_LONG_DATED_EXPIRIES, new Date("2026-12-10T10:00:00+05:30")), "29-Dec-2026");
+});
+
+test("getActiveMonthlyExpiry rolls the year over from December to January", () => {
+  assert.equal(getActiveMonthlyExpiry(NSE_LONG_DATED_EXPIRIES, new Date("2026-12-20T10:00:00+05:30")), "26-Jan-2027");
+});
+
+test("getActiveMonthlyExpiry handles unsorted lists and lowercase month names", () => {
+  const unsorted = ["31-Dec-2030", "29-Dec-2026", "26-Jan-2027", "01-Dec-2026", "28-Dec-2027", "24-Nov-2026"];
+  assert.equal(getActiveMonthlyExpiry(unsorted, new Date("2026-11-16T10:00:00+05:30")), "29-Dec-2026");
+  const lower = ["24-nov-2026", "29-dec-2026", "01-dec-2026", "31-dec-2030", null, "garbage"];
+  assert.equal(getActiveMonthlyExpiry(lower, new Date("2026-11-16T10:00:00+05:30")), "29-dec-2026");
+});
+
+test("getActiveMonthlyExpiry falls back to the next later month group, and empty input returns empty", () => {
+  const noDec2026 = ["17-Nov-2026", "24-Nov-2026", "26-Jan-2027", "19-Jan-2027", "30-Mar-2027", "28-Dec-2027"];
+  assert.equal(getActiveMonthlyExpiry(noDec2026, new Date("2026-11-16T10:00:00+05:30")), "26-Jan-2027");
+  assert.equal(getActiveMonthlyExpiry([], new Date("2026-11-16T10:00:00+05:30")), "");
+});
+
 test("calculateDte calculates days to expiry correctly", () => {
   const fakeNov9 = new Date("2026-11-09T10:00:00+05:30");
   assert.equal(calculateDte("09-Nov-2026", fakeNov9), 1);

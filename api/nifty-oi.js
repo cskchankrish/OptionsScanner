@@ -519,12 +519,41 @@ export function getActiveMonthlyExpiry(expiryDates = [], currentDate = new Date(
   const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   
   // Rule: If <= 15th, use current month's monthly expiry. If > 15th, roll to next month's monthly expiry
-  let targetMonthName = monthNames[currentMonthIdx];
+  // (year rolls over when rolling from December to January)
+  let targetMonthIdx = currentMonthIdx;
+  let targetYear = istDate.getFullYear();
   if (dayOfMonth > 15) {
-    targetMonthName = monthNames[(currentMonthIdx + 1) % 12];
+    targetMonthIdx = (currentMonthIdx + 1) % 12;
+    if (currentMonthIdx === 11) targetYear += 1;
   }
-  const matching = expiryDates.filter(e => typeof e === "string" && e.includes(`-${targetMonthName}-`));
-  if (matching.length > 0) return matching[matching.length - 1];
+  const targetKey = targetYear * 12 + targetMonthIdx;
+  const lowerMonths = monthNames.map(m => m.toLowerCase());
+
+  // Parse "DD-Mon-YYYY" entries; skip non-strings and malformed values.
+  const parsed = [];
+  for (const raw of expiryDates) {
+    if (typeof raw !== "string") continue;
+    const parts = raw.trim().split("-");
+    if (parts.length !== 3) continue;
+    const day = Number(parts[0]);
+    const mIdx = lowerMonths.indexOf(parts[1].toLowerCase());
+    const year = Number(parts[2]);
+    if (!Number.isInteger(day) || day < 1 || day > 31 || mIdx === -1 || !Number.isInteger(year)) continue;
+    parsed.push({ raw, day, key: year * 12 + mIdx });
+  }
+
+  // Latest-day expiry within a month/year group (by day number, not list position).
+  const lastInGroup = key => parsed
+    .filter(p => p.key === key)
+    .reduce((best, p) => (!best || p.day > best.day ? p : best), null);
+
+  const exact = lastInGroup(targetKey);
+  if (exact) return exact.raw;
+
+  // Target month missing: use the earliest later month/year group instead of an arbitrary index.
+  const laterKeys = parsed.map(p => p.key).filter(k => k > targetKey);
+  if (laterKeys.length > 0) return lastInGroup(Math.min(...laterKeys)).raw;
+
   return expiryDates[expiryDates.length > 2 ? 2 : expiryDates.length - 1] || expiryDates[0] || "";
 }
 
