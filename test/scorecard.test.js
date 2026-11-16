@@ -413,3 +413,91 @@ test("Telegram texts carry no stray Markdown underscores and stay short", () => 
   assert.match(sc.formatMorningTelegram("2026-11-11", d11.eodFinal, d11.eodOutcome), /EOD outcome 2026-11-11:\* STBT .*MISS \(2026-11-12\)/);
   assert.ok(!/_/.test(sc.formatMorningTelegram("2026-11-12", { data: { category: "NO_CARRY" } }, { status: "UNMEASURABLE", reason: "x" })));
 });
+
+// ── carry-over quote at the open (first live tick) ──
+
+// Mon 2026-11-16's first minutes as recorded: 09:15 repeats Friday's quote, OI and cumulative volume.
+const NOV16_OPEN = [
+  [555, 25175, 208489, 2733315], [556, 25275, 208312, 68835], [557, 25284.4, 208312, 61620], [558, 25281.7, 207518, 187070],
+  [559, 25270.7, 207379, 233480], [560, 25272, 207350, 244000], [561, 25273.1, 207297, 255190], [562, 25274, 207280, 262000],
+];
+const nov16Timeline = (withVolume = true) => NOV16_OPEN.map(([m, f, oi, v]) => tick(m, f, { futCombinedOI: oi, ...(withVolume ? { futVolume: v } : {}) }));
+const NOV16_PLAN_SERIES = () => {
+  const s = sc.compactSeries([...nov16Timeline(), ...path([[600, 25290], [720, 25273]])]);
+  return s;
+};
+
+test("measureEodNext: open fields from the first live tick; 09:20 price and hit unchanged; clean open unchanged", () => {
+  const final = { futPrice: 25169, data: { category: "BTST", score: 70 } };
+  const fixed = sc.measureEodNext(final, sc.compactSeries(nov16Timeline()), { nextDate: "2026-11-16" });
+  // Without volume the OI-and-price fallback does not fire on these ticks (OI only −0.5%): the old answer.
+  const old = sc.measureEodNext(final, sc.compactSeries(nov16Timeline(false)), { nextDate: "2026-11-16" });
+  assert.deepEqual([old.openPrice, old.openAt, old.openGapPts, "openStaleSkipped" in old], [25175, "09:15", 6, false]);
+  assert.deepEqual([fixed.openPrice, fixed.openAt, fixed.openGapPts, fixed.openStaleSkipped], [25275, "09:16", 106, 1]);
+  for (const k of ["status", "nextDate", "refPrice", "price0920", "move0920Pts", "move0920Pct", "hit", "signedMove0920Pts"]) assert.deepEqual(fixed[k], old[k], k);
+  // Morning Telegram: same text, only the open figures differ.
+  const tOld = sc.formatMorningTelegram("2026-11-13", final, old);
+  const tNew = sc.formatMorningTelegram("2026-11-13", final, fixed);
+  assert.match(tOld, /open 25175 \(\+6\)/);
+  assert.equal(tNew, tOld.replace("open 25175 (+6)", "open 25275 (+106)"));
+  // A clean open (volume rising from the first tick) is measured exactly as before.
+  const cleanTl = nov16Timeline().map((t, i) => (i === 0 ? { ...t, futPrice: 25275, futVolume: 10000, futCombinedOI: 208312 } : t));
+  const clean = sc.measureEodNext(final, sc.compactSeries(cleanTl), { nextDate: "2026-11-16" });
+  const cleanNoVol = sc.measureEodNext(final, sc.compactSeries(cleanTl.map(({ futVolume, ...t }) => t)), { nextDate: "2026-11-16" });
+  assert.deepEqual(clean, cleanNoVol);
+  assert.deepEqual([clean.openAt, clean.openPrice, "openStaleSkipped" in clean], ["09:15", 25275, false]);
+});
+
+function storedNov16Doc({ withSeries = true } = {}) {
+  const plan = { id: "PLAN_DOC:FIRST:555:", t: 0, time: "09:15", minutes: 555, section: "PLAN_DOC", type: "FIRST", direction: "LONG", data: { half: "FIRST", call: "BULLISH", conviction: "HIGH", startMins: 555, endMins: 720 }, dq: { ok: true } };
+  const others = ["FUSION", "TURN", "RADAR", "EOD_SLOT", "SIGNAL", "CANDIDATE", "TRAP_SHADOW"].map((section, i) => ev({ minutes: 600 + i, section, type: `T${i}`, direction: "LONG" }));
+  const outcomes = { [plan.id]: { status: "MEASURED", refPrice: 25175, refAt: "09:15", endPrice: 25273, endAt: "12:00", movePct: 0.3893, movePts: 98, outcome: "UP", bandPct: 0.15, hit: true } };
+  others.forEach((e, i) => { outcomes[e.id] = { status: "MEASURED", hit: i % 2 === 0, horizons: { 60: { status: "OK", pts: 10 + i } }, refPrice: 25175 }; });
+  return { v: 1, date: "2026-11-16", finalisedAt: "2026-11-16T10:30:00.000Z", settings: { a: 1 }, ...(withSeries ? { series: NOV16_PLAN_SERIES() } : {}), events: [plan, ...others], outcomes, eodFinal: null, eodOutcome: null, dataQuality: { state: "OK", coveragePct: 100 } };
+}
+
+test("re-measure on read: a stored false PLAN_DOC hit is corrected in the aggregate and day view; other sections untouched", async () => {
+  const doc = storedNov16Doc();
+  const before = JSON.stringify(doc);
+  const planId = "PLAN_DOC:FIRST:555:";
+  const agg = sc.aggregate([doc]);
+  assert.deepEqual([agg.sections.PLAN_DOC.measurable, agg.sections.PLAN_DOC.hits], [1, 0]);
+  assert.deepEqual(agg.sections.PLAN_DOC.outcomeMix, { UP: 0, DOWN: 0, FLAT: 1, windows: 1 });
+  const pub = sc.publicDayView(doc);
+  const o = pub.outcomes[planId];
+  assert.deepEqual([o.refPrice, o.refAt, o.outcome, o.hit, o.remeasured, o.storedHit, o.storedRefPrice, o.refShifted, o.staleSkipped], [25275, "09:16", "FLAT", false, true, true, 25175, true, 1]);
+  for (const e of doc.events.filter((x) => x.section !== "PLAN_DOC")) {
+    assert.equal(JSON.stringify(pub.outcomes[e.id]), JSON.stringify(doc.outcomes[e.id]), e.section);
+  }
+  for (const sec of ["FUSION", "TURN", "RADAR", "EOD_SLOT", "SIGNAL", "CANDIDATE", "TRAP_SHADOW"]) {
+    const unchanged = sc.aggregate([{ ...doc, events: doc.events.filter((x) => x.section !== "PLAN_DOC") }]).sections[sec];
+    assert.deepEqual(agg.sections[sec], unchanged, sec);
+  }
+  assert.equal(JSON.stringify(doc), before, "the stored document is not modified");
+
+  // Without a series the stored outcome stands.
+  const noSeries = storedNov16Doc({ withSeries: false });
+  assert.equal(sc.publicDayView(noSeries).outcomes[planId].hit, true);
+  assert.equal("remeasured" in sc.publicDayView(noSeries).outcomes[planId], false);
+  assert.equal(sc.aggregate([noSeries]).sections.PLAN_DOC.hits, 1);
+
+  // API (public and authenticated day view, aggregate): corrected, nothing written.
+  const prev = process.env.TV_WEBHOOK_SECRET;
+  process.env.TV_WEBHOOK_SECRET = SECRET;
+  try {
+    const store = fakeStore();
+    store.kv[sc.keys.day("2026-11-11")] = { ...storedNov16Doc(), date: "2026-11-11" };
+    const stored = JSON.stringify(store.kv[sc.keys.day("2026-11-11")]);
+    const h = apiHarness(store);
+    for (const q of [{ date: "2026-11-11" }, { date: "2026-11-11", key: SECRET }]) {
+      const r = await call(h, q);
+      assert.deepEqual([r.body.outcomes[planId].hit, r.body.outcomes[planId].remeasured], [false, true], JSON.stringify(q));
+      for (const e of doc.events.filter((x) => x.section !== "PLAN_DOC")) assert.equal(JSON.stringify(r.body.outcomes[e.id]), JSON.stringify(doc.outcomes[e.id]));
+    }
+    const a = await call(h, { days: "30" });
+    assert.equal(a.body.sections.PLAN_DOC.hits, 0);
+    assert.equal(JSON.stringify(store.kv[sc.keys.day("2026-11-11")]), stored, "no write");
+  } finally {
+    if (prev === undefined) delete process.env.TV_WEBHOOK_SECRET; else process.env.TV_WEBHOOK_SECRET = prev;
+  }
+});

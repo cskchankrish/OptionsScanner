@@ -87,6 +87,12 @@ These are fusion, Turn Tracker, radar and EOD slot events. For each one the scor
 
 The scorecard records the next session's opening futures price and the 09:20 price, both compared
 with the final reading's futures reference.
+- The opening price (`openPrice` / `openAt` / `openGapPts`, also shown in the morning Telegram) is the
+  first **live** tick of the next session: leading carry-over quotes that repeat the previous session's
+  price are skipped (src/sessionOpen.js; see docs/plan-doc-shadow.md for the rule) and
+  `openStaleSkipped: n` is recorded. Example: Friday 13 Nov's outcome showed open 25175 (+6) although
+  Monday's live open was 25275 (+106). The 09:20 price and the hit rule are unchanged. Outcomes stored
+  before this fix keep their stored open figures.
 - The outcome stays `PENDING` until a later session has ticks up to 09:20. Weekends and holidays
   are handled by using the next session that has data.
 - If the futures contract rolled in between, the outcome is `UNMEASURABLE`.

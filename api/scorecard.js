@@ -15,7 +15,7 @@
 import { authorizeRequest, extractRequestSecret } from "../src/webhookAuth.js";
 import { computeDataQuality } from "../src/dataQuality.js";
 import {
-  keys, finaliseDay, aggregate, publicDayView, dayToCsv, aggregateToCsv, istOf, timelineKeysFor,
+  keys, finaliseDay, aggregate, publicDayView, withRemeasuredPlanDoc, dayToCsv, aggregateToCsv, istOf, timelineKeysFor,
   scStoreFromCommand, measureEvent, compactSeries, finalEodEvent, getScorecardConfig, SC_CLOSE_MEASURE_MINS, SC_TTL_SEC,
   isEmptyDayDoc, isSessionDayDoc, NO_SESSION_REASON_WEEKEND, NO_SESSION_REASON_EMPTY,
 } from "../src/scorecard.js";
@@ -123,7 +123,8 @@ export function createScorecardHandler(overrides = {}) {
           dataQuality: timeline.length ? (() => { const { _gapMins, ...dq } = computeDataQuality({ timeline, nowMins: today.minutes, isLive: true }); return dq; })() : null,
         };
       }
-      const view = authed ? doc : publicDayView(doc);
+      // PLAN_DOC outcomes are re-measured from the document's own series on read (no write).
+      const view = authed ? withRemeasuredPlanDoc(doc) : publicDayView(doc);
       if (csv) {
         res.setHeader("Content-Type", "text/csv");
         return res.status(200).send(dayToCsv(view, { authed }));

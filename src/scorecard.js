@@ -22,6 +22,7 @@ import { windowCoverage, hhmm, DQ_GAP_LIST_MIN, DQ_GAP_ALERT_MIN, DQ_WINDOW_MAX_
 import { getSessionKindForDate } from "./marketCalendar.js";
 import { TRAP_SHADOW_ENV_KEYS } from "./trapShadow.js";
 import { measurePlanCall, getPlanDocConfig, PLAN_DOC_ENV_KEYS } from "./planDocShadow.js";
+import { firstLiveIndex } from "./sessionOpen.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -523,10 +524,19 @@ export function measureEodNext(final, nextSeries, { nextDate, noCarryBandPct = S
   const category = final.data?.category ?? final.category;
   const dir = category === "BTST" ? 1 : category === "STBT" ? -1 : 0;
   const movePct = Math.round(((p920 - ref) / ref) * 100000) / 1000;
+  // The displayed open is the first LIVE tick: leading carry-over quotes (the previous session's price,
+  // see src/sessionOpen.js) are skipped. Status and the 09:20 hit rule are unaffected.
+  const live = firstLiveIndex(nextSeries);
+  let openTick = open;
+  if (live.skipped > 0) {
+    const lt = ticks.find((t) => t.minutes >= Number(live.minutes));
+    if (lt) openTick = lt;
+  }
   const out = {
-    status: "MEASURED", nextDate, refPrice: ref, openPrice: open.futPrice, openAt: hhmm(open.minutes), price0920: p920,
-    openGapPts: r2(open.futPrice - ref), move0920Pts: r2(p920 - ref), move0920Pct: movePct,
+    status: "MEASURED", nextDate, refPrice: ref, openPrice: openTick.futPrice, openAt: hhmm(openTick.minutes), price0920: p920,
+    openGapPts: r2(openTick.futPrice - ref), move0920Pts: r2(p920 - ref), move0920Pct: movePct,
   };
+  if (live.skipped > 0 && openTick !== open) out.openStaleSkipped = live.skipped;
   out.hit = dir !== 0 ? dir * (p920 - ref) > 0 : Math.abs(movePct) < noCarryBandPct;
   out.signedMove0920Pts = dir !== 0 ? r2(dir * (p920 - ref)) : null;
   return out;
@@ -614,10 +624,48 @@ export function planOutcomeMix(rows) {
 export const CANDIDATE_SC_CATEGORIES = ["CONFIRMED", "UNCONFIRMED", "REJECTED", "UNVERIFIABLE"];
 export const CANDIDATE_SC_GRADES = ["SYNERGY_BULL_CAND", "SYNERGY_BEAR_CAND", "BEAR_TRAP_BUY_CAND", "BULL_TRAP_SELL_CAND"];
 
+/**
+ * Read-time correction for PLAN_DOC outcomes only: a stored day document keeps the outcome measured at
+ * finalisation, which may have used a carry-over quote at the open as the reference. When the document
+ * carries its own series, each PLAN_DOC event is re-measured with the current rule; when the answer
+ * differs from the stored outcome it replaces it (marked `remeasured: true`; `storedHit` /
+ * `storedRefPrice` kept when they differ), otherwise the stored outcome is kept untouched. No other section is touched and nothing is written. Never throws: falls back to the stored
+ * outcome when there is no series or re-measuring fails. Returns the same object when nothing applies.
+ */
+export function withRemeasuredPlanDoc(doc) {
+  try {
+    if (!doc || doc.provisional || !doc.series || !Array.isArray(doc.series.m) || !doc.series.m.length) return doc;
+    const evs = (doc.events || []).filter((e) => e && e.section === "PLAN_DOC" && e.id);
+    if (!evs.length) return doc;
+    const outcomes = { ...(doc.outcomes || {}) };
+    let changed = false;
+    for (const ev of evs) {
+      const stored = outcomes[ev.id];
+      try {
+        const bandPct = Number(stored?.bandPct) > 0 ? Number(stored.bandPct) : getPlanDocConfig().bandPct;
+        const fresh = measurePlanCall(ev.data || {}, doc.series, { bandPct });
+        if (!fresh || typeof fresh !== "object") continue;
+        if (stored && JSON.stringify(stored) === JSON.stringify(fresh)) continue; // same answer: keep the stored outcome as-is
+        const o = { ...fresh, remeasured: true };
+        if (stored && stored.hit !== fresh.hit) o.storedHit = stored.hit ?? null;
+        if (stored && stored.refPrice !== undefined && stored.refPrice !== fresh.refPrice) o.storedRefPrice = stored.refPrice;
+        outcomes[ev.id] = o;
+        changed = true;
+      } catch (e) {
+        /* keep the stored outcome */
+      }
+    }
+    return changed ? { ...doc, outcomes } : doc;
+  } catch (e) {
+    return doc;
+  }
+}
+
 /** Rolling aggregate over day documents. */
 export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = true } = {}) {
   const rows = [];
-  for (const d of days) {
+  for (const raw of days) {
+    const d = withRemeasuredPlanDoc(raw);
     for (const ev of d?.events || []) rows.push({ date: d.date, event: ev, outcome: d.outcomes?.[ev.id] || null });
     if (d?.eodFinal) rows.push({ date: d.date, event: d.eodFinal, outcome: d.eodOutcome || { status: "PENDING" } });
   }
@@ -670,8 +718,9 @@ export function buildDayDoc({ date, events, finalEvent, series, settings, dataQu
 }
 
 /** Removes rupee results and the settings snapshot (public view). */
-export function publicDayView(doc) {
-  if (!doc) return null;
+export function publicDayView(raw) {
+  if (!raw) return null;
+  const doc = withRemeasuredPlanDoc(raw);
   const { settings, ...rest } = doc;
   return {
     ...rest,

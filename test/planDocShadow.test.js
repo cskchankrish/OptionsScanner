@@ -751,3 +751,78 @@ test("api/scorecard: the day view exposes the stored snapshot read-only as planD
   assert.equal(res.body.events.length, 2);
   assert.ok(!store.log.some((x) => x.startsWith("store:set:") || x.startsWith("store:setNx:nifty:plan")), "read-only");
 }));
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  First live tick of the session (carry-over quotes at the open)
+// ─────────────────────────────────────────────────────────────────────────────
+const so = await import("../src/sessionOpen.js");
+// Mon 2026-11-16 as recorded: 09:15 is Friday's quote and cumulative volume.
+const NOV16 = {
+  m: [555, 556, 557, 558, 559, 561, 600, 660, 720],
+  f: [25175, 25275, 25284.4, 25281.7, 25270.7, 25273.1, 25290, 25260, 25273],
+  s: [25206.15, 25299.9, 25299.9, 25229.7, 25258.4, 25256, 25300, 25270, 25280],
+  o: [208489, 208312, 208312, 207518, 207379, 207297, 207100, 206900, 206800],
+  v: [2733315, 68835, 61620, 187070, 233480, 255190, 900000, 1500000, 2000000],
+};
+// Fri 2026-11-13 shape: two carry-over ticks, the reset at the third.
+const NOV13 = {
+  m: [555, 556, 557, 558, 559, 560, 561, 570],
+  f: [25314, 25314, 25170, 25172, 25168, 25175, 25171, 25180],
+  o: [216128, 216128, 212215, 212200, 212190, 212180, 212170, 212100],
+  v: [3559335, 3559335, 20000, 45000, 70000, 95000, 120000, 300000],
+};
+const without = (s, k) => { const { [k]: _, ...rest } = s; return rest; };
+
+test("firstLiveIndex: volume reset (16-Nov one stale tick, 13-Nov two), clean open, window limit", () => {
+  assert.deepEqual([so.firstLiveIndex(NOV16).index, so.firstLiveIndex(NOV16).skipped, so.firstLiveIndex(NOV16).minutes], [1, 1, 556]);
+  assert.deepEqual([so.firstLiveIndex(NOV13).index, so.firstLiveIndex(NOV13).skipped], [2, 2]);
+  const clean = { ...NOV16, v: [10000, 68835, 70000, 187070, 233480, 255190, 900000, 1500000, 2000000] };
+  assert.deepEqual([so.firstLiveIndex(clean).index, so.firstLiveIndex(clean).skipped], [0, 0]);
+  // A volume drop 12 minutes in is outside the 10-minute look window: ignored.
+  const late = { m: [555, 558, 561, 564, 567, 570], f: [25000, 25010, 25020, 25030, 25040, 25050], v: [1000, 2000, 3000, 4000, 100, 5000] };
+  assert.deepEqual([so.firstLiveIndex(late).index, so.firstLiveIndex(late).skipped], [0, 0]);
+  assert.equal(so.SESSION_OPEN_MAX_LOOK_MIN, 10);
+});
+
+test("firstLiveIndex: OI-and-price fallback without volume; fast real open kept; too few followers", () => {
+  const r = so.firstLiveIndex(without(NOV13, "v"));
+  assert.deepEqual([r.index, r.skipped], [2, 2], "13-Nov numbers without volume: OI −1.8% and price −0.57% → carry-over");
+  const fast = { ...without(NOV13, "v"), o: NOV13.o.map(() => 212200) };
+  assert.equal(so.firstLiveIndex(fast).skipped, 0, "price moved but OI did not → a real fast open");
+  const three = { m: [555, 556, 557], f: [25314, 25314, 25170], o: [216128, 216128, 212215] };
+  assert.equal(so.firstLiveIndex(three).skipped, 0, "fewer than 3 followers → no skip");
+  const nullVol = { ...NOV13, v: NOV13.v.map(() => null) };
+  assert.equal(so.firstLiveIndex(nullVol).index, 2, "null volumes fall back to OI and price");
+});
+
+test("firstLiveIndex: empty / malformed input never throws", () => {
+  assert.equal(so.firstLiveIndex(null).index, -1);
+  assert.equal(so.firstLiveIndex({}).index, -1);
+  assert.equal(so.firstLiveIndex({ m: [] }).index, -1);
+  assert.equal(so.firstLiveIndex({ m: ["x", 2] }).skipped, 0);
+  assert.equal(so.firstLiveIndex({ m: [555, 556], v: "junk", f: null }).skipped, 0);
+});
+
+test("measurePlanCall: 16-Nov first half measured from the first live tick (09:16), not Friday's quote", () => {
+  const r = pd.measurePlanCall(win("BULLISH", 555, 720), NOV16);
+  assert.equal(r.status, "MEASURED");
+  assert.deepEqual([r.refPrice, r.refAt, r.endPrice, r.endAt, r.outcome, r.hit, r.refShifted, r.staleSkipped], [25275, "09:16", 25273, "12:00", "FLAT", false, true, 1]);
+  assert.ok(Math.abs(r.movePct - -0.0079) < 0.0002, String(r.movePct));
+  // Before the fix the same ticks gave 25175 @09:15 → +0.389% UP, a false hit.
+});
+
+test("measurePlanCall: clean open and mid-session windows unchanged; live tick > 10 min late → UNMEASURABLE", () => {
+  const clean = { ...NOV16, f: [25275, ...NOV16.f.slice(1)], v: [10000, ...NOV16.v.slice(1)], o: [208312, ...NOV16.o.slice(1)] };
+  const c = pd.measurePlanCall(win("BULLISH", 555, 720), clean);
+  assert.deepEqual([c.refAt, c.refPrice, "refShifted" in c, "staleSkipped" in c], ["09:15", 25275, false, false]);
+  assert.deepEqual(c, pd.measurePlanCall(win("BULLISH", 555, 720), { m: clean.m, f: clean.f }), "same as the price-only rule");
+  const mid = pd.measurePlanCall(win("BEARISH", 600, 720), NOV16);
+  assert.deepEqual([mid.refAt, mid.refPrice, "refShifted" in mid], ["10:00", 25290, false]);
+  // Carry-over ticks 09:15–09:24, the volume resets at 09:25; window starts 09:14 → 11 min late.
+  const m = [555, 556, 557, 558, 559, 560, 561, 562, 563, 564, 565, 566, 567, 720];
+  const lateLive = { m, f: m.map((x) => (x < 565 ? 25000 : 25100)), v: m.map((x) => (x < 565 ? 3000000 : 10000 + x)) };
+  const u = pd.measurePlanCall(win("BULLISH", 554, 720), lateLive);
+  assert.equal(u.status, "UNMEASURABLE");
+  assert.match(u.reason, /first live futures tick 09:25 is more than 10 min after the window start 09:14/);
+  assert.equal(pd.measurePlanCall(win("BULLISH", 555, 720), lateLive).refAt, "09:25", "exactly 10 min is allowed");
+});

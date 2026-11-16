@@ -88,6 +88,29 @@ On NIFTY futures (the scorecard's compact series): reference = the first tick at
 `UNMEASURABLE` with the reason. `movePct = (end − ref) / ref × 100`; outcome `UP` if ≥ +band, `DOWN`
 if ≤ −band, else `FLAT`; band `PLAN_DOC_BAND_PCT` (default 0.15%).
 
+**Carry-over quotes at the open are never the reference.** NSE's feed often repeats the previous
+session's futures quote, OI and cumulative volume on the first tick(s) of a session. `firstLiveIndex`
+(src/sessionOpen.js) finds the first tick that belongs to today:
+- *Volume reset (primary):* within the first 10 minutes of the series, a tick whose cumulative futures
+  volume falls below half of an earlier tick's volume marks a reset; every tick before the last reset
+  is carry-over and the reset tick is the first live tick.
+- *Fallback when volume is missing:* a leading tick is carry-over only if its OI differs by more than
+  1% **and** its futures price by more than 0.25% from the median of the next up-to-5 ticks within
+  10 minutes (at least 3 needed), so a genuinely fast open is not discarded.
+
+When a window starts before the first live tick, the reference is the first live tick, provided it is
+at most 10 minutes after the window start (otherwise `UNMEASURABLE`); the outcome then carries
+`refShifted: true` and `staleSkipped: n`. Windows that start later are unaffected.
+Example, Mon 16 Nov 2026 first half (BULLISH, 09:15–12:00): 09:15 showed Friday's 25175 (volume
+2,733,315), 09:16 the live 25275 (volume 68,835). Measured from 25175 the half was +0.389% UP (a false
+hit); from 25275 it is −0.008% FLAT (a miss).
+
+Stored day documents keep the outcome measured at finalisation. On read (day view, public and
+authenticated, and the rolling aggregate) each `PLAN_DOC` event of a document that carries its series
+is re-measured with the current rule; if the answer differs it replaces the stored one, marked
+`remeasured: true` with `storedHit` / `storedRefPrice`. Nothing is written back and no other section
+is re-measured.
+
 Hit: BULLISH → UP, BEARISH → DOWN, RANGE → FLAT. UNPARSED → `NOT_SCORED` (the window move is still
 recorded for the base rate).
 

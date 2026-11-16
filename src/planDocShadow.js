@@ -13,12 +13,15 @@
  */
 import { hhmm } from "./dataQuality.js";
 import { istParts, getSessionKindForDate, dowOfIsoDate } from "./marketCalendar.js";
+import { firstLiveIndex } from "./sessionOpen.js";
 
 export const PLAN_DOC_BAND_PCT = 0.15;
 export const PLAN_DOC_OPEN_MINS = 555; // 09:15
 export const PLAN_DOC_CLOSE_MINS = 930; // 15:30
 export const PLAN_DOC_LAST_PREOPEN_MINS = 554; // 09:14
 export const PLAN_DOC_EDGE_TOLERANCE_MIN = 5;
+/** When carry-over quotes are skipped at the open, the first live tick may be at most this late after the window start. */
+export const PLAN_DOC_LIVE_REF_MAX_MIN = 10;
 export const PLAN_DOC_DEFAULT_WINDOWS = Object.freeze({
   FIRST: Object.freeze({ startMins: 555, endMins: 720 }), // 09:15–12:00
   SECOND: Object.freeze({ startMins: 750, endMins: 930 }), // 12:30–15:30
@@ -251,11 +254,25 @@ export function measurePlanCall(call, series, cfg = {}) {
   }
   ticks.sort((a, b) => a.minutes - b.minutes);
   const tol = PLAN_DOC_EDGE_TOLERANCE_MIN;
-  const ref = ticks.find((t) => t.minutes >= start && t.minutes <= start + tol);
+  // Carry-over quotes at the open (the previous session's price) are never a reference.
+  const live = firstLiveIndex(series);
+  const liveMin = live.skipped > 0 && Number.isFinite(Number(live.minutes)) ? Number(live.minutes) : null;
+  const shifted = liveMin !== null && start < liveMin;
+  let ref;
+  let problem = null;
+  if (shifted) {
+    ref = ticks.find((t) => t.minutes >= liveMin);
+    if (ref && ref.minutes > start + PLAN_DOC_LIVE_REF_MAX_MIN) {
+      problem = `first live futures tick ${hhmm(ref.minutes)} is more than ${PLAN_DOC_LIVE_REF_MAX_MIN} min after the window start ${hhmm(start)}`;
+      ref = null;
+    }
+  } else {
+    ref = ticks.find((t) => t.minutes >= start && t.minutes <= start + tol);
+  }
   let fin = null;
   for (const t of ticks) if (t.minutes <= end && t.minutes >= end - tol) fin = t;
-  let problem = null;
-  if (!ref) problem = `no futures tick within ${tol} min after the window start ${hhmm(start)}`;
+  if (problem) ref = null; // reason already set: first live tick too late
+  else if (!ref) problem = `no futures tick within ${tol} min after the window start ${hhmm(start)}`;
   else if (!fin) problem = `no futures tick within ${tol} min before the window end ${hhmm(end)}${ticks.length && ticks[ticks.length - 1].minutes < end - tol ? " (window not over yet, or a data gap)" : ""}`;
   else if (!(fin.minutes > ref.minutes)) problem = "window has no span between its first and last tick";
   if (problem) return scored ? { status: "UNMEASURABLE", reason: problem } : unscored({});
@@ -264,6 +281,7 @@ export function measurePlanCall(call, series, cfg = {}) {
   const base = {
     refPrice: ref.price, refAt: hhmm(ref.minutes), endPrice: fin.price, endAt: hhmm(fin.minutes),
     movePct, movePts: Math.round((fin.price - ref.price) * 100) / 100, outcome, bandPct,
+    ...(shifted ? { refShifted: true, staleSkipped: live.skipped } : {}),
   };
   if (!scored) return unscored(base);
   return { status: "MEASURED", ...base, hit: outcome === HIT_OUTCOME[call.call] };
