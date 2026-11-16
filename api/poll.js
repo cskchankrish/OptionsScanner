@@ -21,7 +21,9 @@
  *   - Every live-session call (success or failure) runs the scanner-blind watchdog.
  *   - Several pollers (VM `x-poll-source: vm`, QStash, GitHub cron): if a live snapshot younger than
  *     POLL_MIN_INTERVAL_SEC (default 20) already exists, return 200 { status: "FRESH_ENOUGH" }
- *     without calling NSE, so three pollers do not triple the NSE load.
+ *     without calling NSE, so three pollers do not triple the NSE load — but only when that snapshot
+ *     already holds a tick for the current IST minute; otherwise the refresh runs as usual (the
+ *     success response and record then carry `forcedForMinute: true`), so no minute loses its tick.
  *   - Collector bookkeeping (read by GET /api/collector-status): per-source last success / failure
  *     (`nifty:poller:src_ok:<source>`, `nifty:poller:src_fail:<source>`) and capped lists of the last
  *     100 failures and 100 successes (`nifty:poller:failures`, `nifty:poller:successes`).
@@ -98,6 +100,27 @@ const SOURCE_TTL_SEC = 14 * 86400;
 export function getPollMinIntervalSec(env = process.env) {
   const v = Number(env.POLL_MIN_INTERVAL_SEC);
   return Number.isFinite(v) && v >= 0 ? v : 20;
+}
+
+/**
+ * The IST minute a refresh run now would stamp its tick with: capped at the session close
+ * (16:00 = 960 on the Muhurat session, else 15:40 = 940), as the tick stamping in nifty-oi.js does.
+ */
+export function currentTickMinute(nowMs, sessionInfo) {
+  const closeMins = sessionInfo?.isSunday || sessionInfo?.isMuhuratSession ? 960 : 940;
+  return Math.min(istParts(nowMs).minutes, closeMins);
+}
+
+/** True when the stored snapshot's latest timeline tick (max `minutes`) is at or past `minute`. */
+export function hasTickForMinute(snapshot, minute) {
+  const timeline = snapshot?.intradayTimeline;
+  if (!Array.isArray(timeline) || timeline.length === 0) return false;
+  let latest = -Infinity;
+  for (const t of timeline) {
+    const m = Number(t?.minutes);
+    if (Number.isFinite(m) && m > latest) latest = m;
+  }
+  return latest >= minute;
 }
 
 /** Known sources keep their name; anything else is bucketed as "secret" (authenticated caller). */
@@ -244,7 +267,13 @@ export function createPollHandler(overrides = {}) {
     }
     const existingAt = Number(existing?.snapshotAt);
     const existingAgeSec = Number.isFinite(existingAt) && existingAt > 0 ? (started - existingAt) / 1000 : null;
-    if (minIntervalSec > 0 && existingAgeSec !== null && existingAgeSec >= 0 && existingAgeSec < minIntervalSec) {
+    const isFreshByAge = minIntervalSec > 0 && existingAgeSec !== null && existingAgeSec >= 0 && existingAgeSec < minIntervalSec;
+    // A tick exists only for a minute in which a refresh ran, so "fresh enough" may skip NSE only
+    // when the snapshot already holds a tick for the current IST minute (capped at the session close,
+    // exactly as the tick stamping does). Otherwise a refresh in the last seconds of minute M-1 would
+    // leave minute M without a tick.
+    const forcedForMinute = isFreshByAge && !hasTickForMinute(existing, currentTickMinute(deps.now(), sessionInfo));
+    if (isFreshByAge && !forcedForMinute) {
       const nowIso = new Date(deps.now()).toISOString();
       try { await deps.setHeartbeat({ at: nowIso, snapshotAt: new Date(existingAt).toISOString(), source: authSource, status: "FRESH_ENOUGH" }); } catch (e) { /* ignore */ }
       await record(true, { status: "FRESH_ENOUGH", httpStatus: 200, durationMs: deps.now() - started, ageSec: Math.round(existingAgeSec) });
@@ -314,7 +343,7 @@ export function createPollHandler(overrides = {}) {
       heartbeat = false;
     }
     const watchdog = await runWatchdog(snapshotAt, true, null);
-    await record(true, { status: "LIVE_POLL_SUCCESS", httpStatus: 200, durationMs: deps.now() - started, ticks: result.ticks ?? null });
+    await record(true, { status: "LIVE_POLL_SUCCESS", httpStatus: 200, durationMs: deps.now() - started, ticks: result.ticks ?? null, ...(forcedForMinute ? { forcedForMinute: true } : {}) });
     await notePollerSuccess({ source: authSource, deps: { del: deps.del, send: deps.sendText } });
 
     // Plan-document shadow: first live poll of the day appends the snapshot's calls to the
@@ -350,6 +379,7 @@ export function createPollHandler(overrides = {}) {
       watchdog: watchdog.status,
       dataQuality: result.payload?.dataQuality ?? null,
       ...(planEvents ? { planEvents } : {}),
+      ...(forcedForMinute ? { forcedForMinute: true } : {}),
     });
   };
 }

@@ -524,3 +524,171 @@ test("poll: outage then recovery sends exactly one blind and one recovered alert
 test("poll: rejects other HTTP methods", pollCase({}, async (handler) => {
   assert.equal((await callPoll(handler, { method: "DELETE", headers: { "x-webhook-secret": SECRET } })).statusCode, 405);
 }));
+
+// ── /api/poll: FRESH_ENOUGH only when the current IST minute already has a tick ──
+
+// Monday 16-Nov-2026, IST minute + second → epoch ms.
+const istAt = (mins, sec = 0) => Date.UTC(2026, 10, 16, 0, 0, 0) + (mins - 330) * 60_000 + sec * 1000;
+const ptick = (m) => ({ minutes: m, time: `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}` });
+const AUTH = { headers: { "x-webhook-secret": SECRET, "x-poll-source": "vm" } };
+
+function withMinInterval(value, fn) {
+  return async (...args) => {
+    const prev = process.env.POLL_MIN_INTERVAL_SEC;
+    if (value === undefined) delete process.env.POLL_MIN_INTERVAL_SEC;
+    else process.env.POLL_MIN_INTERVAL_SEC = value;
+    try { await fn(...args); } finally {
+      if (prev === undefined) delete process.env.POLL_MIN_INTERVAL_SEC;
+      else process.env.POLL_MIN_INTERVAL_SEC = prev;
+    }
+  };
+}
+
+const NOW_1000_30 = istAt(600, 30); // 10:00:30 IST
+
+test("poll: snapshot 10s old whose latest tick is the previous minute -> refresh runs (forcedForMinute)", pollCase({
+  now: () => NOW_1000_30,
+}, withMinInterval(undefined, async (handler, state) => {
+  const records = [];
+  const h = createPollHandler({
+    now: () => NOW_1000_30,
+    getMarketSessionInfo: () => ({ isLiveMarket: true }),
+    refresh: async (opts) => { state.refreshCalls.push(opts); return { ok: true, snapshotAt: opts.now, ticks: 46, payload: {} }; },
+    getFlowSnapshot: async () => ({ snapshotAt: NOW_1000_30 - 10_000, intradayTimeline: [ptick(598), ptick(599)] }),
+    setHeartbeat: async (v) => { state.heartbeats.push(v); return true; },
+    setNx: async () => true, del: async () => 0, sendText: async () => true, qstashKeys: () => [],
+    pushEvent: async (key, v) => { records.push({ key, v }); },
+    setSourceStatus: async () => {},
+  });
+  const res = await callPoll(h, AUTH);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.status, "LIVE_POLL_SUCCESS");
+  assert.equal(res.body.forcedForMinute, true);
+  assert.equal(state.refreshCalls.length, 1);
+  assert.equal(state.heartbeats.length, 1);
+  assert.equal(records[0].v.status, "LIVE_POLL_SUCCESS");
+  assert.equal(records[0].v.forcedForMinute, true);
+})));
+
+test("poll: snapshot 10s old whose latest tick is the current minute -> FRESH_ENOUGH, no refresh", pollCase({
+  now: () => NOW_1000_30,
+}, withMinInterval(undefined, async (handler, state) => {
+  // Timeline order must not matter: the latest tick is the max `minutes`.
+  state.flowSnapshot = { snapshotAt: NOW_1000_30 - 10_000, intradayTimeline: [ptick(600), ptick(598), ptick(599)] };
+  const res = await callPoll(handler, AUTH);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.status, "FRESH_ENOUGH");
+  assert.equal(res.body.ageSec, 10);
+  assert.equal(res.body.forcedForMinute, undefined);
+  assert.equal(state.refreshCalls.length, 0);
+  assert.equal(state.heartbeats.length, 1);
+  assert.equal(state.heartbeats[0].status, "FRESH_ENOUGH");
+})));
+
+test("poll: snapshot 10s old with missing / empty / malformed intradayTimeline -> refresh runs", pollCase({
+  now: () => NOW_1000_30,
+}, withMinInterval(undefined, async (handler, state) => {
+  const variants = [
+    {},
+    { intradayTimeline: [] },
+    { intradayTimeline: "not-an-array" },
+    { intradayTimeline: null },
+    { intradayTimeline: [null, { minutes: "x" }, { time: "10:00" }] },
+  ];
+  for (const extra of variants) {
+    state.flowSnapshot = { snapshotAt: NOW_1000_30 - 10_000, ...extra };
+    const before = state.refreshCalls.length;
+    const res = await callPoll(handler, AUTH);
+    assert.equal(res.body.status, "LIVE_POLL_SUCCESS", JSON.stringify(extra));
+    assert.equal(res.body.forcedForMinute, true, JSON.stringify(extra));
+    assert.equal(state.refreshCalls.length, before + 1, JSON.stringify(extra));
+  }
+})));
+
+test("poll: minute is capped at the session close (15:40 weekday, 16:00 Muhurat)", withMinInterval(undefined, async () => {
+  const prev = process.env.TV_WEBHOOK_SECRET;
+  process.env.TV_WEBHOOK_SECRET = SECRET;
+  try {
+    const run = async (nowMs, sessionInfo, timeline) => {
+      let refreshes = 0;
+      const h = createPollHandler({
+        now: () => nowMs,
+        getMarketSessionInfo: () => ({ isLiveMarket: true, ...sessionInfo }),
+        refresh: async (opts) => { refreshes++; return { ok: true, snapshotAt: opts.now, ticks: 1, payload: {} }; },
+        getFlowSnapshot: async () => ({ snapshotAt: nowMs - 10_000, intradayTimeline: timeline }),
+        setHeartbeat: async () => true, setNx: async () => true, del: async () => 0, sendText: async () => true, qstashKeys: () => [],
+        pushEvent: async () => {}, setSourceStatus: async () => {},
+      });
+      const res = await callPoll(h, AUTH);
+      return { status: res.body.status, refreshes };
+    };
+    // 15:40:30 IST with the 15:40 (940) tick already stored -> FRESH_ENOUGH.
+    assert.deepEqual(await run(istAt(940, 30), {}, [ptick(939), ptick(940)]), { status: "FRESH_ENOUGH", refreshes: 0 });
+    // Same instant, latest tick 15:39 -> refresh.
+    assert.deepEqual(await run(istAt(940, 30), {}, [ptick(939)]), { status: "LIVE_POLL_SUCCESS", refreshes: 1 });
+    // Past the close (15:41:10, a mocked-live edge): still capped at 940.
+    assert.deepEqual(await run(istAt(941, 10), {}, [ptick(940)]), { status: "FRESH_ENOUGH", refreshes: 0 });
+    // Muhurat session caps at 16:00 (960), not 15:40.
+    const muh = Date.UTC(2026, 10, 8, 0, 0, 0) + (960 - 330) * 60_000 + 30_000; // Sun 08-Nov 16:00:30 IST
+    assert.deepEqual(await run(muh, { isSunday: true, isMuhuratSession: true }, [ptick(960)]), { status: "FRESH_ENOUGH", refreshes: 0 });
+    assert.deepEqual(await run(muh, { isSunday: true, isMuhuratSession: true }, [ptick(940)]), { status: "LIVE_POLL_SUCCESS", refreshes: 1 });
+  } finally {
+    if (prev === undefined) delete process.env.TV_WEBHOOK_SECRET; else process.env.TV_WEBHOOK_SECRET = prev;
+  }
+}));
+
+test("poll: POLL_MIN_INTERVAL_SEC=0 always refreshes, even with a current-minute tick", pollCase({
+  now: () => NOW_1000_30,
+}, withMinInterval("0", async (handler, state) => {
+  state.flowSnapshot = { snapshotAt: NOW_1000_30 - 1_000, intradayTimeline: [ptick(600)] };
+  const res = await callPoll(handler, AUTH);
+  assert.equal(res.body.status, "LIVE_POLL_SUCCESS");
+  assert.equal(res.body.forcedForMinute, undefined, "not forced: the interval check is disabled");
+  assert.equal(state.refreshCalls.length, 1);
+})));
+
+test("poll simulation: a browser refresh at :55 of minute 1 no longer costs minute 2 its tick", withMinInterval(undefined, async () => {
+  const prev = process.env.TV_WEBHOOK_SECRET;
+  process.env.TV_WEBHOOK_SECRET = SECRET;
+  try {
+    const START = 560; // 09:20 IST; minutes 1..6 = 09:20..09:25
+    let clock = istAt(START, 0);
+    const snapshot = { snapshotAt: istAt(START - 1, 0), intradayTimeline: [ptick(START - 1)] };
+    // Any refresh (poller or browser) stamps the minute in which it runs, as nifty-oi.js does.
+    const doRefresh = (nowMs) => {
+      const m = Math.min(Math.floor(((nowMs / 60_000) + 330) % 1440), 940);
+      const tl = snapshot.intradayTimeline.filter((t) => t.minutes !== m);
+      tl.push(ptick(m));
+      snapshot.intradayTimeline = tl;
+      snapshot.snapshotAt = nowMs;
+      return { ok: true, snapshotAt: nowMs, ticks: tl.length, payload: {} };
+    };
+    let pollerRefreshes = 0;
+    const h = createPollHandler({
+      now: () => clock,
+      getMarketSessionInfo: () => ({ isLiveMarket: true }),
+      refresh: async (opts) => { pollerRefreshes++; return doRefresh(opts.now); },
+      getFlowSnapshot: async () => JSON.parse(JSON.stringify(snapshot)),
+      setHeartbeat: async () => true, setNx: async () => true, del: async () => 0, sendText: async () => true, qstashKeys: () => [],
+      pushEvent: async () => {}, setSourceStatus: async () => {},
+    });
+    const statuses = [];
+    for (let i = 0; i < 6; i++) {
+      const m = START + i;
+      clock = istAt(m, 0);
+      const r = await callPoll(h, AUTH); // poller at second 0
+      statuses.push({ m, status: r.body.status, forced: r.body.forcedForMinute === true });
+      clock = istAt(m, 2);
+      const r2 = await callPoll(h, { headers: { "x-webhook-secret": SECRET, "x-poll-source": "qstash" } }); // second poller
+      assert.equal(r2.body.status, "FRESH_ENOUGH", `second poller in minute ${m} is skipped`);
+      if (i === 0) { clock = istAt(m, 55); doRefresh(clock); } // dashboard tab refresh at :55 of minute 1
+    }
+    const minutes = new Set(snapshot.intradayTimeline.map((t) => t.minutes));
+    for (let i = 0; i < 6; i++) assert.ok(minutes.has(START + i), `minute ${START + i} has a tick`);
+    // Minute 2 is exactly the case the old rule skipped: the snapshot was 5 s old at 09:21:00.
+    assert.deepEqual(statuses[1], { m: START + 1, status: "LIVE_POLL_SUCCESS", forced: true });
+    assert.equal(pollerRefreshes, 6, "one poller refresh per minute; the second poller never refreshes");
+  } finally {
+    if (prev === undefined) delete process.env.TV_WEBHOOK_SECRET; else process.env.TV_WEBHOOK_SECRET = prev;
+  }
+}));

@@ -214,7 +214,8 @@ function pollHarness({ snapshotAgeSec = 600, refreshResult } = {}) {
       st.refreshes++;
       return refreshResult || { ok: true, snapshotAt: nowMs, ticks: 140, payload: { spotPrice: 25000, dataQuality: { state: "OK" } } };
     },
-    getFlowSnapshot: async () => ({ snapshotAt: nowMs - snapshotAgeSec * 1000, snapshotSource: "poller", dataQuality: { state: "GAPS" } }),
+    // The timeline already holds the current minute's tick (11:40 = 700), so FRESH_ENOUGH may apply.
+    getFlowSnapshot: async () => ({ snapshotAt: nowMs - snapshotAgeSec * 1000, snapshotSource: "poller", dataQuality: { state: "GAPS" }, intradayTimeline: [tick(699), tick(700)] }),
     setHeartbeat: async (v) => { st.heartbeats.push(v); return true; },
     setNx: async (k, v) => { if (k in st.kv) return false; st.kv[k] = v; return true; },
     del: async (k) => { if (k in st.kv) { delete st.kv[k]; return 1; } return 0; },
