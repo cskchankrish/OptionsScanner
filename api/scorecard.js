@@ -20,6 +20,7 @@ import {
   isEmptyDayDoc, isSessionDayDoc, NO_SESSION_REASON_WEEKEND, NO_SESSION_REASON_EMPTY,
 } from "../src/scorecard.js";
 import { getSessionKindForDate } from "../src/marketCalendar.js";
+import { planKeys } from "../src/planDocShadow.js";
 
 async function defaultDeps() {
   const { redisRestCommand, scorecardSettings } = await import("./nifty-oi.js");
@@ -128,7 +129,15 @@ export function createScorecardHandler(overrides = {}) {
         return res.status(200).send(dayToCsv(view, { authed }));
       }
       const { series, ...light } = view;
-      return res.status(200).json({ ok: true, authenticated: authed, ...light, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}) });
+      // Read-only: the stored plan-document snapshot (raw text verbatim) for this date, if any.
+      let planDoc = null;
+      try {
+        const snap = await store.get(planKeys.snap(date));
+        if (snap && typeof snap === "object" && snap.raw) planDoc = { fetchedAt: snap.fetchedAt ?? null, source: snap.source ?? null, late: Boolean(snap.late), raw: snap.raw, parsed: snap.parsed ?? null };
+      } catch (e) {
+        planDoc = null;
+      }
+      return res.status(200).json({ ok: true, authenticated: authed, ...light, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
     }
 
     // ── rolling aggregate ──

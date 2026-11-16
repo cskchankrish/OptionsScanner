@@ -429,3 +429,38 @@ export default async function handler(req, res) {
     });
   }
 }
+
+// ── Additive helpers for the plan-document shadow snapshot (api/poll.js, src/planDocShadow.js).
+// They do not touch the endpoint above, its in-memory cache or the Redis cache it writes.
+
+/**
+ * Freshly fetched and parsed sessions from the Google Doc, or null. Bounded to `timeoutMs` in
+ * total (the fetch itself may keep running in the background after that). Never throws.
+ */
+export async function fetchArgonSessionsLive({ timeoutMs = 8000 } = {}) {
+  let timer;
+  try {
+    const text = await Promise.race([
+      fetchGoogleDocWithRetry(DOC_URL, 2),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+    if (!text) return null;
+    const sessions = parseArgonDoc(text);
+    return Array.isArray(sessions) && sessions.length ? sessions : null;
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Sessions from the Redis cache the endpoint maintains (no Google call), or null. Never throws. */
+export async function getCachedArgonSessions() {
+  try {
+    const data = await getRedisArgonData();
+    if (!data || !Array.isArray(data.sessions) || !data.sessions.length) return null;
+    return { sessions: data.sessions, updatedAt: data.updatedAt || null, source: data.source || null };
+  } catch (e) {
+    return null;
+  }
+}

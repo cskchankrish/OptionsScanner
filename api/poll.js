@@ -39,6 +39,47 @@ import {
 } from "./nifty-oi.js";
 import { sendTelegramText } from "./tv-webhook.js";
 import { notePollerSuccess } from "../src/collectorAlerts.js";
+import { takePreOpenPlanSnapshot, recordPlanEventsOnce } from "../src/planDocShadow.js";
+import { istParts } from "../src/marketCalendar.js";
+import { scStoreFromCommand, buildPlanEvents, recordEvent as scRecordEvent } from "../src/scorecard.js";
+import { fetchArgonSessionsLive, getCachedArgonSessions } from "./argon.js";
+
+// Plan-document shadow (measurement only; docs/plan-doc-shadow.md). Hard caps so it can never push
+// a poll past Vercel's 15 s maxDuration: the pre-open step runs only on MARKET_CLOSED polls; the
+// first-live-poll step runs after all normal poll work and only within the remaining budget.
+const PLAN_PREOPEN_MAX_MS = 11000;
+const PLAN_EVENTS_MAX_MS = 3000;
+const PLAN_EVENTS_DEADLINE_FROM_START_MS = 14000;
+const PLAN_REPORTED = ["TAKEN", "RETRY", "NO_ENTRY", "RECORDED", "TIMEOUT"];
+
+// Per-instance memo: the IST date for which this warm instance already knows each plan step is
+// settled, so later polls that day skip it without a Redis call. Only settled answers are memoised
+// (pre-open: TAKEN / lock already claimed; events: RECORDED / NO_ENTRY / already done). RETRY,
+// TIMEOUT and ERROR never are, so a later poll still retries.
+const PLAN_SNAP_SETTLED = ["TAKEN", "ALREADY_CLAIMED"];
+const PLAN_EVENTS_SETTLED = ["RECORDED", "NO_ENTRY", "ALREADY_DONE"];
+const planMemo = { snapDate: null, eventsDate: null };
+
+/** Test-only: clears the module-level plan memo. */
+export function resetPlanMemoForTesting() {
+  planMemo.snapDate = null;
+  planMemo.eventsDate = null;
+}
+
+/** Runs one plan step with a hard time cap; never throws. */
+async function runPlanStep(fn, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ status: "TIMEOUT" }), ms); }),
+    ]);
+  } catch (e) {
+    return { status: "ERROR", reason: e?.message || String(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export const HEARTBEAT_KEY = "nifty:poller:last_ok";
 const HEARTBEAT_TTL_SEC = 7 * 86400;
@@ -105,6 +146,14 @@ function defaultDeps() {
       await redisRestCommand(["LTRIM", key, "0", String(POLL_EVENTS_CAP - 1)]);
     },
     setSourceStatus: (key, value) => redisRestSet(key, value, SOURCE_TTL_SEC),
+    // Plan-document shadow (never allowed to fail or change a poll).
+    env: process.env,
+    planStore: scStoreFromCommand(redisRestCommand),
+    fetchPlanSessionsLive: () => fetchArgonSessionsLive({ timeoutMs: 8000 }),
+    getCachedPlanSessions: () => getCachedArgonSessions(),
+    planMemo,
+    buildPlanEvents,
+    recordScorecardEvent: scRecordEvent,
   };
 }
 
@@ -156,12 +205,25 @@ export function createPollHandler(overrides = {}) {
     // list) is never live, so no NSE call, tick, heartbeat or Telegram happens on it.
     const sessionInfo = deps.getMarketSessionInfo(deps.now());
     if (!sessionInfo.isLiveMarket) {
-      return res.status(200).json({
+      const closedBody = {
         ok: true,
         status: "MARKET_CLOSED",
         nextOpen: sessionInfo.nextOpenDescription,
         source: authSource,
-      });
+      };
+      // Pre-open plan-document snapshot (weekday 08:45–09:14 IST only; no-op otherwise).
+      const snapDate = istParts(deps.now()).date;
+      if (deps.planMemo?.snapDate !== snapDate) {
+        const plan = await runPlanStep(() => takePreOpenPlanSnapshot({
+          nowMs: deps.now(),
+          store: deps.planStore,
+          fetchLiveSessions: deps.fetchPlanSessionsLive,
+          env: deps.env || process.env,
+        }), PLAN_PREOPEN_MAX_MS);
+        if (deps.planMemo && PLAN_SNAP_SETTLED.includes(plan?.status)) deps.planMemo.snapDate = snapDate;
+        if (PLAN_REPORTED.includes(plan?.status)) closedBody.planSnapshot = plan.status;
+      }
+      return res.status(200).json(closedBody);
     }
 
     const bucket = normalizePollSource(authSource);
@@ -255,6 +317,25 @@ export function createPollHandler(overrides = {}) {
     await record(true, { status: "LIVE_POLL_SUCCESS", httpStatus: 200, durationMs: deps.now() - started, ticks: result.ticks ?? null });
     await notePollerSuccess({ source: authSource, deps: { del: deps.del, send: deps.sendText } });
 
+    // Plan-document shadow: first live poll of the day appends the snapshot's calls to the
+    // scorecard, once. After all normal poll work; skipped (left to the next poll) when the
+    // remaining time budget is short.
+    let planEvents = null;
+    const planBudgetMs = Math.min(PLAN_EVENTS_MAX_MS, started + PLAN_EVENTS_DEADLINE_FROM_START_MS - deps.now());
+    const eventsDate = istParts(deps.now()).date;
+    if (planBudgetMs >= 500 && deps.planMemo?.eventsDate !== eventsDate) {
+      const plan = await runPlanStep(() => recordPlanEventsOnce({
+        nowMs: deps.now(),
+        store: deps.planStore,
+        getCachedSessions: deps.getCachedPlanSessions,
+        buildEvents: deps.buildPlanEvents,
+        recordEvent: deps.recordScorecardEvent,
+        env: deps.env || process.env,
+      }), planBudgetMs);
+      if (deps.planMemo && PLAN_EVENTS_SETTLED.includes(plan?.status)) deps.planMemo.eventsDate = eventsDate;
+      if (PLAN_REPORTED.includes(plan?.status)) planEvents = plan.status;
+    }
+
     return res.status(200).json({
       ok: true,
       status: "LIVE_POLL_SUCCESS",
@@ -268,6 +349,7 @@ export function createPollHandler(overrides = {}) {
       source: authSource,
       watchdog: watchdog.status,
       dataQuality: result.payload?.dataQuality ?? null,
+      ...(planEvents ? { planEvents } : {}),
     });
   };
 }

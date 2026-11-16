@@ -9,7 +9,7 @@ import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 const VARIANT_LABEL = { BEAR_TRAP_BASE: "Bear trap — current rule", BEAR_TRAP_STRICT: "Bear trap — tighter (shadow)", BULL_TRAP_BASE: "Bull trap — current rule", BULL_TRAP_STRICT: "Bull trap — tighter (shadow)" };
-const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", CANDIDATE: "Candidate alerts — real-chain verdict (shadow, no orders)", TRADE: "Algo trades (₹)" };
+const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", CANDIDATE: "Candidate alerts — real-chain verdict (shadow, no orders)", TRADE: "Algo trades (₹)", PLAN_DOC: "Plan document (Gemini) — half-day calls, shadow" };
 const SPLIT_LABEL = {
   "category:CONFIRMED": "Confirmed by the real chain",
   "category:UNCONFIRMED": "Let through, not confirmed by the chain",
@@ -19,9 +19,22 @@ const SPLIT_LABEL = {
   "grade:SYNERGY_BEAR_CAND": "Bear synergy candidates",
   "grade:BEAR_TRAP_BUY_CAND": "Bear trap (buy) candidates",
   "grade:BULL_TRAP_SELL_CAND": "Bull trap (sell) candidates",
+  "half:FIRST": "First-half calls",
+  "half:SECOND": "Second-half calls",
+  "half:FULL": "Whole-day calls",
+  "call:BULLISH": "Bullish calls (hit = window went up)",
+  "call:BEARISH": "Bearish calls (hit = window went down)",
+  "call:RANGE": "Range calls (hit = window stayed flat)",
+  "conviction:HIGHEST": "Conviction HIGHEST",
+  "conviction:HIGH": "Conviction HIGH",
+  "conviction:MEDIUM": "Conviction MEDIUM",
+  "conviction:LOW": "Conviction LOW",
 };
 /** Sub-rows of a section: [key, label, stats]. CANDIDATE has two splits (category and grade). */
 function splitsOf(s) {
+  if (s.byHalf || s.byCall || s.byConviction) {
+    return ["half", "call", "conviction"].flatMap((p) => Object.entries(s[`by${p[0].toUpperCase()}${p.slice(1)}`] || {}).map(([k, v]) => [`${p}:${k}`, SPLIT_LABEL[`${p}:${k}`] || k, v]));
+  }
   if (s.byCategory || s.byGrade) {
     return [
       ...Object.entries(s.byCategory || {}).map(([k, v]) => [`category:${k}`, SPLIT_LABEL[`category:${k}`] || k, v]),
@@ -122,7 +135,15 @@ export function ScorecardView({ t, isDark }) {
           <tbody>
             {agg && Object.entries(agg.sections).flatMap(([sec, s]) => [
               <tr key={sec}>
-                <td style={cell}><strong>{SECTION_LABEL[sec] || sec}</strong><div style={{ fontSize: 10.5, color: t.textMuted }}>{s.rule}</div></td>
+                <td style={cell}>
+                  <strong>{SECTION_LABEL[sec] || sec}</strong><div style={{ fontSize: 10.5, color: t.textMuted }}>{s.rule}</div>
+                  {s.outcomeMix && (
+                    <div style={{ fontSize: 11, color: t.textSub, marginTop: 2 }}>
+                      Windows went up {s.outcomeMix.UP} · down {s.outcomeMix.DOWN} · flat {s.outcomeMix.FLAT}
+                      {s.notScored ? ` · ${s.notScored} unparsed call(s) not scored` : ""}{s.late ? ` · ${s.late} from late snapshots` : ""}
+                    </div>
+                  )}
+                </td>
                 <td style={cell}><Rate s={s} t={t} /></td>
                 <td style={cell}>{s.excludedUnmeasurable}{s.pending ? ` · ${s.pending} pending` : ""}</td>
                 <td style={cell}>{s.events}</td>
@@ -165,7 +186,15 @@ export function ScorecardView({ t, isDark }) {
               <tr key={e.id}>
                 <td style={cell}>{e.time}</td>
                 <td style={cell}>{SECTION_LABEL[e.section] || e.section}</td>
-                <td style={cell}>{e.type.replace(/_/g, " ")}{e.data?.category ? ` · ${e.data.category}` : ""}</td>
+                <td style={cell}>
+                  {e.type.replace(/_/g, " ")}{e.data?.category ? ` · ${e.data.category}` : ""}
+                  {e.section === "PLAN_DOC" && (
+                    <div style={{ fontSize: 10.5, color: t.textMuted }}>
+                      {e.data?.call} · {e.data?.phrase}{e.data?.conviction ? ` · ${e.data.conviction}` : ""}{e.data?.late ? " · late snapshot" : ""}
+                      {o?.outcome ? ` · window ${o.refAt}–${o.endAt} ${o.movePct > 0 ? "+" : ""}${o.movePct}% (${o.outcome})` : ""}
+                    </div>
+                  )}
+                </td>
                 <td style={cell}>{e.direction || "—"}</td>
                 <td style={cell}>{e.futPrice ?? "—"}</td>
                 <td style={{ ...cell, fontWeight: 800, color: o?.status === "MEASURED" ? (o.hit ? "#16a34a" : "#ef4444") : t.textMuted }}>

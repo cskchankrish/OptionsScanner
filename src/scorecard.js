@@ -21,6 +21,7 @@
 import { windowCoverage, hhmm, DQ_GAP_LIST_MIN, DQ_GAP_ALERT_MIN, DQ_WINDOW_MAX_GAP_MIN, DQ_WINDOW_MIN_COVERAGE_PCT, DQ_STALE_AFTER_SEC } from "./dataQuality.js";
 import { getSessionKindForDate } from "./marketCalendar.js";
 import { TRAP_SHADOW_ENV_KEYS } from "./trapShadow.js";
+import { measurePlanCall, getPlanDocConfig, PLAN_DOC_ENV_KEYS } from "./planDocShadow.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -70,6 +71,7 @@ export const HIT_RULES = {
   SIGNAL: "Futures-equivalent T1 is reached before the stop, within the same session (approved and vetoed alike).",
   CANDIDATE: "Same rule as SIGNAL: futures-equivalent T1 is reached before the stop, within the same session. Shadow candidate alerts judged against the real option chain — no orders, no Telegram.",
   TRADE: "The Algo-reported rupee result is above zero, counted only when the Algo says every account's exit price is known.",
+  PLAN_DOC: "Plan document (Gemini) half-day call vs the futures move over its window (first tick at/after the start → last tick at/before the end, ±0.15% band): BULLISH = UP, BEARISH = DOWN, RANGE = FLAT. UNPARSED calls are not scored. Compare with the outcome mix (base rate). Shadow — feeds nothing.",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ const ENV_WHITELIST = [
   "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT",
   "CANDIDATE_SHADOW_ENABLED",
   ...TRAP_SHADOW_ENV_KEYS,
+  ...PLAN_DOC_ENV_KEYS,
 ];
 
 /**
@@ -311,6 +314,38 @@ export function buildCandidateEvent(rec, nowMs) {
   };
 }
 
+/**
+ * PLAN_DOC events from a stored plan-document snapshot (src/planDocShadow.js buildPlanSnapshot):
+ * one per parsed half-day call. Shadow only — measured by measurePlanCall, never in Telegram.
+ */
+export function buildPlanEvents(snapshot) {
+  const calls = snapshot?.parsed?.calls;
+  const date = String(snapshot?.date || "");
+  if (!Array.isArray(calls) || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return [];
+  const dayStartUtc = Date.parse(`${date}T00:00:00Z`);
+  const late = Boolean(snapshot.late);
+  return calls.filter((c) => c && ["FIRST", "SECOND", "FULL"].includes(c.half) && Number.isFinite(Number(c.startMins))).map((c) => {
+    const startMins = Number(c.startMins);
+    return {
+      id: `PLAN_DOC:${c.half}:${startMins}:`,
+      key: c.half,
+      t: dayStartUtc + (startMins - 330) * 60000,
+      time: hhmm(startMins),
+      minutes: startMins,
+      section: "PLAN_DOC",
+      type: c.half,
+      direction: c.call === "BULLISH" || c.call === "BEARISH" ? c.call : null,
+      futPrice: null,
+      spot: null,
+      data: {
+        half: c.half, call: c.call, phrase: c.phrase ?? null, reason: c.reason ?? null, conviction: snapshot.parsed?.conviction ?? null,
+        startMins, endMins: Number(c.endMins), late, source: snapshot.source ?? null,
+      },
+      dq: { ok: true, text: late ? "late snapshot (dashboard cache read at the first live poll, not before the open)" : null },
+    };
+  });
+}
+
 /** TRADE event (Algo-owned intraday exit or carry exit) with the Algo's rupee result. */
 export function buildTradeEvent({ kind, tradeId, exitGrade, direction, entry, exitPrice, pnlInr, pnlKnown, accountsCount, nowMs }) {
   const ist = istOf(nowMs);
@@ -507,6 +542,8 @@ export function measureEvent(event, series, cfg = getScorecardConfig()) {
     return { status: "UNMEASURABLE", reason: d.pnlInr == null ? "₹ result not reported by the Algo" : "₹ result incomplete (an account's exit price unknown)" };
   }
   if (event.section === "EOD") return { status: "PENDING", reason: "waiting for the next session's 09:20 futures price" };
+  // Plan document: own window rule (start → end of the half), independent of event.minutes.
+  if (event.section === "PLAN_DOC") return measurePlanCall(event.data || {}, series, { bandPct: cfg?.planBandPct ?? getPlanDocConfig().bandPct });
   return measureDirectional(event, series, { bandPct: cfg.bandPct });
 }
 
@@ -557,7 +594,23 @@ export function statsFor(rows, { minSample = SC_MIN_SAMPLE } = {}) {
   };
 }
 
-const SECTIONS = ["FUSION", "TURN", "RADAR", "TRAP_SHADOW", "EOD", "EOD_SLOT", "SIGNAL", "CANDIDATE", "TRADE"];
+const SECTIONS = ["FUSION", "TURN", "RADAR", "TRAP_SHADOW", "EOD", "EOD_SLOT", "SIGNAL", "CANDIDATE", "TRADE", "PLAN_DOC"];
+export const PLAN_DOC_HALVES = ["FIRST", "SECOND", "FULL"];
+export const PLAN_DOC_CALLS = ["BULLISH", "BEARISH", "RANGE"];
+export const PLAN_DOC_CONVICTIONS = ["HIGHEST", "HIGH", "MEDIUM", "LOW"];
+
+/** UP / DOWN / FLAT counts over every measured plan window (scored or not): the base rate. */
+export function planOutcomeMix(rows) {
+  const mix = { UP: 0, DOWN: 0, FLAT: 0, windows: 0 };
+  for (const r of rows) {
+    const o = r.outcome?.outcome;
+    if ((r.outcome?.status === "MEASURED" || r.outcome?.status === "NOT_SCORED") && (o === "UP" || o === "DOWN" || o === "FLAT")) {
+      mix[o]++;
+      mix.windows++;
+    }
+  }
+  return mix;
+}
 export const CANDIDATE_SC_CATEGORIES = ["CONFIRMED", "UNCONFIRMED", "REJECTED", "UNVERIFIABLE"];
 export const CANDIDATE_SC_GRADES = ["SYNERGY_BULL_CAND", "SYNERGY_BEAR_CAND", "BEAR_TRAP_BUY_CAND", "BULL_TRAP_SELL_CAND"];
 
@@ -579,6 +632,15 @@ export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = tru
     if (sec === "CANDIDATE") {
       out.sections[sec].byCategory = Object.fromEntries(CANDIDATE_SC_CATEGORIES.map((c) => [c, statsFor(r.filter((x) => x.event.data?.category === c), { minSample })]));
       out.sections[sec].byGrade = Object.fromEntries(CANDIDATE_SC_GRADES.map((g) => [g, statsFor(r.filter((x) => x.event.type === g), { minSample })]));
+    }
+    if (sec === "PLAN_DOC") {
+      const s = out.sections[sec];
+      s.notScored = r.filter((x) => x.outcome?.status === "NOT_SCORED").length;
+      s.late = r.filter((x) => x.event.data?.late === true).length;
+      s.byHalf = Object.fromEntries(PLAN_DOC_HALVES.map((h) => [h, statsFor(r.filter((x) => x.event.data?.half === h), { minSample })]));
+      s.byCall = Object.fromEntries(PLAN_DOC_CALLS.map((c) => [c, statsFor(r.filter((x) => x.event.data?.call === c), { minSample })]));
+      s.byConviction = Object.fromEntries(PLAN_DOC_CONVICTIONS.map((c) => [c, statsFor(r.filter((x) => x.event.data?.conviction === c), { minSample })]));
+      s.outcomeMix = planOutcomeMix(r);
     }
   }
   return out;
@@ -628,8 +690,9 @@ const plain = (v) => String(v ?? "").replace(/[_*`[\]]/g, " ").replace(/\s+/g, "
 const gapList = (gaps) => { const g = (gaps || []).map((x) => `${x.from}–${x.to}`); return g.length > 6 ? `${g.slice(0, 6).join(", ")} … (${g.length - 6} more)` : g.join(", "); };
 
 export function formatDailyTelegram(doc) {
-  // Shadow candidates are never part of the Telegram message (not even in the unmeasurable count).
-  const rows = rowsOf(doc).filter((x) => x.ev.section !== "CANDIDATE");
+  // Shadow candidates and plan-document calls are never part of the Telegram message (not even in
+  // the unmeasurable count).
+  const rows = rowsOf(doc).filter((x) => x.ev.section !== "CANDIDATE" && x.ev.section !== "PLAN_DOC");
   const lines = [`📊 *Scorecard ${doc.date}*${doc.backfilled ? " (backfilled)" : ""}`];
   const dq = doc.dataQuality;
   lines.push(`• *Data:* ${dq ? `${dq.state} · ${dq.coveragePct ?? "?"}% coverage${dq.gaps?.length ? ` · gaps ${gapList(dq.gaps)}` : ""}` : "unknown"}`);
@@ -676,12 +739,13 @@ const csvEsc = (v) => {
 };
 
 export function dayToCsv(doc, { authed = false } = {}) {
-  const head = ["date", "time", "section", "type", "direction", "futPrice", "status", "hit", "reason", "m15_pts", "m30_pts", "m60_pts", "close_pts", "mfe60_pts", "mae60_pts", "band60_first", "signal_first", "eod_move0920_pct", "pnlInr", "dq_ok", "data"];
+  const head = ["date", "time", "section", "type", "direction", "futPrice", "status", "hit", "reason", "m15_pts", "m30_pts", "m60_pts", "close_pts", "mfe60_pts", "mae60_pts", "band60_first", "signal_first", "eod_move0920_pct", "pnlInr", "dq_ok", "data", "plan_move_pct", "plan_outcome"];
   const rows = rowsOf(doc).map(({ ev, out }) => [
     doc.date, ev.time, ev.section, ev.type, ev.direction, ev.futPrice, out?.status, out?.hit, out?.reason,
     out?.horizons?.[15]?.pts, out?.horizons?.[30]?.pts, out?.horizons?.[60]?.pts, out?.horizons?.close?.pts,
     out?.excursion60?.mfePts, out?.excursion60?.maePts, out?.band60?.first, out?.first, out?.move0920Pct,
     authed ? ev.data?.pnlInr : null, ev.dq?.ok, ev.section === "TRADE" && !authed ? { ...ev.data, pnlInr: undefined, accounts: undefined } : ev.data,
+    ev.section === "PLAN_DOC" ? out?.movePct : null, ev.section === "PLAN_DOC" ? out?.outcome : null,
   ]);
   return [head.join(","), ...rows.map((r) => r.map(csvEsc).join(","))].join("\n");
 }
@@ -697,6 +761,11 @@ export function aggregateToCsv(agg) {
     for (const [k, v] of Object.entries(s.byVariant || {})) out.push(line(sec, `variant:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byCategory || {})) out.push(line(sec, `category:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byGrade || {})) out.push(line(sec, `grade:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byHalf || {})) out.push(line(sec, `half:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byCall || {})) out.push(line(sec, `call:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byConviction || {})) out.push(line(sec, `conviction:${k}`, v).map(csvEsc).join(","));
+    // Base rate: windows (events column) whose futures move was UP / DOWN / FLAT.
+    if (s.outcomeMix) for (const k of ["UP", "DOWN", "FLAT"]) out.push([sec, `outcome:${k}`, "", s.outcomeMix[k]].map(csvEsc).join(","));
   }
   return out.join("\n");
 }
