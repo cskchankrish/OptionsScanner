@@ -5,6 +5,8 @@ import {
   sanitizeEodHistory,
   reconcileEodHistory,
   runEodHistoryRepairOnce,
+  repairEodHistory,
+  repairEodHistoryV2,
 } from "../src/eodTrackRecord.js";
 import {
   parseNseFuturesPayload,
@@ -892,8 +894,23 @@ export function calculateDeltaPcr(totPutWriting, totCallWriting) {
 // tries the claim once, so the timeline reads happen only on the one repairing refresh.
 // DISPLAY / HISTORY ONLY — nothing reads eodHistory back into a decision.
 export const EOD_HISTORY_REPAIR_KEY = "nifty_eod_history_repair_v1";
+// Second repair: undoes the first repair's entry prices taken from the 15:15–15:30 frozen spot
+// (repairEodHistoryV2). Runs after v1's check, so a fresh database is correct in one pass.
+export const EOD_HISTORY_REPAIR_V2_KEY = "nifty_eod_history_repair_v2";
 const EOD_HISTORY_REPAIR_TTL_SEC = 180 * 86400;
 let eodRepairChecked = false;
+let eodRepairV2Checked = false;
+
+function eodRepairTimelineReader(todayIso, timeline) {
+  return async (iso) => {
+    if (iso === todayIso) return Array.isArray(timeline) ? timeline : [];
+    for (const k of timelineKeysFor(iso)) {
+      const t = await redisRestGet(k);
+      if (Array.isArray(t) && t.length) return t;
+    }
+    return [];
+  };
+}
 
 export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision, timeline = [] }) {
   const todayIso = getISTIsoDateStr();
@@ -915,7 +932,7 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     return sanitizeEodHistory(history, { limit: 60 });
   }
 
-  let repairRan = false;
+  const repairKeysRan = [];
   if (REDIS_URL && REDIS_TOKEN && !eodRepairChecked) {
     eodRepairChecked = true;
     const repair = await runEodHistoryRepairOnce({
@@ -923,22 +940,35 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
       todayIso,
       claim: () => redisRestSetNx(EOD_HISTORY_REPAIR_KEY, JSON.stringify({ at: Date.now() }), EOD_HISTORY_REPAIR_TTL_SEC),
       release: () => redisRestDel(EOD_HISTORY_REPAIR_KEY),
-      getTimelineForDate: async (iso) => {
-        if (iso === todayIso) return Array.isArray(timeline) ? timeline : [];
-        for (const k of timelineKeysFor(iso)) {
-          const t = await redisRestGet(k);
-          if (Array.isArray(t) && t.length) return t;
-        }
-        return [];
-      },
+      getTimelineForDate: eodRepairTimelineReader(todayIso, timeline),
+      repair: repairEodHistory,
     });
     if (repair.ran) {
-      repairRan = true;
+      repairKeysRan.push(EOD_HISTORY_REPAIR_KEY);
       history = repair.history;
       console.log(`EOD history repair: ${repair.changes.length} row(s) changed, dropped ${repair.dropped.join(", ") || "none"}`);
     } else if (repair.error) {
       console.warn("EOD history repair skipped:", repair.error);
       if (repair.error.startsWith("claim failed")) eodRepairChecked = false; // Redis unreachable: try again later
+    }
+  }
+  if (REDIS_URL && REDIS_TOKEN && !eodRepairV2Checked) {
+    eodRepairV2Checked = true;
+    const repair = await runEodHistoryRepairOnce({
+      history,
+      todayIso,
+      claim: () => redisRestSetNx(EOD_HISTORY_REPAIR_V2_KEY, JSON.stringify({ at: Date.now() }), EOD_HISTORY_REPAIR_TTL_SEC),
+      release: () => redisRestDel(EOD_HISTORY_REPAIR_V2_KEY),
+      getTimelineForDate: eodRepairTimelineReader(todayIso, timeline),
+      repair: repairEodHistoryV2,
+    });
+    if (repair.ran) {
+      repairKeysRan.push(EOD_HISTORY_REPAIR_V2_KEY);
+      history = repair.history;
+      console.log(`EOD history repair v2: ${repair.changes.length} row(s) changed`);
+    } else if (repair.error) {
+      console.warn("EOD history repair v2 skipped:", repair.error);
+      if (repair.error.startsWith("claim failed")) eodRepairV2Checked = false;
     }
   }
 
@@ -960,9 +990,12 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   });
 
   if (REDIS_URL) {
-    if (repairRan) {
+    if (repairKeysRan.length) {
       const saved = await saveRedisEodHistory(history);
-      if (!saved) await redisRestDel(EOD_HISTORY_REPAIR_KEY); // not persisted: let a later refresh repair again
+      if (!saved) {
+        // Not persisted: release the markers so a later refresh repairs again.
+        for (const k of repairKeysRan) await redisRestDel(k);
+      }
     } else {
       saveRedisEodHistory(history).catch(() => {});
     }

@@ -535,9 +535,9 @@ export function isSessionDate(isoDate) {
 /** Open / close / finalisation minutes (IST) of a session date; nulls for a closed date. */
 export function eodSessionTimes(isoDate) {
   const kind = getSessionKindForDate(isoDate);
-  if (kind === "MUHURAT") return { kind, openMins: 840, closeMins: 960, closeSpotMins: 960, finalMins: EOD_FINAL_MINS_MUHURAT, closeTimeStr: "16:00" };
-  if (kind === "WEEKDAY") return { kind, openMins: 555, closeMins: 940, closeSpotMins: 930, finalMins: EOD_FINAL_MINS_WEEKDAY, closeTimeStr: "15:40" };
-  return { kind, openMins: null, closeMins: null, closeSpotMins: null, finalMins: null, closeTimeStr: null };
+  if (kind === "MUHURAT") return { kind, openMins: 840, closeMins: 960, finalMins: EOD_FINAL_MINS_MUHURAT, closeTimeStr: "16:00" };
+  if (kind === "WEEKDAY") return { kind, openMins: 555, closeMins: 940, finalMins: EOD_FINAL_MINS_WEEKDAY, closeTimeStr: "15:40" };
+  return { kind, openMins: null, closeMins: null, finalMins: null, closeTimeStr: null };
 }
 
 /** The next session date after isoDate by the calendar (closed weekend days skipped; exchange holidays are not modelled). */
@@ -630,12 +630,44 @@ export function sessionOpenTick(timeline, isoDate) {
   return { spot: Number(first.spot), minutes: m, time: first.time || hhmmOf(m) };
 }
 
-/** Closing spot of a session: last real tick at or before 15:30 (Muhurat: its 16:00 session close). */
-export function sessionCloseSpot(timeline, isoDate) {
+/** NSE closing-auction freeze of the spot index (src/flowCalc.js SPOT_FREEZE_START_MINS / _END_MINS). */
+export const EOD_SPOT_FREEZE_START_MINS = 915; // 15:15
+export const EOD_SPOT_FREEZE_END_MINS = 930; // 15:30 (exclusive): the closing print appears from here
+
+/**
+ * The spot value repeated across the 15:15–15:29 freeze-window ticks (the most frequent value;
+ * ties → the later one), or null when the window has no real tick.
+ */
+export function frozenWindowSpot(timeline) {
+  const ticks = realTicksAsc(timeline, EOD_SPOT_FREEZE_START_MINS, EOD_SPOT_FREEZE_END_MINS - 1);
+  if (!ticks.length) return null;
+  const counts = new Map();
+  let best = null;
+  let bestCount = 0;
+  for (const pt of ticks) {
+    const v = Number(pt.spot);
+    const c = (counts.get(v) || 0) + 1;
+    counts.set(v, c);
+    if (c >= bestCount) { best = v; bestCount = c; }
+  }
+  return best;
+}
+
+/**
+ * The day's closing print (weekday sessions only): the LAST real tick (not synthetic,
+ * isLiveTick !== false, spot > 0) with 15:30 ≤ minutes ≤ the 15:40 session close that is not
+ * flagged `spotFrozen` and whose spot differs from the freeze-window value (older days carry no
+ * flag). Never a tick inside 15:15–15:29. Null when no such tick exists, and always null for the
+ * Muhurat date (its auction window is not modelled) — the caller then keeps the stored entry.
+ * @returns {{ spot: number, minutes: number, time: string } | null}
+ */
+export function sessionClosingPrint(timeline, isoDate) {
   const t = eodSessionTimes(isoDate);
-  if (t.openMins == null) return null;
-  const ticks = realTicksAsc(timeline, t.openMins, t.closeSpotMins);
-  const last = ticks[ticks.length - 1];
+  if (t.kind !== "WEEKDAY") return null;
+  const frozen = frozenWindowSpot(timeline);
+  const candidates = realTicksAsc(timeline, EOD_SPOT_FREEZE_END_MINS, t.closeMins)
+    .filter(pt => pt.spotFrozen !== true && (frozen == null || Number(pt.spot) !== frozen));
+  const last = candidates[candidates.length - 1];
   if (!last) return null;
   const m = tickMinutes(last);
   return { spot: Number(last.spot), minutes: m, time: last.time || hhmmOf(m) };
@@ -825,76 +857,152 @@ export function reconcileEodHistory({ history, todayIso, nowMins, timeStr, dayNa
   return sortEodRowsDesc(rows).slice(0, limit);
 }
 
-// ── One-off repair of stored rows ────────────────────────────────────────────
+// ── One-off repairs of stored rows ───────────────────────────────────────────
+//
+// Entry-price rule (both repairs): a repaired row's entrySpot becomes the day's CLOSING PRINT
+// (sessionClosingPrint: the last real, non-frozen tick from 15:30 to the 15:40 close). If there is
+// no such tick, or the date is the Muhurat session, the stored entry is kept. A tick inside the
+// 15:15–15:30 closing-auction freeze is never used (the first repair originally did — fixed here;
+// repairEodHistoryV2 undoes what it changed in production).
+// Rows written by the current repair carry `repairVersion: 2`.
 
+export const EOD_REPAIR_VERSION = 2;
 const REPAIR_VERDICT_NOTE = "Verdict as last recorded that day (not known whether it was the 15:38 final).";
 
 function fmtPts(n) {
   return Number.isFinite(Number(n)) && Number(n) > 0 ? String(Number(n)) : "none";
 }
 
-async function repairEodRow(row, { tl, todayIso }) {
-  if (row.source === "seed" || row.isoDate < EOD_RECORDED_FROM_ISO) return { row, change: null };
-  if (todayIso && row.isoDate >= todayIso) return { row, change: null };
-  if (row.provisional === true || row.outcome === "IN_PROGRESS") return { row, change: null };
-  const carry = row.bias === "BULLISH" || row.bias === "BEARISH";
-  if (row.outcome !== "PRESERVED_CASH") return { row, change: null };
+function signedPts(n) {
+  const v = round2(n);
+  return `${v >= 0 ? "+" : ""}${v}`;
+}
 
-  const own = await tl(row.isoDate);
-  const close = sessionCloseSpot(own, row.isoDate);
-  const oldEntry = Number(row.entrySpot);
+function describeEntry(entry, print, kind) {
+  if (print) return `entry ${fmtPts(entry)} = that day's closing print (${print.time} tick, after the 15:15–15:30 closing-auction freeze)`;
+  const why = kind === "MUHURAT"
+    ? "Muhurat session: no closing print derived"
+    : "no post-15:30 closing print in that day's timeline";
+  return `entry ${fmtPts(entry)} as originally recorded (${why})`;
+}
 
-  if (!carry) {
-    if (close && (!(oldEntry > 0) || Math.abs(close.spot - oldEntry) > 1)) {
-      const what = `entry spot ${fmtPts(oldEntry)} → ${close.spot} (that day's close, ${close.time} tick)`;
-      return {
-        row: { ...row, entrySpot: close.spot, repaired: true, notes: `Repaired: ${what}; the stored price was not that day's close.${row.notes ? ` ${row.notes}` : ""}` },
-        change: { id: row.id, what },
-      };
-    }
-    return { row, change: null };
+function describeOutcome(row) {
+  const rf = row.resolvedFrom;
+  const side = row.bias === "BULLISH" ? "BTST" : row.bias === "BEARISH" ? "STBT" : "carry";
+  if (row.outcome === "WIN" || row.outcome === "LOSS") {
+    const where = rf && rf.date ? ` (${rf.date}${rf.time ? ` ${rf.time}` : ""} tick)` : "";
+    return `${row.outcome} — next-session open ${row.nextDayOpen}${where}, index gap ${signedPts(Number(row.nextDayOpen) - Number(row.entrySpot))} pts = ${signedPts(row.gapPts)} pts for the ${side}`;
   }
+  if (row.outcome === "UNRESOLVED") return `UNRESOLVED — ${EOD_OPEN_NOT_AVAILABLE_NOTE}`;
+  if (row.outcome === "PENDING") return "PENDING — awaiting the next session's opening tick";
+  if (row.outcome === "PRESERVED_CASH") return "PRESERVED_CASH — no carry";
+  return String(row.outcome);
+}
 
-  // Carry call stored as PRESERVED_CASH (outcome kept from an earlier NEUTRAL snapshot).
-  const parts = [];
-  let entry = oldEntry;
-  if (close && (!(oldEntry > 0) || Math.abs(close.spot - oldEntry) > 0.001)) {
-    parts.push(`entry spot ${fmtPts(oldEntry)} → ${close.spot} (that day's close, ${close.time} tick)`);
-    entry = close.spot;
-  }
-  const base = { ...row, entrySpot: entry > 0 ? entry : row.entrySpot, repaired: true };
-  const next = nextSessionDate(row.isoDate);
+function composeRepairNote(row, { print, kind, extras = [] }) {
+  const extra = extras.filter(Boolean);
+  return `Repaired: ${describeEntry(row.entrySpot, print, kind)}${extra.length ? ` (${extra.join("; ")})` : ""}; outcome ${describeOutcome(row)}. ${REPAIR_VERDICT_NOTE}`;
+}
+
+/** Score an open carry row (entry already set) from its next session — shared by both repairs. */
+async function resolveRepairedCarry(base, { tl, todayIso }) {
+  const next = nextSessionDate(base.isoDate);
   let result;
   if (!next) {
-    result = { status: "UNRESOLVED", row: { ...base, outcome: "UNRESOLVED", nextDayOpen: null, gapPts: null, notes: capitalise(EOD_OPEN_NOT_AVAILABLE_NOTE) + "." } };
+    result = { status: "UNRESOLVED", row: { ...base, outcome: "UNRESOLVED", nextDayOpen: null, gapPts: null } };
   } else if (todayIso && next > todayIso) {
     result = { status: "WAITING", row: base };
   } else {
     const sessionOver = !(todayIso && next === todayIso);
     result = resolveOpenFromTimeline(base, next, await tl(next), { sessionOver });
   }
-  let outRow = result.row;
   if (result.status === "WAITING") {
-    outRow = { ...outRow, outcome: "PENDING", nextDayOpen: null, gapPts: null, notes: "Awaiting the next session's opening tick." };
+    return { ...result.row, outcome: "PENDING", nextDayOpen: null, gapPts: null };
   }
-  parts.push(`outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → ${outRow.outcome}${outRow.resolvedFrom ? ` from the ${outRow.resolvedFrom.date} ${outRow.resolvedFrom.time} opening tick` : ""}`);
-  const what = parts.join("; ");
+  return result.row;
+}
+
+async function repairEodRow(row, { tl, todayIso }) {
+  if (row.source === "seed" || row.isoDate < EOD_RECORDED_FROM_ISO) return { row, change: null };
+  if (todayIso && row.isoDate >= todayIso) return { row, change: null };
+  if (row.provisional === true || row.outcome === "IN_PROGRESS") return { row, change: null };
+  if (row.outcome !== "PRESERVED_CASH") return { row, change: null };
+  const carry = row.bias === "BULLISH" || row.bias === "BEARISH";
+  const kind = eodSessionTimes(row.isoDate).kind;
+  const oldEntry = Number(row.entrySpot);
+
+  if (!carry) {
+    if (kind !== "WEEKDAY") return { row, change: null };
+    const print = sessionClosingPrint(await tl(row.isoDate), row.isoDate);
+    if (print && (!(oldEntry > 0) || Math.abs(print.spot - oldEntry) > 1)) {
+      const out = { ...row, entrySpot: print.spot, repaired: true, repairVersion: EOD_REPAIR_VERSION };
+      out.notes = composeRepairNote(out, { print, kind, extras: [`stored entry ${fmtPts(oldEntry)} was not that day's closing print`] });
+      return { row: out, change: { id: row.id, what: `entry ${fmtPts(oldEntry)} → ${print.spot} (closing print, ${print.time})` } };
+    }
+    return { row, change: null };
+  }
+
+  // Carry call stored as PRESERVED_CASH (outcome kept from an earlier no-carry snapshot).
+  const print = kind === "WEEKDAY" ? sessionClosingPrint(await tl(row.isoDate), row.isoDate) : null;
+  const entry = print ? print.spot : oldEntry;
+  const entryChanged = print && (!(oldEntry > 0) || Math.abs(print.spot - oldEntry) > 0.001);
+  const base = { ...row, entrySpot: entry > 0 ? entry : row.entrySpot, repaired: true, repairVersion: EOD_REPAIR_VERSION };
+  const out = await resolveRepairedCarry(base, { tl, todayIso });
+  out.notes = composeRepairNote(out, {
+    print,
+    kind,
+    extras: [entryChanged ? `stored entry was ${fmtPts(oldEntry)}` : null, "the stored PRESERVED_CASH outcome had been kept from an earlier no-carry snapshot"],
+  });
   return {
-    row: { ...outRow, repaired: true, notes: `Repaired: ${what}. ${REPAIR_VERDICT_NOTE} ${outRow.notes || ""}`.trim() },
-    change: { id: row.id, what },
+    row: out,
+    change: { id: row.id, what: `${entryChanged ? `entry ${fmtPts(oldEntry)} → ${entry}; ` : ""}outcome PRESERVED_CASH → ${out.outcome}` },
   };
 }
 
-/**
- * One-off repair of already-stored rows (I/O injected: getTimelineForDate(isoDate) → ticks[]):
- * drops non-session rows; for recorded rows from 2026-11-07 on, re-scores carry calls stored as
- * PRESERVED_CASH (entry = that day's close when its timeline exists; WIN/LOSS from the next
- * session's opening tick, else UNRESOLVED) and corrects NEUTRAL rows whose entry differs from that
- * day's close by more than 1 point. Seed rows are never modified. Idempotent.
- * Throws if the timeline reader throws (the caller keeps the unrepaired history).
- * @returns {Promise<{ history: object[], changes: {id, what}[], dropped: string[] }>}
- */
-export async function repairEodHistory({ history, getTimelineForDate, todayIso = null }) {
+/** "entry spot <original> → <replaced>" from a first-repair note, or null when absent/unparsable. */
+export function parseV1EntryChange(notes) {
+  const m = /entry spot (\d+(?:\.\d+)?) → (\d+(?:\.\d+)?)/.exec(String(notes || ""));
+  if (!m) return null;
+  const original = Number(m[1]);
+  const replaced = Number(m[2]);
+  if (!(original > 0) || !(replaced > 0)) return null;
+  return { original, replaced };
+}
+
+async function repairEodRowV2(row, { tl, todayIso }) {
+  if (row.repaired !== true || row.repairVersion === EOD_REPAIR_VERSION || isSeedRow(row)) return { row, change: null };
+  const parsed = parseV1EntryChange(row.notes);
+  if (!parsed) return { row, change: null }; // the first repair did not change this row's entry (or the note is unreadable)
+  const kind = eodSessionTimes(row.isoDate).kind;
+  const print = kind === "WEEKDAY" ? sessionClosingPrint(await tl(row.isoDate), row.isoDate) : null;
+  const entry = print ? print.spot : parsed.original;
+  let out = { ...row, entrySpot: entry, repaired: true, repairVersion: EOD_REPAIR_VERSION };
+
+  if (isCarryRow(row)) {
+    if (Number(row.nextDayOpen) > 0) {
+      // Re-score from the stored next-session open (no timeline read).
+      const rf = row.resolvedFrom || null;
+      const resolved = resolveRowFromOpenTick(out, { spot: Number(row.nextDayOpen), time: rf?.time || null, minutes: null }, rf?.date || nextSessionDate(row.isoDate));
+      if (resolved) out = { ...resolved, resolvedFrom: rf || { date: nextSessionDate(row.isoDate), time: null, source: "stored-open" } };
+    } else if (row.outcome === "UNRESOLVED") {
+      out = { ...out, nextDayOpen: null, gapPts: null };
+    } else if (row.outcome === "PENDING" || row.outcome === "PRESERVED_CASH") {
+      out = await resolveRepairedCarry(out, { tl, todayIso });
+    }
+  }
+
+  const extras = [`originally recorded entry ${parsed.original}`];
+  if (Math.abs(parsed.replaced - entry) > 0.001) {
+    extras.push(`an earlier repair had set ${parsed.replaced} from a tick at or before 15:30, before the closing print`);
+  }
+  out.notes = composeRepairNote(out, { print, kind, extras });
+  return {
+    row: out,
+    change: { id: row.id, what: `entry ${fmtPts(row.entrySpot)} → ${entry}; outcome ${row.outcome} → ${out.outcome}` },
+  };
+}
+
+async function runRowRepair(history, rowFn, getTimelineForDate, todayIso) {
   const input = Array.isArray(history) ? history : [];
   const dropped = input
     .map(r => eodRowIso(r))
@@ -911,7 +1019,7 @@ export async function repairEodHistory({ history, getTimelineForDate, todayIso =
   const out = [];
   const changes = [];
   for (const row of rows) {
-    const { row: next, change } = await repairEodRow(row, { tl, todayIso });
+    const { row: next, change } = await rowFn(row, { tl, todayIso });
     out.push(next);
     if (change) changes.push(change);
   }
@@ -919,10 +1027,34 @@ export async function repairEodHistory({ history, getTimelineForDate, todayIso =
 }
 
 /**
- * Run the repair at most once (claim = atomic marker, e.g. Redis SET NX). If the repair throws the
+ * The current one-off repair (marker nifty_eod_history_repair_v1) — I/O injected:
+ * getTimelineForDate(isoDate) → ticks[]. Drops non-session rows; for recorded rows from 2026-11-07
+ * on, re-scores carry calls stored as PRESERVED_CASH (entry = the day's closing print when one
+ * exists, else the stored entry; WIN/LOSS from the next session's opening tick, else UNRESOLVED)
+ * and corrects NEUTRAL rows whose entry differs from the closing print by more than 1 point.
+ * Seed rows are never modified. Idempotent. Throws if the timeline reader throws.
+ * @returns {Promise<{ history: object[], changes: {id, what}[], dropped: string[] }>}
+ */
+export async function repairEodHistory({ history, getTimelineForDate, todayIso = null }) {
+  return runRowRepair(history, repairEodRow, getTimelineForDate, todayIso);
+}
+
+/**
+ * Second one-off repair (marker nifty_eod_history_repair_v2): for rows the first repair marked
+ * `repaired` and whose entry it changed (note "entry spot <orig> → <new>"), restore the entry under
+ * the closing-print rule starting from the original value, re-score from the stored nextDayOpen
+ * (a timeline is read only for an open row that is resolvable), rewrite the note, set
+ * repairVersion 2. Rows without that note, or already at version 2, are left alone. Idempotent.
+ */
+export async function repairEodHistoryV2({ history, getTimelineForDate, todayIso = null }) {
+  return runRowRepair(history, repairEodRowV2, getTimelineForDate, todayIso);
+}
+
+/**
+ * Run a repair at most once (claim = atomic marker, e.g. Redis SET NX). If the repair throws the
  * marker is released and the ORIGINAL history is returned unchanged; never throws.
  */
-export async function runEodHistoryRepairOnce({ history, claim, release, getTimelineForDate, todayIso = null }) {
+export async function runEodHistoryRepairOnce({ history, claim, release, getTimelineForDate, todayIso = null, repair = repairEodHistory }) {
   let claimed = false;
   try {
     claimed = Boolean(await claim());
@@ -931,7 +1063,7 @@ export async function runEodHistoryRepairOnce({ history, claim, release, getTime
   }
   if (!claimed) return { history, ran: false };
   try {
-    const r = await repairEodHistory({ history, getTimelineForDate, todayIso });
+    const r = await repair({ history, getTimelineForDate, todayIso });
     return { history: r.history, ran: true, changes: r.changes, dropped: r.dropped };
   } catch (e) {
     try { await release(); } catch (_) {}

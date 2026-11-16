@@ -27,7 +27,10 @@ const {
   computeEodTrackStats,
   formatEodWinRate,
   sessionOpenTick,
-  sessionCloseSpot,
+  sessionClosingPrint,
+  frozenWindowSpot,
+  repairEodHistoryV2,
+  parseV1EntryChange,
   isSeedRow,
   eodUnresolvedLabel,
 } = await import("../src/eodTrackRecord.js");
@@ -73,18 +76,31 @@ function productionFixture() {
   return [...recorded, nov6, ...seeds];
 }
 
-// Injected timelines: 11-Nov closes 25255.05; 12-Nov opens 25213.5 (closes 25299.35);
-// 13-Nov opens 25209.85 (closes 25144.3). Nothing recorded for 08, 09 or 10-Nov.
+// Spot frozen during the 15:15–15:30 closing auction; the closing print appears after 15:30.
+function frozenRun(from, to, spot, extra = {}) {
+  const out = [];
+  for (let m = from; m <= to; m++) out.push(tick(`15:${String(m).padStart(2, "0")}`, spot, extra));
+  return out;
+}
+
+// Injected timelines in the recorded production shapes:
+// 11-Nov: 15:16–15:25 frozen at 25130 (NOT flagged — older day), close print 25255.05 at 15:36.
+// 12-Nov: opens 25213.5; 15:17–15:28 frozen at 25275.25 (flagged), close print 25299.35 at 15:31.
+// 13-Nov: opens 25209.85, close print 25144.3. 09-Nov: only frozen-window ticks (no print).
+// Nothing recorded for 08 or 10-Nov.
 const TIMELINES = {
-  "2026-11-11": [tick("09:15", 25180), tick("12:00", 25230), tick("15:30", 25255.05), tick("15:40", 25260, { isLiveTick: false })],
+  // 09-Nov recording started late (11:00), so it carries no usable opening tick for 08-Nov.
+  "2026-11-09": [tick("11:00", 24990), ...frozenRun(20, 29, 25003.65, { spotFrozen: true })],
+  "2026-11-11": [tick("09:15", 25180), tick("12:00", 25230), ...frozenRun(16, 25, 25130), tick("15:36", 25255.05), tick("15:40", 25260, { isLiveTick: false })],
   "2026-11-12": [
     tick("09:15", 99999, { synthetic: true, isLiveTick: false }),
     tick("09:15", 88888, { isLiveTick: false }),
     tick("09:15", 25213.5),
     tick("11:00", 25260),
-    tick("15:30", 25299.35),
+    ...frozenRun(17, 28, 25275.25, { spotFrozen: true }),
+    tick("15:31", 25299.35),
   ],
-  "2026-11-13": [tick("09:15", 25209.85), tick("13:00", 25180), tick("15:30", 25144.3)],
+  "2026-11-13": [tick("09:15", 25209.85), tick("13:00", 25180), tick("15:31", 25144.3)],
 };
 const getTimelineForDate = async (iso) => TIMELINES[iso] || [];
 
@@ -290,12 +306,42 @@ test("resolution: EVERY pending row is resolved from its own next session (not o
   assert.equal(resolvePendingEodRows([seed], { todayIso: "2026-11-16", todayTimeline: [] })[0], seed);
 });
 
-test("timeline helpers: open and close ticks (weekday 15:30 close, Muhurat session close)", () => {
+test("timeline helpers: open tick; closing print from the production shapes; Muhurat → null", () => {
   assert.equal(sessionOpenTick(TIMELINES["2026-11-12"], "2026-11-12").spot, 25213.5);
-  assert.equal(sessionCloseSpot(TIMELINES["2026-11-11"], "2026-11-11").spot, 25255.05);
+  assert.equal(sessionClosingPrint(TIMELINES["2026-11-11"], "2026-11-11").spot, 25255.05);
+  assert.equal(sessionClosingPrint(TIMELINES["2026-11-12"], "2026-11-12").spot, 25299.35);
   const muhurat = [tick("14:00", 24950), tick("15:30", 24970), tick("16:00", 24986.4)];
-  assert.equal(sessionCloseSpot(muhurat, "2026-11-08").spot, 24986.4);
+  assert.equal(sessionClosingPrint(muhurat, "2026-11-08"), null, "Muhurat: stored entry is kept");
   assert.equal(sessionOpenTick([], "2026-11-12"), null);
+});
+
+test("closing-print picker: flagged frozen window then 15:31 → 15:31 value", () => {
+  const tl = [tick("14:00", 25100), ...frozenRun(15, 29, 25000, { spotFrozen: true }), tick("15:31", 25050.5)];
+  const p = sessionClosingPrint(tl, "2026-11-12");
+  assert.equal(p.spot, 25050.5);
+  assert.equal(p.time, "15:31");
+});
+
+test("closing-print picker: unflagged repeated value then 15:36 (the 11-Nov shape) → 15:36 value; a post-15:30 tick still showing the frozen value is skipped", () => {
+  const tl = [...frozenRun(16, 25, 25130), tick("15:30", 25130), tick("15:36", 25255.05)];
+  assert.equal(sessionClosingPrint(tl, "2026-11-11").spot, 25255.05);
+  const stillFrozen = [...frozenRun(16, 25, 25130), tick("15:31", 25130)];
+  assert.equal(sessionClosingPrint(stillFrozen, "2026-11-11"), null);
+});
+
+test("closing-print picker: only freeze-window ticks → null; synthetic / isLiveTick:false / spotFrozen ignored", () => {
+  assert.equal(sessionClosingPrint(frozenRun(15, 29, 25000), "2026-11-12"), null);
+  assert.equal(sessionClosingPrint([tick("15:10", 25010), ...frozenRun(15, 29, 25000, { spotFrozen: true })], "2026-11-12"), null, "never a pre-15:30 tick");
+  const noise = [
+    ...frozenRun(15, 29, 25000, { spotFrozen: true }),
+    tick("15:33", 25040),
+    tick("15:35", 1, { synthetic: true }),
+    tick("15:38", 2, { isLiveTick: false }),
+    tick("15:39", 3, { spotFrozen: true }),
+    tick("15:45", 4), // after the 15:40 close
+  ];
+  assert.equal(sessionClosingPrint(noise, "2026-11-12").spot, 25040);
+  assert.equal(frozenWindowSpot(noise), 25000);
 });
 
 // ── Repair ───────────────────────────────────────────────────────────────────
@@ -361,7 +407,9 @@ test("repair: NEUTRAL row whose entry differs from that day's close by > 1 pt is
   const by = Object.fromEntries(out.map(r => [r.isoDate, r]));
   assert.equal(by["2026-11-10"].entrySpot, 25120.4);
   assert.equal(by["2026-11-10"].repaired, true);
-  assert.match(by["2026-11-10"].notes, /25044\.65 → 25120\.4/);
+  assert.match(by["2026-11-10"].notes, /entry 25120\.4 = that day's closing print \(15:30 tick/);
+  assert.match(by["2026-11-10"].notes, /stored entry 25044\.65 was not/);
+  assert.equal(by["2026-11-10"].repairVersion, 2);
   assert.equal(by["2026-11-13"].entrySpot, 25144.9, "0.6 pt difference left alone");
   assert.equal(changes.length, 1);
   const again = await repairEodHistory({ history: out, getTimelineForDate: async d => tls[d] || [] });
@@ -405,6 +453,126 @@ test("repair once: not claimed → no timeline read; claimed → repaired histor
   const claimErr = await runEodHistoryRepairOnce({ history: [], claim: async () => { throw new Error("x"); }, release: async () => {}, getTimelineForDate: reader });
   assert.equal(claimErr.ran, false);
   assert.match(claimErr.error, /^claim failed/);
+});
+
+// ── Second repair (v2): undo first-repair entries taken from the frozen spot ──
+
+const V1_TAIL = "Verdict as last recorded that day (not known whether it was the 15:38 final).";
+
+// Production state after the first (v1) repair ran with the frozen-tick entry rule.
+function productionAfterV1() {
+  const pre = productionFixture().filter(r => r.isoDate !== "2026-11-07" && r.isoDate !== "2026-11-15");
+  const replace = {
+    "2026-11-12": {
+      entrySpot: 25275.25, nextDayOpen: 25209.85, gapPts: -65.4, outcome: "LOSS", repaired: true,
+      resolvedFrom: { date: "2026-11-13", time: "09:15", source: "timeline-open" },
+      notes: `Repaired: entry spot 25299.35 → 25275.25 (that day's close, 15:28 tick); outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → LOSS from the 2026-11-13 09:15 opening tick. ${V1_TAIL} -65.4 pts morning gap on open`,
+    },
+    "2026-11-11": {
+      entrySpot: 25130, nextDayOpen: 25213.5, gapPts: -83.5, outcome: "LOSS", repaired: true,
+      resolvedFrom: { date: "2026-11-12", time: "09:15", source: "timeline-open" },
+      notes: `Repaired: entry spot 25255.05 → 25130 (that day's close, 15:25 tick); outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → LOSS from the 2026-11-12 09:15 opening tick. ${V1_TAIL} -83.5 pts gap-down on open`,
+    },
+    "2026-11-09": {
+      entrySpot: 25003.65, nextDayOpen: null, gapPts: null, outcome: "UNRESOLVED", repaired: true,
+      notes: `Repaired: entry spot 25044.65 → 25003.65 (that day's close, 15:29 tick); outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → UNRESOLVED. ${V1_TAIL} Next session's opening price not available (no recorded timeline for 2026-11-10).`,
+    },
+    "2026-11-08": {
+      nextDayOpen: null, gapPts: null, outcome: "UNRESOLVED", repaired: true,
+      notes: `Repaired: outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → UNRESOLVED. ${V1_TAIL} Next session's opening price not available (no recorded timeline for 2026-11-09).`,
+    },
+  };
+  return pre.map(r => (replace[r.isoDate] ? { ...r, ...replace[r.isoDate] } : r));
+}
+
+test("parseV1EntryChange reads the first repair's note", () => {
+  assert.deepEqual(parseV1EntryChange("Repaired: entry spot 25299.35 → 25275.25 (that day's close, 15:28 tick); …"), { original: 25299.35, replaced: 25275.25 });
+  assert.equal(parseV1EntryChange("Repaired: outcome PRESERVED_CASH → UNRESOLVED."), null);
+  assert.equal(parseV1EntryChange("Repaired: entry spot none → 25000 (…)"), null);
+});
+
+test("v2 on the production state: 12-Nov LOSS −89.5 at 25299.35, 11-Nov WIN at 25255.05, 09-Nov entry restored and UNRESOLVED, 08-Nov untouched", async () => {
+  const input = productionAfterV1();
+  const inputCopy = JSON.parse(JSON.stringify(input));
+  const reads = [];
+  const reader = async (d) => { reads.push(d); return TIMELINES[d] || []; };
+  const { history, changes } = await repairEodHistoryV2({ history: input, getTimelineForDate: reader, todayIso: "2026-11-16" });
+  assert.deepEqual(input, inputCopy, "input not mutated");
+  const by = Object.fromEntries(history.map(r => [r.isoDate, r]));
+
+  const r12 = by["2026-11-12"];
+  assert.equal(r12.entrySpot, 25299.35);
+  assert.equal(r12.nextDayOpen, 25209.85);
+  assert.equal(r12.gapPts, -89.5);
+  assert.equal(r12.outcome, "LOSS");
+  assert.equal(r12.repairVersion, 2);
+  assert.deepEqual(r12.resolvedFrom, { date: "2026-11-13", time: "09:15", source: "timeline-open" });
+  assert.match(r12.notes, /entry 25299\.35 = that day's closing print \(15:31 tick/);
+  assert.match(r12.notes, /an earlier repair had set 25275\.25/);
+  assert.match(r12.notes, /LOSS — next-session open 25209\.85 \(2026-11-13 09:15 tick\), index gap -89\.5 pts = -89\.5 pts for the BTST/);
+  assert.match(r12.notes, /Verdict as last recorded that day/);
+
+  const r11 = by["2026-11-11"];
+  assert.equal(r11.entrySpot, 25255.05);
+  assert.equal(r11.nextDayOpen, 25213.5);
+  assert.equal(r11.gapPts, 41.55); // index gap −41.55 → +41.55 for the STBT
+  assert.equal(r11.outcome, "WIN");
+  assert.match(r11.notes, /index gap -41\.55 pts = \+41\.55 pts for the STBT/);
+
+  const r09 = by["2026-11-09"];
+  assert.equal(r09.entrySpot, 25044.65);
+  assert.equal(r09.outcome, "UNRESOLVED");
+  assert.match(r09.notes, /entry 25044\.65 as originally recorded \(no post-15:30 closing print/);
+
+  const before = Object.fromEntries(sanitizeEodHistory(input).map(r => [r.isoDate, r]));
+  for (const d of ["2026-11-08", "2026-11-10", "2026-11-13", "2026-11-16", "2026-11-06"]) {
+    assert.deepEqual(by[d], before[d], d);
+  }
+  assert.deepEqual(changes.map(c => c.id).sort(), ["eod_2026-11-09", "eod_2026-11-11", "eod_2026-11-12"]);
+  // Re-scored from the stored nextDayOpen: only the rows' own dates were read.
+  assert.deepEqual([...new Set(reads)].sort(), ["2026-11-09", "2026-11-11", "2026-11-12"]);
+
+  const again = await repairEodHistoryV2({ history, getTimelineForDate: reader, todayIso: "2026-11-16" });
+  assert.deepEqual(again.changes, []);
+  assert.deepEqual(again.history, history);
+});
+
+test("v2: an unparsable note leaves the row alone; a throwing reader leaves history unchanged and releases the marker", async () => {
+  const odd = { ...row("2026-11-12", CE, "LOSS", 25275.25, { nextDayOpen: 25209.85, gapPts: -65.4 }), repaired: true, notes: "Repaired by hand: entry changed" };
+  const { history, changes } = await repairEodHistoryV2({ history: [odd], getTimelineForDate: getTimelineForDate });
+  assert.deepEqual(changes, []);
+  assert.equal(history[0].entrySpot, 25275.25);
+  assert.equal(history[0].repairVersion, undefined);
+
+  const input = productionAfterV1();
+  let released = 0;
+  const r = await runEodHistoryRepairOnce({
+    history: input,
+    claim: async () => true,
+    release: async () => { released += 1; },
+    getTimelineForDate: async () => { throw new Error("redis down"); },
+    repair: repairEodHistoryV2,
+  });
+  assert.equal(r.ran, false);
+  assert.equal(r.history, input);
+  assert.equal(released, 1);
+});
+
+test("fresh database (rows as before v1): current repair then v2 ends in the same correct state; v2 changes nothing", async () => {
+  const first = await repairEodHistory({ history: productionFixture(), getTimelineForDate, todayIso: "2026-11-16" });
+  const second = await repairEodHistoryV2({ history: first.history, getTimelineForDate, todayIso: "2026-11-16" });
+  assert.deepEqual(second.changes, []);
+  const fresh = Object.fromEntries(second.history.map(r => [r.isoDate, r]));
+  const prod = Object.fromEntries((await repairEodHistoryV2({ history: productionAfterV1(), getTimelineForDate, todayIso: "2026-11-16" })).history.map(r => [r.isoDate, r]));
+  const pick = r => ({ entrySpot: r.entrySpot, nextDayOpen: r.nextDayOpen, gapPts: r.gapPts, outcome: r.outcome });
+  assert.deepEqual(pick(fresh["2026-11-12"]), { entrySpot: 25299.35, nextDayOpen: 25209.85, gapPts: -89.5, outcome: "LOSS" });
+  assert.deepEqual(pick(fresh["2026-11-11"]), { entrySpot: 25255.05, nextDayOpen: 25213.5, gapPts: 41.55, outcome: "WIN" });
+  assert.deepEqual(pick(fresh["2026-11-09"]), { entrySpot: 25044.65, nextDayOpen: null, gapPts: null, outcome: "UNRESOLVED" });
+  assert.deepEqual(pick(fresh["2026-11-08"]), { entrySpot: 24986.4, nextDayOpen: null, gapPts: null, outcome: "UNRESOLVED" });
+  for (const d of ["2026-11-12", "2026-11-11", "2026-11-09", "2026-11-08"]) {
+    assert.deepEqual(pick(fresh[d]), pick(prod[d]), d);
+    assert.equal(fresh[d].repairVersion, 2, d);
+  }
 });
 
 // ── Statistics ───────────────────────────────────────────────────────────────
