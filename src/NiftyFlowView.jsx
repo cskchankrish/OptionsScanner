@@ -13,6 +13,7 @@ import { isSpotFrozenAt } from "./flowCalc.js";
 import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 import { EodVerdictCard } from "./EodVerdictCard.jsx";
+import { WeeklyOutlookCard } from "./WeeklyOutlookCard.jsx";
 import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
@@ -2497,6 +2498,8 @@ export function NiftyFlowView({ t, isDark }) {
               <>
                 {/* VERDICT CARD — final verdict and results first; the long audit below is collapsed */}
                 <EodVerdictCard card={eod.card} t={t} isDark={isDark} isMobile={isMobile} />
+                {/* Weekly Outlook — shadow, display only (GET /api/swing; docs/weekly-outlook.md) */}
+                <WeeklyOutlookCard t={t} isDark={isDark} isMobile={isMobile} />
                 <details open={!eod.card} style={{ marginBottom: 8 }}>
                   <summary style={{ cursor: "pointer", fontSize: isMobile ? 11.5 : 12.5, fontWeight: 800, color: t.textSub, padding: "4px 0", marginBottom: 6 }}>
                     Full EOD audit and detail

@@ -33,6 +33,7 @@ import { describeCarryConfig } from "../src/carryBridge.js";
 export { buildEodCard, formatEodCardLines };
 import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
 import { istParts, getSessionKindForDate, isMuhuratTomorrow, getSessionDayOfWeek } from "../src/marketCalendar.js";
+import { getSwingConfig, shouldCaptureSwing, runSwingCapture } from "../src/swingSummary.js";
 
 let cache = {
   data: null,
@@ -2763,7 +2764,96 @@ export default async function handler(req, res) {
  * @returns {Promise<{ ok: boolean, payload?: object, error?: string, stage?: "nse"|"redis",
  *   persisted?: boolean|null, snapshotAt?: number, ticks?: number, targetExpiry?: string, nearExpiry?: string }>}
  */
-export async function refreshLiveSnapshot({
+// ── Daily swing summary capture (SHADOW — src/swingSummary.js, docs/weekly-outlook.md) ──
+// Runs only AFTER refreshLiveSnapshotCore has returned (payload computed, snapshot persisted or
+// its write started). Reads values the core already computed, writes only nifty:swing:* keys, sends
+// no Telegram; nothing in the refresh, decision, order, EOD or scorecard paths reads what it writes.
+let swingCaptureOverride = null;
+/** Tests only: replace the capture step (e.g. with one that throws). null restores the default. */
+export function __setSwingCaptureForTests(fn) {
+  swingCaptureOverride = typeof fn === "function" ? fn : null;
+}
+
+async function captureSwingSummary(ctx, opts = {}) {
+  const cfg = getSwingConfig(process.env);
+  const nowMs = Date.now();
+  const deadlineMs = Number.isFinite(opts.deadlineMs) ? opts.deadlineMs : null;
+  const decision = shouldCaptureSwing({
+    cfg,
+    sessionKind: ctx.sessionInfo?.sessionKind,
+    isLiveMarket: ctx.sessionInfo?.isLiveMarket,
+    istMinutes: getISTMinutes(),
+    targetExpiry: ctx.targetExpiry,
+    nearExpiry: ctx.nearExpiry,
+    isEodTest: Boolean(opts.isEodTest),
+    hasRedis: Boolean(REDIS_URL && REDIS_TOKEN),
+    source: opts.source ?? "browser",
+    nowMs,
+    deadlineMs,
+  });
+  if (!decision.capture) return { status: "SKIPPED", reason: decision.reason };
+  // Hard cap: never past the caller's deadline (minus a margin), never longer than maxCaptureMs.
+  const capMs = Math.min(cfg.maxCaptureMs, deadlineMs !== null ? deadlineMs - nowMs - 250 : Infinity);
+  if (!(capMs > 0)) return { status: "SKIPPED", reason: "no-time" };
+  // Copy the tick list now: the module-level history may change under a later refresh.
+  const timeline = Array.isArray(ctx.timeline) ? ctx.timeline.map((p) => ({ ...p })) : [];
+  const store = scStoreFromCommand(redisRestCommand);
+  const work = runSwingCapture({
+    cfg,
+    fetchExtras: decision.fetchExtras,
+    ctx: { ...ctx, timeline },
+    deps: {
+      now: () => Date.now(),
+      dteOf: (e) => calculateDte(e),
+      claimLock: (k, ttl) => redisRestSetNx(k, String(nowMs), ttl),
+      set: (k, v, ttl) => redisRestSet(k, v, ttl),
+      mget: (ks) => store.mget(ks),
+      fetchChain: async (expiry, timeoutMs) => {
+        const left = deadlineMs !== null ? deadlineMs - Date.now() - 300 : timeoutMs;
+        if (left < 200) throw new Error("no time left in this refresh");
+        const url = `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=NIFTY&expiry=${encodeURIComponent(expiry)}`;
+        const r = await fetch(url, { headers: ctx.sessionHeaders, signal: AbortSignal.timeout(Math.min(timeoutMs, left)) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        return { rows: j.filtered?.data || j.records?.data || [], spot: Number(j.records?.underlyingValue) || null };
+      },
+    },
+  });
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ status: "TIMEOUT", capMs }), capMs);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Live fetch → compute → payload → persist (refreshLiveSnapshotCore, unchanged), then the shadow
+ * swing capture. The capture can never fail or change the refresh result: its errors are
+ * swallowed; on awaited-persist callers (poller) it is awaited within the deadline budget, on
+ * every other caller it is not awaited (no added response latency).
+ */
+export async function refreshLiveSnapshot(opts = {}) {
+  const swingCtx = {};
+  const result = await refreshLiveSnapshotCore(opts, swingCtx);
+  if (!result?.ok || !swingCtx.ready) return result;
+  try {
+    const run = swingCaptureOverride || captureSwingSummary;
+    const p = Promise.resolve(run(swingCtx, opts)).catch((e) => {
+      console.error("Swing capture error:", e?.message);
+      return { status: "ERROR" };
+    });
+    if (opts?.awaitPersist) await p;
+  } catch (e) {
+    console.error("Swing capture error:", e?.message);
+  }
+  return result;
+}
+
+async function refreshLiveSnapshotCore({
   now = Date.now(),
   sessionInfo = getMarketSessionInfo(),
   queryExpiry = null,
@@ -2772,7 +2862,7 @@ export async function refreshLiveSnapshot({
   awaitPersist = false,
   source = "browser",
   deadlineMs = null,
-} = {}) {
+} = {}, swingCtx = null) {
   const today = getISTDateStr();
   // Keep ~2.5s for the awaited Redis write when a deadline is set.
   const fetchDeadline = Number.isFinite(deadlineMs) ? deadlineMs - (awaitPersist ? 2500 : 0) : null;
@@ -2889,10 +2979,12 @@ export async function refreshLiveSnapshot({
 
     // Parse Next Expiry metrics if fetched during Expiry Day Rollover
     let nextMetrics = null;
+    let swingPrefetchedNextRows = null; // read only by the shadow swing capture after the refresh
     if (nextSettled && nextSettled.status === "fulfilled" && nextSettled.value.ok) {
       try {
         const nextV3Data = await nextSettled.value.json();
         const nextRows = nextV3Data.filtered?.data || nextV3Data.records?.data || [];
+        swingPrefetchedNextRows = nextRows;
         nextMetrics = extractOptionChainMetrics(nextRows, spot);
         nextMetrics.expiry = nextExpiry;
       } catch (e) {
@@ -3494,6 +3586,28 @@ export async function refreshLiveSnapshot({
       cacheByExpiry.set("near", { data: payload, timestamp: now });
       cacheByExpiry.set("default", { data: payload, timestamp: now });
       cache = { data: payload, timestamp: now };
+    }
+    // Shadow swing capture context: references to values computed above, used only by the
+    // wrapper (refreshLiveSnapshot) after this function returns. Nothing here reads it back.
+    if (swingCtx) {
+      Object.assign(swingCtx, {
+        ready: true,
+        date: getISTIsoDateStr(),
+        sessionInfo,
+        sessionHeaders,
+        targetExpiry,
+        nearExpiry,
+        nextExpiry,
+        monthlyExpiry,
+        isExpiryDay,
+        spot,
+        nearRows: records,
+        prefetchedNextRows: nextExpiry ? swingPrefetchedNextRows : null,
+        timeline,
+        futuresMetrics,
+        dataQuality,
+        nearIntraday: { floor: floorStrike, roof: roofStrike, pcr, deltaPcr, totalPutWriting: totPutWriting, totalCallWriting: totCallWriting },
+      });
     }
   } catch (err) {
     return { ok: false, stage: "nse", error: err?.message || String(err), errorObject: err };
