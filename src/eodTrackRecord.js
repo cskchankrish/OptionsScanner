@@ -761,7 +761,49 @@ export function settleStaleProvisionalRows(rows, todayIso) {
 
 /** Chip text for an UNRESOLVED row. */
 export function eodUnresolvedLabel(row) {
-  return String(row?.notes || "").startsWith(EOD_VERDICT_NOT_FINAL_PREFIX) ? "Verdict not final" : "Open not recorded";
+  if (String(row?.notes || "").startsWith(EOD_VERDICT_NOT_FINAL_PREFIX)) return "Verdict not final";
+  if (row?.entryUnverified === true && !(Number(row?.entrySpot) > 0)) return "Entry not recorded";
+  return "Open not recorded";
+}
+
+// ── Finalisation guard (real spot + post-freeze NSE data) ───────────────────
+
+/**
+ * A refresh may finalise today's row only when its spot is NSE's real underlying value (not the
+ * display fallback) AND the NSE data time is at or after the end of the closing-session freeze:
+ * 15:30 on a weekday; on the Muhurat date the same margin before its finalisation minute (15:50).
+ * If no such refresh has arrived by more than this many minutes after the close (weekday: after
+ * 15:50), the row is finalised anyway and flagged `entryUnverified`.
+ */
+export const EOD_FINAL_FALLBACK_AFTER_CLOSE_MINS = 10;
+
+/** Earliest NSE data time (IST minutes) that counts as post-freeze closing data; null for a closed date. */
+export function eodFreshDataMins(isoDate) {
+  const t = eodSessionTimes(isoDate);
+  if (t.finalMins == null) return null;
+  return t.finalMins - (EOD_FINAL_MINS_WEEKDAY - EOD_SPOT_FREEZE_END_MINS);
+}
+
+const NSE_TS_MONTHS = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+/**
+ * IST minutes of an NSE option-chain timestamp ("16-Nov-2026 15:35:19"), or null when missing or
+ * unparsable — or, when `expectIso` is given, when the timestamp is from a different date.
+ */
+export function nseTimestampIstMinutes(s, expectIso = null) {
+  const m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(s ?? "").trim());
+  if (!m) return null;
+  const mon = NSE_TS_MONTHS[m[2].toLowerCase()];
+  const h = Number(m[4]);
+  const min = Number(m[5]);
+  if (!mon || h > 23 || min > 59) return null;
+  if (expectIso && `${m[3]}-${mon}-${m[1].padStart(2, "0")}` !== expectIso) return null;
+  return h * 60 + min;
+}
+
+function unverifiedReason({ spotNum, nseDataMins, freshMins }) {
+  if (spotNum == null) return "NSE sent no underlying value (spot)";
+  if (!Number.isFinite(nseDataMins)) return "NSE data time unknown";
+  return `NSE data time ${hhmmOf(nseDataMins)} is before ${hhmmOf(freshMins)} (closing-session freeze)`;
 }
 
 // ── Today's row ──────────────────────────────────────────────────────────────
@@ -773,15 +815,29 @@ export function eodUnresolvedLabel(row) {
  * - at/after finalisation: outcome from the FINAL bias only (NEUTRAL → PRESERVED_CASH, carry →
  *   PENDING), entrySpot = spot at the first final snapshot, then frozen;
  * - a finalised row is not overwritten by a later request whose closing data is invalid.
+ * Finalisation guard: a refresh finalises only when `spotIsReal` (the spot is NSE's real
+ * underlying value) and `nseDataMins` (NSE data time, IST minutes) ≥ eodFreshDataMins(today);
+ * otherwise the row stays IN_PROGRESS and a later refresh retries. More than
+ * EOD_FINAL_FALLBACK_AFTER_CLOSE_MINS after the close without such a refresh, the row is finalised
+ * with the best real spot seen and `entryUnverified: true` (never a real spot → entrySpot null,
+ * carries UNRESOLVED, cash rows PRESERVED_CASH). A non-real spot is never recorded as entrySpot.
+ * Both facts default to "not verified".
  */
-export function buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing = null, extra = null }) {
+export function buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing = null, extra = null, spotIsReal = false, nseDataMins = null }) {
   if (!eodDecision || !isSessionDate(todayIso)) return null;
   const t = eodSessionTimes(todayIso);
   const prev = existing && eodRowIso(existing) === todayIso ? existing : null;
   if (!(Number(nowMins) >= t.openMins)) return prev;
-  const isFinal = Number(nowMins) >= t.finalMins;
   const prevFinal = Boolean(prev && prev.provisional === false);
-  const spotNum = Number(spot) > 0 ? Number(spot) : null;
+  const spotNum = spotIsReal === true && Number(spot) > 0 ? Number(spot) : null;
+  const freshMins = eodFreshDataMins(todayIso);
+  const dataMins = nseDataMins == null || nseDataMins === "" ? NaN : Number(nseDataMins);
+  const verified = spotNum != null && Number.isFinite(dataMins) && dataMins >= freshMins;
+  const pastFinal = Number(nowMins) >= t.finalMins;
+  // A row finalised by the fallback without any real spot may still take a later real one.
+  const refillable = !prevFinal || (spotNum != null && prev.entryUnverified === true && !(Number(prev.entrySpot) > 0));
+  const fallback = pastFinal && !verified && refillable && Number(nowMins) > t.closeMins + EOD_FINAL_FALLBACK_AFTER_CLOSE_MINS;
+  const isFinal = pastFinal && (verified || fallback);
 
   const snapshot = {
     id: `eod_${todayIso}`,
@@ -826,29 +882,52 @@ export function buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, fl
 
   const isCarry = eodDecision.bias === "BULLISH" || eodDecision.bias === "BEARISH";
   const frozenEntry = prevFinal && Number(prev.entrySpot) > 0 ? Number(prev.entrySpot) : null;
-  return {
+  const finalNote = `Decision finalized at ${timeStr || hhmmOf(Number(nowMins))} (verdict final from ${hhmmOf(t.finalMins)} IST; session close ${t.closeTimeStr} IST).`;
+  let entrySpot;
+  let entryUnverified;
+  let notes;
+  if (frozenEntry != null) {
+    entrySpot = frozenEntry;
+    entryUnverified = prev.entryUnverified === true;
+    notes = entryUnverified && prev.notes ? prev.notes : finalNote;
+  } else if (verified) {
+    entrySpot = spotNum;
+    entryUnverified = false;
+    notes = finalNote;
+  } else {
+    // Fallback: the best real spot available (this refresh, else the last real one recorded today).
+    const prevReal = Number(prev?.entrySpot) > 0 ? Number(prev.entrySpot) : null;
+    entrySpot = spotNum ?? prevReal;
+    entryUnverified = true;
+    const why = unverifiedReason({ spotNum, nseDataMins: dataMins, freshMins });
+    notes = `${finalNote} Entry unverified: no refresh from ${hhmmOf(t.finalMins)} to ${hhmmOf(t.closeMins + EOD_FINAL_FALLBACK_AFTER_CLOSE_MINS)} IST had a real NSE spot with data time at or after ${hhmmOf(freshMins)} (this refresh: ${why}); ${entrySpot != null ? `entry ${entrySpot} is the last real spot recorded` : "no real spot was recorded, entry left empty"}.`;
+  }
+  const out = {
     ...(prev || {}),
     ...snapshot,
-    entrySpot: frozenEntry ?? spotNum ?? prev?.entrySpot ?? null,
+    entrySpot,
     nextDayOpen: null,
     gapPts: null,
-    outcome: isCarry ? "PENDING" : "PRESERVED_CASH",
+    outcome: isCarry ? (entrySpot != null ? "PENDING" : "UNRESOLVED") : "PRESERVED_CASH",
     provisional: false,
-    notes: `Decision finalized at ${timeStr || hhmmOf(Number(nowMins))} (verdict final from ${hhmmOf(t.finalMins)} IST; session close ${t.closeTimeStr} IST).`,
+    notes,
   };
+  if (entryUnverified) out.entryUnverified = true;
+  else delete out.entryUnverified;
+  return out;
 }
 
 /**
  * Server step: sanitise, settle stale in-progress rows, upsert today's row, resolve every PENDING
  * row whose next session is today from today's timeline, sort newest first.
  */
-export function reconcileEodHistory({ history, todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, todayTimeline = [], timelinesByDate = null, limit = 60 }) {
+export function reconcileEodHistory({ history, todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, todayTimeline = [], timelinesByDate = null, limit = 60, spotIsReal = false, nseDataMins = null }) {
   let rows = sanitizeEodHistory(history);
   if (!isSessionDate(todayIso)) return rows.slice(0, limit);
   rows = settleStaleProvisionalRows(rows, todayIso);
   const idx = rows.findIndex(r => r.isoDate === todayIso);
   const existing = idx >= 0 ? rows[idx] : null;
-  const todayRow = buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing });
+  const todayRow = buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing, spotIsReal, nseDataMins });
   if (todayRow && todayRow !== existing) {
     if (idx >= 0) rows[idx] = todayRow;
     else rows.push(todayRow);

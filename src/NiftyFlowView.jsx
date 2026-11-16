@@ -12,6 +12,7 @@ import {
   computeEodTrackStats,
   formatEodWinRate,
   eodUnresolvedLabel,
+  nseTimestampIstMinutes,
 } from "./eodTrackRecord.js";
 import {
   classifyFuturesQuadrant,
@@ -1681,6 +1682,9 @@ export function NiftyFlowView({ t, isDark }) {
                 timeStr: `${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false })} IST`,
                 dayName: new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" }),
                 spot: data.spotPrice,
+                // Same finalisation guard as the server: real NSE spot + post-freeze data time.
+                spotIsReal: data.spotIsReal === true,
+                nseDataMins: nseTimestampIstMinutes(data.timestamp, todayKey),
                 floorStrike: data.floor,
                 roofStrike: data.roof,
                 eodDecision: data.eodDecision,

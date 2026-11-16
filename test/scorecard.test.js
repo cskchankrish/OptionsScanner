@@ -65,6 +65,77 @@ test("capture: fusion quadrant and scenario changes (not the first reading)", ()
   assert.equal(sc.captureEvents(r.state, reading(602, { fusion: { quadrant: "SHORT_BUILDUP", scenario: "BULL_TRAP" } })).events.length, 0);
 });
 
+// 16-Nov-2026 14:02–14:11: the whole-day quadrant flipped SHORT_COVERING ↔ LONG_UNWINDING six times.
+const SC_Q = "SHORT_COVERING";
+const LU_Q = "LONG_UNWINDING";
+const fq = (m, quadrant, scenario = "MIXED_FLOW") => reading(m, { fusion: { quadrant, scenario } });
+const replay = (readings, opts, state = null) => {
+  const out = [];
+  for (const r of readings) {
+    const x = sc.captureEvents(state, r, opts);
+    state = JSON.parse(JSON.stringify(x.state)); // the stored state goes through JSON (Redis)
+    out.push(...x.events.map((e) => `${e.time} ${e.type} ${e.data.from}>${e.data.to}`));
+  }
+  return { out, state };
+};
+
+test("fusion re-arm: the 16-Nov 14:02–14:11 flicker emits once at 14:02 and once more at 14:12", () => {
+  const { out, state } = replay([
+    fq(780, SC_Q), // 13:00, first value of the day (initialises, no event)
+    fq(842, LU_Q), fq(843, SC_Q), fq(846, LU_Q), fq(846, SC_Q), fq(847, LU_Q), fq(851, SC_Q),
+    fq(852, SC_Q), // 14:12: still different from the last emitted value, 10 min after 14:02
+    fq(853, SC_Q),
+  ]);
+  assert.deepEqual(out, ["14:02 QUADRANT_CHANGE SHORT_COVERING>LONG_UNWINDING", "14:12 QUADRANT_CHANGE LONG_UNWINDING>SHORT_COVERING"]);
+  assert.equal(state.fusionQuadrant, SC_Q, "latest reading still tracked");
+  assert.deepEqual(state.fusionEmit.quadrant, { lastEmitted: SC_Q, lastEmitMinutes: 852 });
+  // Flicker that ends on the last emitted value emits nothing more.
+  const back = replay([fq(854, LU_Q), fq(856, SC_Q), fq(860, LU_Q), fq(861, SC_Q), fq(870, SC_Q)], undefined, state);
+  assert.deepEqual(back.out, [], "flips inside the re-arm window that end on the last emitted value count nothing");
+});
+
+test("fusion re-arm: a genuine change after a quiet period emits immediately; 0 restores every-change", () => {
+  const quiet = replay([fq(600, SC_Q), fq(700, LU_Q), fq(760, SC_Q)]);
+  assert.deepEqual(quiet.out, ["11:40 QUADRANT_CHANGE SHORT_COVERING>LONG_UNWINDING", "12:40 QUADRANT_CHANGE LONG_UNWINDING>SHORT_COVERING"]);
+  const flicker = [fq(780, SC_Q), fq(842, LU_Q), fq(843, SC_Q), fq(846, LU_Q), fq(846, SC_Q), fq(847, LU_Q), fq(851, SC_Q)];
+  assert.equal(replay(flicker, { fusionRearmMin: 0 }).out.length, 6, "old behaviour: each flip counted");
+  assert.equal(replay(flicker).out.length, 1);
+  // Env: SCORECARD_FUSION_REARM_MIN read by the config (0 allowed, junk → default).
+  assert.equal(sc.getScorecardConfig({}).fusionRearmMin, 10);
+  assert.equal(sc.getScorecardConfig({ SCORECARD_FUSION_REARM_MIN: "0" }).fusionRearmMin, 0);
+  assert.equal(sc.getScorecardConfig({ SCORECARD_FUSION_REARM_MIN: "15" }).fusionRearmMin, 15);
+  assert.equal(sc.getScorecardConfig({ SCORECARD_FUSION_REARM_MIN: "x" }).fusionRearmMin, 10);
+  const snap = sc.settingsSnapshot({ env: { SCORECARD_FUSION_REARM_MIN: "5" } });
+  assert.equal(snap.scorecard.fusionRearmMin, 5);
+  assert.equal(snap.envOverrides.SCORECARD_FUSION_REARM_MIN, "5");
+});
+
+test("fusion re-arm: the scenario stream is independent of the quadrant stream", () => {
+  const { out } = replay([
+    reading(780, { fusion: { quadrant: SC_Q, scenario: "MIXED_FLOW" } }),
+    reading(842, { fusion: { quadrant: LU_Q, scenario: "MIXED_FLOW" } }), // quadrant emits
+    reading(845, { fusion: { quadrant: LU_Q, scenario: "BEAR_TRAP" } }), // scenario emits (its own clock)
+    reading(846, { fusion: { quadrant: SC_Q, scenario: "MIXED_FLOW" } }), // both suppressed
+    reading(855, { fusion: { quadrant: SC_Q, scenario: "MIXED_FLOW" } }), // scenario re-armed (10 min after 14:05), quadrant re-armed
+  ]);
+  assert.deepEqual(out, [
+    "14:02 QUADRANT_CHANGE SHORT_COVERING>LONG_UNWINDING",
+    "14:05 SCENARIO_CHANGE MIXED_FLOW>BEAR_TRAP",
+    "14:15 QUADRANT_CHANGE LONG_UNWINDING>SHORT_COVERING",
+    "14:15 SCENARIO_CHANGE BEAR_TRAP>MIXED_FLOW",
+  ]);
+});
+
+test("fusion re-arm: an old-format state (no fusionEmit) continues without throwing or double-emitting", () => {
+  const legacy = { fusionQuadrant: SC_Q, fusionScenario: "MIXED_FLOW", turn: {}, radarKeys: [], eod: { lastSlot: null, lastCategory: null, last: null } };
+  let r;
+  assert.doesNotThrow(() => { r = sc.captureEvents(legacy, fq(842, SC_Q)); });
+  assert.equal(r.events.length, 0, "same value as the stored latest → no event");
+  const { out } = replay([fq(843, LU_Q), fq(844, SC_Q), fq(853, SC_Q)], undefined, JSON.parse(JSON.stringify(legacy)));
+  assert.deepEqual(out, ["14:03 QUADRANT_CHANGE SHORT_COVERING>LONG_UNWINDING", "14:13 QUADRANT_CHANGE LONG_UNWINDING>SHORT_COVERING"]);
+  assert.doesNotThrow(() => sc.captureEvents({ ...legacy, fusionEmit: "junk" }, fq(845, LU_Q)));
+});
+
 const turn = (stage, extremeMin, extra = {}) => ({ status: "OK", stage, direction: "BEARISH", reference: { kind: "high", time: hm(extremeMin), minutes: extremeMin, price: 25100 }, futuresLeg: { movePts: -50, movePct: -0.2, oiChange: 500, oiPct: 0.25, quadrant: "SHORT_BUILDUP" }, optionsLeg: { putLegDelta: 0, callLegDelta: 45000, netDelta: -45000, driver: "WRITING", dominantLeg: "CALL", deltaPcrAtExtreme: 1, deltaPcrNow: 0.87 }, elapsedMin: 20, coverage: { ok: true, coveragePct: 100 }, ...extra });
 
 test("capture: Turn Tracker stage transitions once per extreme, with both legs", () => {

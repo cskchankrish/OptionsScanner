@@ -27,7 +27,13 @@ Repo → Settings → Secrets and variables → Actions → New repository secre
 
 `.github/workflows/market-pulse.yml` sends it as the `x-webhook-secret` header. It never goes in the
 URL. Until the secret exists, the workflow fails during market hours with
-"POLL_SECRET is not set". GitHub's scheduler is best-effort, so this is only a backup.
+"POLL_SECRET is not set". This cron is best-effort only and has **not** provided cover: GitHub ran
+it once on Monday 2026-11-16, at 16:21 IST (after the close), and 1–3 times a day the week before,
+mostly late. GitHub delays or drops scheduled runs at busy times, especially on the hour and on
+round minutes, so it now runs every 10 minutes on off-peak minutes (`7-57/10 3-10 * * 1-5`,
+08:37–16:27 IST; the workflow still polls only 09:15–15:40 IST). Do not count on it: the real
+redundancy is the VM poller plus the QStash schedule below, and the POLLER DOWN Telegram alert
+(docs/data-quality.md).
 
 ## 3. QStash schedule (primary poller)
 
@@ -47,7 +53,7 @@ Upstash console → QStash → Schedules → Create:
   calls, use three tighter schedules covering 09:14–15:40 IST: `44-59 3 * * 1-5`, `* 4-9 * * 1-5`
   and `0-10 10 * * 1-5`.
   For a Muhurat session, make sure its date is in the list and add a one-off schedule
-  `* 8-10 * * 0` (Sunday) for that day only; remove it afterwards. The GitHub backup cron runs
+  `* 8-10 * * 0` (Sunday) for that day only; remove it afterwards. The GitHub best-effort cron runs
   Mon–Fri only.
 - **Retries:** 2 or 3. The endpoint returns 502 when NSE fails and 503 when the Redis write fails,
   so QStash retries real failures and never retries a `MARKET_CLOSED` response.

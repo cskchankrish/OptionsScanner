@@ -177,8 +177,9 @@ test("eodRowsForStorage drops weekend and provisional rows", () => {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
-function step(existing, nowMins, spot, eodDecision, todayIso = "2026-11-16") {
-  return buildTodayEodRow({ todayIso, nowMins, timeStr: `${Math.floor(nowMins / 60)}:${String(nowMins % 60).padStart(2, "0")} IST`, dayName: "Monday", spot, floorStrike: 25000, roofStrike: 25400, eodDecision, existing });
+// Default: a real NSE spot with a current data time (the finalisation guard is satisfied).
+function step(existing, nowMins, spot, eodDecision, todayIso = "2026-11-16", guard = { spotIsReal: true, nseDataMins: nowMins }) {
+  return buildTodayEodRow({ todayIso, nowMins, timeStr: `${Math.floor(nowMins / 60)}:${String(nowMins % 60).padStart(2, "0")} IST`, dayName: "Monday", spot, floorStrike: 25000, roofStrike: 25400, eodDecision, existing, ...guard });
 }
 
 test("lifecycle: a day that starts NEUTRAL then turns BTST ends PENDING (not PRESERVED_CASH)", () => {
@@ -226,6 +227,121 @@ test("lifecycle: entrySpot frozen after finalisation; invalid post-market data d
 test("lifecycle: Muhurat date finalises at 15:58", () => {
   assert.equal(step(null, 950, 24990, STBT, "2026-11-08").outcome, "IN_PROGRESS");
   assert.equal(step(null, 958, 24986.4, STBT, "2026-11-08").outcome, "PENDING");
+});
+
+// ── Finalisation guard: real spot + post-freeze NSE data time ───────────────
+
+const FAKE = 25030.35; // api/nifty-oi.js display fallback when NSE omits underlyingValue
+const g = (spotIsReal, nseDataMins) => ({ spotIsReal, nseDataMins });
+
+test("nseTimestampIstMinutes parses the NSE format; null when missing, malformed or another date", async () => {
+  const { nseTimestampIstMinutes } = await import("../src/eodTrackRecord.js");
+  assert.equal(nseTimestampIstMinutes("16-Nov-2026 15:35:19"), 935);
+  assert.equal(nseTimestampIstMinutes("16-Nov-2026 15:35:19", "2026-11-16"), 935);
+  assert.equal(nseTimestampIstMinutes("13-Nov-2026 15:30:00", "2026-11-16"), null, "a previous day's data is not today's close");
+  assert.equal(nseTimestampIstMinutes(undefined), null);
+  assert.equal(nseTimestampIstMinutes("3:38:00 pm"), null);
+});
+
+test("guard: finalises normally at 15:38 with a real spot and NSE data time 15:35", () => {
+  let r = step(null, 900, 25250, BTST, "2026-11-16", g(true, 899));
+  r = step(r, 938, 25270, BTST, "2026-11-16", g(true, 935));
+  assert.equal(r.outcome, "PENDING");
+  assert.equal(r.provisional, false);
+  assert.equal(r.entrySpot, 25270);
+  assert.equal(r.entryUnverified, undefined);
+});
+
+test("guard: a fake spot at 15:38 keeps the row IN_PROGRESS; a real one at 15:39 finalises it", () => {
+  let r = step(null, 930, 25260, BTST, "2026-11-16", g(true, 930));
+  r = step(r, 938, FAKE, BTST, "2026-11-16", g(false, 935));
+  assert.equal(r.outcome, "IN_PROGRESS");
+  assert.equal(r.provisional, true);
+  assert.equal(r.entrySpot, 25260, "a non-real spot never overwrites the recorded real one");
+  r = step(r, 939, 25275, BTST, "2026-11-16", g(true, 936));
+  assert.equal(r.outcome, "PENDING");
+  assert.equal(r.entrySpot, 25275);
+  assert.equal(r.entryUnverified, undefined);
+});
+
+test("guard: NSE data time 15:20 at 15:38 does not finalise (stale pre-15:30 response)", () => {
+  const r = step(null, 938, 25270, STBT, "2026-11-16", g(true, 920));
+  assert.equal(r.outcome, "IN_PROGRESS");
+  assert.equal(r.provisional, true);
+  assert.equal(r.entrySpot, 25270, "display only while in progress");
+  // A later refresh with post-freeze data finalises.
+  const f = step(r, 940, 25280, STBT, "2026-11-16", g(true, 931));
+  assert.equal(f.outcome, "PENDING");
+  assert.equal(f.entrySpot, 25280);
+});
+
+test("guard: unknown NSE time is not finalised until more than 10 minutes after the close, then entryUnverified", () => {
+  let r = step(null, 938, 25270, BTST, "2026-11-16", g(true, null));
+  assert.equal(r.outcome, "IN_PROGRESS");
+  r = step(r, 945, 25272, BTST, "2026-11-16", g(true, null));
+  assert.equal(r.outcome, "IN_PROGRESS");
+  r = step(r, 950, 25273, BTST, "2026-11-16", g(true, null));
+  assert.equal(r.outcome, "IN_PROGRESS", "15:50 is not yet more than 10 minutes past 15:40");
+  r = step(r, 951, FAKE, BTST, "2026-11-16", g(false, null));
+  assert.equal(r.outcome, "PENDING");
+  assert.equal(r.provisional, false);
+  assert.equal(r.entrySpot, 25273, "best available real spot");
+  assert.equal(r.entryUnverified, true);
+  assert.match(r.notes, /Entry unverified/);
+  assert.match(r.notes, /NSE sent no underlying value/);
+  // Frozen afterwards; a later non-verified refresh changes nothing.
+  assert.equal(step(r, 955, FAKE, BTST, "2026-11-16", g(false, null)), r);
+});
+
+test("guard: a spot that was never real → entrySpot null; carry UNRESOLVED, cash PRESERVED_CASH, both entryUnverified", () => {
+  let carry = step(null, 900, FAKE, BTST, "2026-11-16", g(false, 900));
+  assert.equal(carry.entrySpot, null);
+  carry = step(carry, 938, FAKE, BTST, "2026-11-16", g(false, 935));
+  assert.equal(carry.outcome, "IN_PROGRESS");
+  carry = step(carry, 951, FAKE, BTST, "2026-11-16", g(false, 951));
+  assert.equal(carry.outcome, "UNRESOLVED");
+  assert.equal(carry.provisional, false);
+  assert.equal(carry.entrySpot, null);
+  assert.equal(carry.entryUnverified, true);
+  assert.equal(eodUnresolvedLabel(carry), "Entry not recorded");
+  let cash = step(null, 938, FAKE, NEUTRAL, "2026-11-16", g(false, 935));
+  assert.equal(cash.outcome, "IN_PROGRESS");
+  cash = step(cash, 960, FAKE, NEUTRAL, "2026-11-16", g(false, 958));
+  assert.equal(cash.outcome, "PRESERVED_CASH");
+  assert.equal(cash.entrySpot, null);
+  assert.equal(cash.entryUnverified, true);
+  // A real spot after the fallback fills the empty entry (still unverified: data time unknown).
+  const filled = step(carry, 955, 25290, BTST, "2026-11-16", g(true, null));
+  assert.equal(filled.entrySpot, 25290);
+  assert.equal(filled.outcome, "PENDING");
+  assert.equal(filled.entryUnverified, true);
+});
+
+test("guard: entrySpot never becomes the 25030.35 fallback; reconcileEodHistory passes the facts through", () => {
+  const seen = [];
+  let r = null;
+  for (const [mins, spot, real, data] of [[600, FAKE, false, 600], [930, 25260, true, 930], [938, FAKE, false, 935], [940, 25250, true, 920], [945, FAKE, false, null], [951, FAKE, false, null]]) {
+    r = step(r, mins, spot, BTST, "2026-11-16", g(real, data));
+    seen.push(r.entrySpot);
+  }
+  assert.ok(!seen.includes(FAKE), JSON.stringify(seen));
+  const hist = [{ ...row("2026-11-16", CE, "IN_PROGRESS", 25260), provisional: true }];
+  const out = reconcileEodHistory({ history: hist, todayIso: "2026-11-16", nowMins: 938, timeStr: "15:38 IST", dayName: "Monday", spot: FAKE, eodDecision: BTST, spotIsReal: false, nseDataMins: 935 });
+  const t = out.find(x => x.isoDate === "2026-11-16");
+  assert.equal(t.outcome, "IN_PROGRESS");
+  assert.equal(t.entrySpot, 25260);
+  const ok = reconcileEodHistory({ history: out, todayIso: "2026-11-16", nowMins: 939, timeStr: "15:39 IST", dayName: "Monday", spot: 25265, eodDecision: BTST, spotIsReal: true, nseDataMins: 936 });
+  assert.equal(ok.find(x => x.isoDate === "2026-11-16").outcome, "PENDING");
+  assert.equal(ok.find(x => x.isoDate === "2026-11-16").entrySpot, 25265);
+});
+
+test("guard: Muhurat date needs NSE data at or after 15:50 (same margin before its 15:58 finalisation)", () => {
+  assert.equal(step(null, 958, 24986.4, STBT, "2026-11-08", g(true, 949)).outcome, "IN_PROGRESS");
+  assert.equal(step(null, 958, 24986.4, STBT, "2026-11-08", g(true, 950)).outcome, "PENDING");
+  assert.equal(step(null, 970, 24986.4, STBT, "2026-11-08", g(true, 949)).outcome, "IN_PROGRESS");
+  const fb = step(null, 971, 24986.4, STBT, "2026-11-08", g(true, 949));
+  assert.equal(fb.outcome, "PENDING");
+  assert.equal(fb.entryUnverified, true);
 });
 
 test("a past row still IN_PROGRESS becomes UNRESOLVED (verdict never finalised) and is not scored", () => {

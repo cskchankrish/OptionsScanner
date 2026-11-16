@@ -50,13 +50,21 @@ Every event carries:
 
 | Section | Events |
 |---|---|
-| `FUSION` | Each change of the whole-day quadrant, and each change of the fusion scenario. |
+| `FUSION` | A change of the whole-day quadrant, and a change of the fusion scenario, each re-armed after 10 minutes (below). |
 | `TURN` | Each Turn Tracker stage transition per extreme (EARLY, LIKELY TURN, CONFIRMED), with both legs' numbers. |
 | `RADAR` | Each 30-minute trap or turn, and each "divergence, not a trap". |
 | `EOD_SLOT` | The verdict, score and three group contributions at every scheduled slot and every flip. |
 | `EOD` | The final reading: the last one at or before 15:38. |
 | `SIGNAL` | Each TradingView signal received, with its grade and decision. The decision is one of: approved, vetoed with the reason, not executed with the reason, blocked, or downgraded. The levels are included. |
 | `TRADE` | Each Algo-owned trade exit and each carry exit, with the Algo's rupee result. |
+
+**FUSION re-arm (from 2026-11-16).** On 16-Nov the whole-day quadrant flipped SHORT_COVERING ↔
+LONG_UNWINDING six times between 14:02 and 14:11, and each flip was counted as a new call. Since
+then each stream (quadrant, scenario) emits a change only when the value differs from the last
+value it emitted and at least `SCORECARD_FUSION_REARM_MIN` minutes (default 10; 0 = every change,
+the old rule) have passed since that emit; the event's `from` is the last emitted value. The value
+in force is recorded in each day's settings snapshot. FUSION counts for days before 2026-11-16
+include this flicker (and so do 16-Nov's own events, recorded before the change was deployed). The fusion computation itself is unchanged.
 
 Typical storage per session is about 60–130 KB:
 - day document: about 20 KB of series, plus about 1.4 KB of settings, plus about 1.1–1.3 KB per event with its outcome;

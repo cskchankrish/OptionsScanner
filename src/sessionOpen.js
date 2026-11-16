@@ -40,6 +40,54 @@ const median = (a) => {
 };
 
 /**
+ * The volume-reset rule (shared): over the first `look` entries of cumulative volumes `v`, the index
+ * of the LAST tick whose volume fell below SESSION_OPEN_VOLUME_RESET_RATIO of the running high
+ * (-1 when none), and how many entries carried a usable volume.
+ */
+function scanVolumeReset(v, look) {
+  const vv = Array.isArray(v) ? v : [];
+  let maxPrev = null;
+  let lastReset = -1;
+  let validVol = 0;
+  for (let i = 0; i < look; i++) {
+    const x = pos(vv[i]);
+    if (x === null) continue;
+    validVol++;
+    if (maxPrev !== null && x < maxPrev * SESSION_OPEN_VOLUME_RESET_RATIO) {
+      lastReset = i;
+      maxPrev = x; // a new session's count starts here; later ticks compare against it
+    } else if (maxPrev === null || x > maxPrev) maxPrev = x;
+  }
+  return { lastReset, validVol };
+}
+
+/**
+ * Volume-reset rule only (no OI/price fallback), on an array of ticks {minutes, volume} sorted by
+ * minutes ascending: index of the first live tick = the last cumulative-volume reset within
+ * SESSION_OPEN_MAX_LOOK_MIN of the first tick; 0 when there is no reset or no volume data.
+ * Used by the futures anchor picker (api/nifty-oi.js). Never throws.
+ * @returns {{index:number, skipped:number, minutes:number|null, reason:string}}
+ */
+export function firstLiveIndexByVolume(ticks, opts = {}) {
+  try {
+    const arr = Array.isArray(ticks) ? ticks : [];
+    if (!arr.length) return { index: -1, skipped: 0, minutes: null, reason: "empty series" };
+    const maxLook = Number(opts?.maxLookMin) > 0 ? Number(opts.maxLookMin) : SESSION_OPEN_MAX_LOOK_MIN;
+    const m0 = Number(arr[0]?.minutes);
+    if (!Number.isFinite(m0)) return { index: 0, skipped: 0, minutes: null, reason: "malformed series" };
+    let look = 0;
+    while (look < arr.length && Number.isFinite(Number(arr[look]?.minutes)) && Number(arr[look].minutes) - m0 <= maxLook) look++;
+    const { lastReset } = scanVolumeReset(arr.map((t) => t?.volume), look);
+    if (lastReset > 0) {
+      return { index: lastReset, skipped: lastReset, minutes: Number(arr[lastReset].minutes), reason: `cumulative futures volume reset at minute ${arr[lastReset].minutes} (carry-over quote before it)` };
+    }
+    return { index: 0, skipped: 0, minutes: m0, reason: "no volume reset" };
+  } catch (e) {
+    return { index: 0, skipped: 0, minutes: null, reason: "error" };
+  }
+}
+
+/**
  * @param {{m:number[], f?:number[], o?:number[], v?:number[]}} series minutes ascending
  * @param {{maxLookMin?:number}} [opts]
  * @returns {{index:number, minutes:number|null, skipped:number, reason:string}}
@@ -57,19 +105,7 @@ export function firstLiveIndex(series, opts = {}) {
     const done = (i, reason) => ({ index: i, minutes: Number(m[i]), skipped: i, reason });
 
     // Primary: cumulative-volume reset inside the look window.
-    const v = Array.isArray(series?.v) ? series.v : [];
-    let maxPrev = null;
-    let lastReset = -1;
-    let validVol = 0;
-    for (let i = 0; i < look; i++) {
-      const x = pos(v[i]);
-      if (x === null) continue;
-      validVol++;
-      if (maxPrev !== null && x < maxPrev * SESSION_OPEN_VOLUME_RESET_RATIO) {
-        lastReset = i;
-        maxPrev = x; // a new session's count starts here; later ticks compare against it
-      } else if (maxPrev === null || x > maxPrev) maxPrev = x;
-    }
+    const { lastReset, validVol } = scanVolumeReset(series?.v, look);
     if (lastReset > 0) {
       // Every tick before the last reset is carry-over; the live session starts at the reset tick.
       return done(lastReset, `cumulative futures volume reset at minute ${m[lastReset]} (carry-over quote before it)`);

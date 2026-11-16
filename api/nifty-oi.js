@@ -7,6 +7,7 @@ import {
   runEodHistoryRepairOnce,
   repairEodHistory,
   repairEodHistoryV2,
+  nseTimestampIstMinutes,
 } from "../src/eodTrackRecord.js";
 import {
   parseNseFuturesPayload,
@@ -14,6 +15,7 @@ import {
   evaluateSmartMoneyFusion,
 } from "../src/smartMoneyFusion.js";
 import { authorizeRequest } from "../src/webhookAuth.js";
+import { firstLiveIndexByVolume } from "../src/sessionOpen.js";
 import {
   SPOT_FREEZE_START_MINS,
   SPOT_FREEZE_END_MINS,
@@ -106,8 +108,12 @@ const anchorMedian = (xs) => {
  * not a synthetic placeholder, |basis| < 2% of price). The anchor is the first valid tick whose
  * futures quote is plausibly LIVE — consistent in basis and OI with the valid ticks that follow it
  * (see ANCHOR_STALE_*); stale carry-over quotes at the open are skipped (`skippedStaleTicks`).
+ * Before that test, valid ticks before the first live tick by the cumulative futures volume reset
+ * (`futVolume`, src/sessionOpen.js firstLiveIndexByVolume) are never candidates
+ * (`volumeResetSkipped`, also counted in `skippedStaleTicks`); without volume data nothing changes.
  * `provisional: true` when the chosen tick could not yet be checked (too few ticks so far) or when
- * every early candidate failed and the first valid tick is used as a fallback (`reason` says why).
+ * every early candidate failed and the first valid (after a volume reset: first live) tick is used
+ * as a fallback (`reason` says why).
  * Recomputed from the timeline on every call, so a provisional anchor self-corrects.
  * Otherwise a stored Redis baseline that passes the validity checks (a reading taken with
  * futPrice 0 is rejected). Returns null when no valid anchor exists — callers must then report
@@ -120,7 +126,7 @@ export function pickSessionFuturesAnchor({ timeline = [], cachedBase = null } = 
     .filter((p) => ok(p.futPrice, p.spot) && Number(p.futCombinedOI) > 0)
     .slice()
     .sort((a, b) => a.minutes - b.minutes);
-  const build = (t, extra) => ({
+  const buildAnchor = (t, extra) => ({
     source: "timeline",
     time: t.time || dqHhmm(t.minutes),
     minutes: t.minutes,
@@ -133,8 +139,13 @@ export function pickSessionFuturesAnchor({ timeline = [], cachedBase = null } = 
   if (valid.length) {
     const basisOf = (p) => Number(p.futPrice) - Number(p.spot);
     const lastMin = Number(valid[valid.length - 1].minutes);
-    const limit = Math.min(valid.length, ANCHOR_MAX_CANDIDATES);
-    for (let i = 0; i < limit; i++) {
+    // Carry-over ticks by the cumulative futures volume reset (src/sessionOpen.js, same rule as the
+    // scorecard): every valid tick before the first live one is never a candidate. No volume → 0.
+    const live = firstLiveIndexByVolume(valid.map((p) => ({ minutes: Number(p.minutes), volume: p.futVolume })));
+    const liveStart = live.index > 0 ? live.index : 0;
+    const limit = Math.min(valid.length, liveStart + ANCHOR_MAX_CANDIDATES);
+    const build = (t, extra) => buildAnchor(t, { ...extra, volumeResetSkipped: liveStart });
+    for (let i = liveStart; i < limit; i++) {
       const c = valid[i];
       const cMin = Number(c.minutes);
       const followers = valid
@@ -161,7 +172,15 @@ export function pickSessionFuturesAnchor({ timeline = [], cachedBase = null } = 
         return build(c, { provisional: false, skippedStaleTicks: i });
       }
     }
-    // Every early candidate looked stale — never lose the anchor over a noisy open.
+    // Every early candidate looked stale — never lose the anchor over a noisy open. After a volume
+    // reset, fall back to the first LIVE tick (never a carry-over quote).
+    if (liveStart > 0) {
+      return build(valid[liveStart], {
+        provisional: true,
+        skippedStaleTicks: liveStart,
+        reason: `all first ${limit - liveStart} live ticks disagreed with the ticks after them — using the first live tick (after the futures volume reset)`,
+      });
+    }
     return build(valid[0], {
       provisional: true,
       skippedStaleTicks: 0,
@@ -941,7 +960,7 @@ function eodRepairTimelineReader(todayIso, timeline) {
   };
 }
 
-export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision, timeline = [] }) {
+export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision, timeline = [], spotIsReal = false, nseDataMins = null }) {
   const todayIso = getISTIsoDateStr();
   const dayName = new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" });
   const timeStr = `${getISTTimeStr()} IST`;
@@ -1016,6 +1035,8 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     eodDecision,
     todayTimeline: timeline,
     limit: 60,
+    spotIsReal, // finalise only from NSE's real spot ...
+    nseDataMins, // ... with data from after the closing-session freeze
   });
 
   if (REDIS_URL) {
@@ -3049,6 +3070,7 @@ async function refreshLiveSnapshotCore({
                 rawBasis: sessionAnchor.rawBasis,
                 provisional: sessionAnchor.provisional ?? null,
                 skippedStaleTicks: sessionAnchor.skippedStaleTicks ?? null,
+                volumeResetSkipped: sessionAnchor.volumeResetSkipped ?? null,
                 ...(sessionAnchor.reason ? { reason: sessionAnchor.reason } : {}),
               }
             : null;
@@ -3467,6 +3489,10 @@ async function refreshLiveSnapshotCore({
       roofStrike,
       eodDecision,
       timeline, // today's ticks: the opening tick resolves the previous session's carry
+      // Finalisation guard: `spot` above may be the display fallback; the row is finalised only
+      // from NSE's real underlying value with a data time after the 15:15–15:30 freeze.
+      spotIsReal: Number(v3Data.records?.underlyingValue) > 0,
+      nseDataMins: nseTimestampIstMinutes(v3Data.records?.timestamp, getISTIsoDateStr()),
     });
 
     // A closed weekend day (Saturday or an ordinary Sunday; src/marketCalendar.js) has no session:
@@ -3534,6 +3560,7 @@ async function refreshLiveSnapshotCore({
       isSettledSession: false,
       symbol: "NIFTY",
       spotPrice: spot,
+      spotIsReal: Number(v3Data.records?.underlyingValue) > 0, // false → spotPrice is the display fallback
       expiryDate,
       timestamp: timestampStr,
       floor: floorStrike,

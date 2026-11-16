@@ -179,6 +179,74 @@ test("anchor: a timeline anchor always wins over the Redis baseline", () => {
   assert.equal(early.source, "timeline");
 });
 
+// ── 16-Nov: carry-over opening tick detected by the cumulative futures volume reset ──
+
+const NOV16 = [
+  ["09:15", 25175, 25206.15, 208489, 2733315],
+  ["09:16", 25275, 25299.90, 208312, 68835],
+  ["09:17", 25284.4, 25299.90, 208312, 61620],
+  ["09:18", 25281.7, 25229.70, 207518, 187070],
+  ["09:19", 25270.7, 25258.40, 207379, 233480],
+  ["09:21", 25273.1, 25256.00, 207297, 255190],
+  ["09:22", 25275.3, 25260.3, 207361, 282165],
+  ["09:23", 25289.2, 25240.9, 207411, 318825],
+].map(([time, futPrice, spot, futCombinedOI, futVolume]) => {
+  const [h, m] = time.split(":").map(Number);
+  return { time, minutes: h * 60 + m, futPrice, spot, futCombinedOI, futVolume };
+});
+const noVol = (tl) => tl.map(({ futVolume, ...rest }) => rest);
+
+test("anchor 16-Nov: 09:15 is a carry-over tick by the volume reset; anchor stays 09:19 (basis rule), never 09:15", () => {
+  const a = pickSessionFuturesAnchor({ timeline: NOV16 });
+  assert.equal(a.time, "09:19");
+  assert.equal(a.provisional, false);
+  assert.equal(a.volumeResetSkipped, 1);
+  assert.equal(a.skippedStaleTicks, 4, "09:15 by volume, 09:16–09:18 by basis");
+  assert.equal(pickSessionFuturesAnchor({ timeline: NOV16.slice().reverse() }).time, "09:19");
+  for (let n = 1; n <= NOV16.length; n++) {
+    const p = pickSessionFuturesAnchor({ timeline: NOV16.slice(0, n) });
+    if (n >= 2) assert.notEqual(p.time, "09:15", `${n} ticks`);
+  }
+});
+
+test("anchor: a stale first tick that PASSES the basis and OI tests is still excluded after a volume reset", () => {
+  // Basis and OI identical on every tick (the follower tests cannot see it); only the volume resets.
+  const tl = series(12, () => 40, () => 210000).map((p, i) => ({ ...p, futVolume: i === 0 ? 3000000 : 50000 + 20000 * i }));
+  const before = pickSessionFuturesAnchor({ timeline: noVol(tl) });
+  assert.equal(before.time, "09:15", "without volume the stale tick would be the anchor");
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.equal(a.time, "09:16");
+  assert.equal(a.provisional, false);
+  assert.deepEqual([a.volumeResetSkipped, a.skippedStaleTicks], [1, 1]);
+});
+
+test("anchor: no futVolume on any tick → identical result to the code before the volume rule (13-Nov, 12-Nov fixtures)", async () => {
+  const strip = (a) => { if (!a) return a; const { volumeResetSkipped, ...rest } = a; assert.equal(volumeResetSkipped, 0); return rest; };
+  // 13-Nov (as asserted above, unchanged) and the 12-Nov / 11-Nov captured timelines.
+  assert.deepEqual(strip(pickSessionFuturesAnchor({ timeline: NOV13 })), { source: "timeline", time: "09:17", minutes: 557, futPrice: 25170, spot: 25135.75, futCombinedOI: 212215, rawBasis: 34.25, provisional: false, skippedStaleTicks: 2 });
+  const fs = await import("node:fs");
+  const fx = (d) => JSON.parse(fs.readFileSync(new URL(`./fixtures/nifty-oi-2026-11-${d}.json`, import.meta.url), "utf8")).intradayTimeline;
+  const tl12 = fx("12");
+  assert.ok(!tl12.some((p) => p && p.futVolume != null), "fixture carries no volume");
+  assert.deepEqual(strip(pickSessionFuturesAnchor({ timeline: tl12 })), { source: "timeline", time: "09:16", minutes: 556, futPrice: 25189, spot: 25192.3, futCombinedOI: 200031, rawBasis: -3.3, provisional: false, skippedStaleTicks: 0 });
+  assert.deepEqual(strip(pickSessionFuturesAnchor({ timeline: fx("11") })), { source: "timeline", time: "09:15", minutes: 555, futPrice: 25414.2, spot: 25339.3, futCombinedOI: 212344, rawBasis: 74.9, provisional: false, skippedStaleTicks: 0, reason: "too few ticks in the following window to check for a stale quote" });
+  // NOV16 with volume removed: the basis rule alone (09:15 passes nothing different) — and no volumeResetSkipped.
+  assert.equal(pickSessionFuturesAnchor({ timeline: noVol(NOV16) }).volumeResetSkipped, 0);
+});
+
+test("anchor fallback: when every candidate looks stale after a volume reset, the first LIVE tick is used", () => {
+  const tl = series(30, () => 40, (i) => 210000 * (i % 2 ? 0.98 : 1.02)).map((p, i) => ({ ...p, futVolume: i === 0 ? 3000000 : 50000 + 20000 * i }));
+  const a = pickSessionFuturesAnchor({ timeline: tl });
+  assert.equal(a.time, "09:16");
+  assert.equal(a.provisional, true);
+  assert.deepEqual([a.volumeResetSkipped, a.skippedStaleTicks], [1, 1]);
+  assert.match(a.reason, /first live tick/);
+  // Same timeline without volume → the old fallback (first valid tick).
+  const b = pickSessionFuturesAnchor({ timeline: noVol(tl) });
+  assert.deepEqual([b.time, b.skippedStaleTicks, b.volumeResetSkipped], ["09:15", 0, 0]);
+  assert.match(b.reason, /all first 15 valid ticks disagreed/);
+});
+
 // ── 2.2 NO CARRY: no agreement percentage ──
 
 const closing = (callEnd) => {

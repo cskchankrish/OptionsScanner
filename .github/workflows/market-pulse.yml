@@ -1,19 +1,25 @@
 name: Market Hours OI Pulse
 
-# Backup poller. The primary schedule is Upstash QStash -> /api/poll (see docs/poller-setup.md);
-# GitHub's scheduler is best-effort and often skips runs, so this only fills gaps.
+# BEST-EFFORT ONLY. This workflow has NOT provided cover: GitHub ran it once on Monday 2026-11-16,
+# at 16:21 IST (after the close), and only 1-3 times a day in the week before, mostly late.
+# GitHub's scheduler delays or drops scheduled runs at busy times, especially on the hour and on
+# round minutes. Do not count on it.
+#
+# The real redundancy is the VM poller plus Upstash QStash -> /api/poll (docs/poller-setup.md),
+# and the POLLER DOWN Telegram alert (docs/data-quality.md) when the poller heartbeat goes stale.
 #
 # Requires the repository secret POLL_SECRET (same value as the Vercel env var TV_WEBHOOK_SECRET).
 # It is sent as the x-webhook-secret header, never in the URL.
 
 on:
   schedule:
-    # Every 5 minutes, Mon-Fri only: 03:00 - 11:55 UTC, polled only 09:15 - 15:40 IST below.
+    # Every 10 minutes on off-peak minutes (:07, :17, ... :57), Mon-Fri only:
+    # 03:07 - 10:57 UTC = 08:37 - 16:27 IST; polled only 09:15 - 15:40 IST (gate below).
     # Weekends are closed. The once-a-year Diwali Muhurat session (a weekend date in the Muhurat
     # list, src/marketCalendar.js / env MUHURAT_DATES) is covered by a one-off QStash schedule or a
     # manual authenticated call to /api/poll; the endpoint itself gates by that date list and returns
     # MARKET_CLOSED on every other Saturday/Sunday.
-    - cron: "*/5 3-11 * * 1-5"
+    - cron: "7-57/10 3-10 * * 1-5"
   workflow_dispatch:
 
 jobs:

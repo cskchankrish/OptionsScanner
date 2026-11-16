@@ -50,12 +50,22 @@ const num = (v, d) => {
   return Number.isFinite(n) && n > 0 ? n : d;
 };
 
+/** FUSION events: minutes after an emitted change before the same stream may emit again (0 = every change). */
+export const SC_FUSION_REARM_MIN = 10;
+
+function nonNegative(v, d) {
+  if (v === undefined || v === null || String(v).trim() === "") return d;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : d;
+}
+
 export function getScorecardConfig(env = process.env) {
   return {
     enabled: String(env.SCORECARD_ENABLED ?? "true").trim().toLowerCase() !== "false",
     bandPct: num(env.SCORECARD_BAND_PCT, 0.2),
     minSample: Math.round(num(env.SCORECARD_MIN_SAMPLE, SC_MIN_SAMPLE)),
     noCarryBandPct: num(env.SCORECARD_NO_CARRY_BAND_PCT, SC_NO_CARRY_BAND_PCT),
+    fusionRearmMin: nonNegative(env.SCORECARD_FUSION_REARM_MIN, SC_FUSION_REARM_MIN),
   };
 }
 
@@ -84,7 +94,7 @@ const ENV_WHITELIST = [
   "TURN_NOISE_PCT", "TURN_OI_NOISE_PCT", "TURN_OPTIONS_MIN_NET", "REVERSAL_MIN_MOVE_PCT", "REVERSAL_MIN_OI_PCT", "REVERSAL_MIN_ELAPSED_MIN",
   "FLOW_BRIDGE_ENABLED", "FLOW_BRIDGE_DECISIONS", "FLOW_BRIDGE_TIMEOUT_MS", "FLOW_BRIDGE_FILL_WAIT_SEC", "FLOW_ALGO_SQUAREOFF_TIME",
   "CARRY_BRIDGE_ENABLED", "CARRY_WINDOW_START", "CARRY_WINDOW_END", "CARRY_REPORT_TIME", "CARRY_REQUIRED_POLLS", "CARRY_MIN_AGREEMENT", "CARRY_MIN_POLL_GAP_SEC",
-  "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT",
+  "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT", "SCORECARD_FUSION_REARM_MIN",
   "CANDIDATE_SHADOW_ENABLED",
   ...TRAP_SHADOW_ENV_KEYS,
   ...PLAN_DOC_ENV_KEYS,
@@ -134,24 +144,39 @@ function baseEvent(reading, section, type, direction, data, dq, key) {
  * @param {object} reading { t, minutes, futPrice, spot, futuresExpiry, dq:{state,coveragePct},
  *   fusion:{quadrant, scenario}, turn (turnTracker), radar (macroTurn), eod:{verdict,bias,score,
  *   groups:{A,B,C}, unverifiedGroups, slot, category, stopLoss} }
+ * @param {object} [opts] { fusionRearmMin } — default SC_FUSION_REARM_MIN (recordReading passes the env value)
  * @returns {{ events: object[], state: object }}  never mutates its inputs
  */
-export function captureEvents(prev, reading) {
+export function captureEvents(prev, reading, opts = {}) {
   const s = prev ? JSON.parse(JSON.stringify(prev)) : { fusionQuadrant: null, fusionScenario: null, turn: {}, radarKeys: [], eod: { lastSlot: null, lastCategory: null, last: null } };
   const events = [];
   const sessionDq = { ok: reading.dq?.state === "OK", state: reading.dq?.state || null, coveragePct: reading.dq?.coveragePct ?? null };
 
-  // Fusion (whole day): each change of quadrant and of scenario.
-  const q = reading.fusion?.quadrant || null;
-  if (q && s.fusionQuadrant && q !== s.fusionQuadrant) {
-    events.push(baseEvent(reading, "FUSION", "QUADRANT_CHANGE", QUAD_DIR[q] || null, { from: s.fusionQuadrant, to: q }, sessionDq, `${s.fusionQuadrant}>${q}`));
-  }
-  if (q) s.fusionQuadrant = q;
-  const sc = reading.fusion?.scenario || null;
-  if (sc && s.fusionScenario && sc !== s.fusionScenario) {
-    events.push(baseEvent(reading, "FUSION", "SCENARIO_CHANGE", SCEN_DIR[sc] || null, { from: s.fusionScenario, to: sc }, sessionDq, `${s.fusionScenario}>${sc}`));
-  }
-  if (sc) s.fusionScenario = sc;
+  // Fusion (whole day), per stream (quadrant, scenario): a change event only when the value differs
+  // from the last EMITTED value and at least `rearmMin` minutes have passed since that emit, so
+  // flicker (16-Nov 14:02–14:11) counts once. `from` is the last emitted value. The first value of
+  // the day initialises the stream without an event. s.fusionQuadrant / s.fusionScenario still track
+  // the latest reading. A state written before this rule (no `fusionEmit`) starts from the stored
+  // latest value with no emit time, so its next change emits.
+  const rearmMin = nonNegative(opts.fusionRearmMin, SC_FUSION_REARM_MIN);
+  if (!s.fusionEmit || typeof s.fusionEmit !== "object") s.fusionEmit = {};
+  const fusionStream = (name, latestKey, value, type, dirMap) => {
+    if (!s.fusionEmit[name] || typeof s.fusionEmit[name] !== "object") {
+      s.fusionEmit[name] = { lastEmitted: s[latestKey] || null, lastEmitMinutes: null };
+    }
+    const st = s.fusionEmit[name];
+    if (!value) return;
+    if (!st.lastEmitted) {
+      st.lastEmitted = value;
+    } else if (value !== st.lastEmitted && (st.lastEmitMinutes == null || !Number.isFinite(Number(reading.minutes)) || Number(reading.minutes) - Number(st.lastEmitMinutes) >= rearmMin)) {
+      events.push(baseEvent(reading, "FUSION", type, dirMap[value] || null, { from: st.lastEmitted, to: value }, sessionDq, `${st.lastEmitted}>${value}`));
+      st.lastEmitted = value;
+      st.lastEmitMinutes = Number.isFinite(Number(reading.minutes)) ? Number(reading.minutes) : null;
+    }
+    s[latestKey] = value;
+  };
+  fusionStream("quadrant", "fusionQuadrant", reading.fusion?.quadrant || null, "QUADRANT_CHANGE", QUAD_DIR);
+  fusionStream("scenario", "fusionScenario", reading.fusion?.scenario || null, "SCENARIO_CHANGE", SCEN_DIR);
 
   // Turn Tracker: each stage transition per extreme.
   const tt = reading.turn;
@@ -842,9 +867,10 @@ async function appendEvents(store, date, events) {
 /** Records one refresh reading: change detection + append-only events. Measurement only. */
 export async function recordReading({ store, date, reading, env = process.env }) {
   try {
-    if (!store || !getScorecardConfig(env).enabled) return { status: "DISABLED", events: 0 };
+    const cfg = getScorecardConfig(env);
+    if (!store || !cfg.enabled) return { status: "DISABLED", events: 0 };
     const prev = await store.get(keys.state(date));
-    const { events, state } = captureEvents(prev, reading);
+    const { events, state } = captureEvents(prev, reading, { fusionRearmMin: cfg.fusionRearmMin });
     await store.set(keys.state(date), state, SC_TTL_SEC);
     if (events.length) await appendEvents(store, date, events);
     return { status: "OK", events: events.length };
