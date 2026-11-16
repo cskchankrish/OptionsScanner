@@ -9,7 +9,27 @@ import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 const VARIANT_LABEL = { BEAR_TRAP_BASE: "Bear trap — current rule", BEAR_TRAP_STRICT: "Bear trap — tighter (shadow)", BULL_TRAP_BASE: "Bull trap — current rule", BULL_TRAP_STRICT: "Bull trap — tighter (shadow)" };
-const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", TRADE: "Algo trades (₹)" };
+const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", CANDIDATE: "Candidate alerts — real-chain verdict (shadow, no orders)", TRADE: "Algo trades (₹)" };
+const SPLIT_LABEL = {
+  "category:CONFIRMED": "Confirmed by the real chain",
+  "category:UNCONFIRMED": "Let through, not confirmed by the chain",
+  "category:REJECTED": "Rejected (vetoed) by the real chain",
+  "category:UNVERIFIABLE": "Unverifiable (no fresh chain / ΔPCR)",
+  "grade:SYNERGY_BULL_CAND": "Bull synergy candidates",
+  "grade:SYNERGY_BEAR_CAND": "Bear synergy candidates",
+  "grade:BEAR_TRAP_BUY_CAND": "Bear trap (buy) candidates",
+  "grade:BULL_TRAP_SELL_CAND": "Bull trap (sell) candidates",
+};
+/** Sub-rows of a section: [key, label, stats]. CANDIDATE has two splits (category and grade). */
+function splitsOf(s) {
+  if (s.byCategory || s.byGrade) {
+    return [
+      ...Object.entries(s.byCategory || {}).map(([k, v]) => [`category:${k}`, SPLIT_LABEL[`category:${k}`] || k, v]),
+      ...Object.entries(s.byGrade || {}).map(([k, v]) => [`grade:${k}`, SPLIT_LABEL[`grade:${k}`] || k, v]),
+    ];
+  }
+  return Object.entries(s.byStage || s.byDecision || s.byVariant || {}).map(([k, v]) => [k, VARIANT_LABEL[k] || k.replace(/_/g, " "), v]);
+}
 
 function istToday() {
   const d = new Date(Date.now() + 330 * 60000);
@@ -113,9 +133,9 @@ export function ScorecardView({ t, isDark }) {
                 <td style={cell}>{pts(s.meanExcursion60.mfePts)}</td>
                 <td style={cell}>{pts(s.meanExcursion60.maePts)}</td>
               </tr>,
-              ...Object.entries(s.byStage || s.byDecision || s.byVariant || {}).map(([k, v]) => (
+              ...splitsOf(s).map(([k, label, v]) => (
                 <tr key={`${sec}:${k}`} style={{ color: t.textSub }}>
-                  <td style={{ ...cell, paddingLeft: 22 }}>{VARIANT_LABEL[k] || k.replace(/_/g, " ")}</td>
+                  <td style={{ ...cell, paddingLeft: 22 }}>{label}</td>
                   <td style={cell}><Rate s={v} t={t} /></td>
                   <td style={cell}>{v.excludedUnmeasurable}</td>
                   <td style={cell}>{v.events}</td>

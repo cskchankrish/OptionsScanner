@@ -45,6 +45,18 @@ import {
 import { parseAlgoPnl, algoPnlLines, formatInr, indexMovePts } from "../src/algoPnl.js";
 import { formatEodCardLines } from "../src/eodCard.js";
 import { recordEvent as scRecordEvent, scStoreFromClient, buildSignalEvent, buildTradeEvent, istOf as scIstOf } from "../src/scorecard.js";
+import { buildCandidateEvent } from "../src/scorecard.js";
+import {
+  isCandidateGrade,
+  normalizeGrade as normalizeCandidateGrade,
+  realGradeFor,
+  isCandidateShadowEnabled,
+  classifyCandidate,
+  buildCandidateRecord,
+  candidateListKey,
+  CANDIDATE_LIST_CAP,
+  CANDIDATE_TTL_SEC,
+} from "../src/candidateShadow.js";
 
 /** Appends one scorecard event (measurement only; never throws, never changes a response). */
 async function scRecord(redis, event) {
@@ -1796,6 +1808,49 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
 /**
  * Main Vercel / Express Serverless Handler
  */
+/**
+ * Shadow candidate alert (*_CAND grades from Pine v4.3.1) — LOG ONLY.
+ * Asks fuseChartWithOptionChain what the REAL grade would get against the live `nifty:flow:latest`
+ * snapshot (no session fallback, no on-demand NSE refresh), classifies it and records it in its own
+ * list `nifty:tv:candidates:<date>` plus a scorecard CANDIDATE event. It never reads or writes
+ * nifty:tv:active_trade, never dispatches to the Algo, never sends Telegram and never writes
+ * nifty:tv:latest_signal, the daily signals list or the master archive.
+ */
+async function handleCandidateShadow({ redis, payload, res, istDate }) {
+  if (!isCandidateShadowEnabled()) {
+    return res.status(200).json({ ok: true, event: "CANDIDATE_IGNORED" });
+  }
+  const deps = getWebhookDeps();
+  const grade = normalizeCandidateGrade(payload.grade);
+  const realGrade = realGradeFor(grade);
+  let liveScanner = null;
+  try {
+    liveScanner = await readFlowSnapshot(redis); // nifty:flow:latest only
+  } catch (e) {
+    liveScanner = null;
+  }
+  const nowMs = deps.now();
+  const fused = fuseChartWithOptionChain({ ...payload, grade: realGrade }, liveScanner, nowMs);
+  const snapshotAgeSec = fused.liveOptionChainMetrics.snapshotAgeSec;
+  const snapshotOk = Boolean(liveScanner) && snapshotAgeSec !== null && snapshotAgeSec <= getFlowMaxAgeSec();
+  const category = classifyCandidate({ realGrade, fused, snapshotOk });
+  const record = buildCandidateRecord({ grade, realGrade, fused, category, snapshotAgeSec, nowMs });
+
+  if (redis) {
+    const key = candidateListKey(istDate);
+    try {
+      await redis.lpush(key, JSON.stringify(record));
+      await redis.ltrim(key, 0, CANDIDATE_LIST_CAP - 1);
+      if (typeof redis.expire === "function") await redis.expire(key, CANDIDATE_TTL_SEC);
+    } catch (e) {
+      console.warn("[tv-webhook] candidate record not stored:", e?.message || e);
+    }
+  }
+  await scRecord(redis, buildCandidateEvent(record, nowMs));
+
+  return res.status(200).json({ ok: true, event: "CANDIDATE_SHADOW", grade, realGrade, category, decision: "SHADOW_ONLY", realDecision: fused.decision });
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -2072,6 +2127,17 @@ export default async function handler(req, res) {
         });
       }
 
+      // Shadow candidate alerts for the date (newest first; log-only, never orders).
+      let candidates = [];
+      if (redis) {
+        try {
+          const raw = await redis.lrange(candidateListKey(queryDate), 0, CANDIDATE_LIST_CAP - 1);
+          candidates = (raw || []).map((item) => (typeof item === "string" ? JSON.parse(item) : item));
+        } catch (e) {
+          candidates = [];
+        }
+      }
+
       return res.status(200).json({
         lastResult,
         success: true,
@@ -2081,6 +2147,7 @@ export default async function handler(req, res) {
         openCarry,
         latestSignal,
         signals,
+        candidates,
       });
     } catch (err) {
       return res.status(500).json({ error: "Failed to read signals", details: err.message });
@@ -2107,6 +2174,12 @@ export default async function handler(req, res) {
     }
     if (!payload || typeof payload !== "object") {
       return res.status(400).json({ error: "Invalid JSON payload" });
+    }
+
+    // 1-. Shadow candidate alerts (*_CAND): log-only, handled and answered here, so they can never
+    //     reach the actionable pipeline (orders) or the generic LOG_ONLY path (Telegram/latest_signal).
+    if (isCandidateGrade(payload.grade)) {
+      return await handleCandidateShadow({ redis, payload, res, istDate });
     }
 
     // 1a. Algo entry outcome sync-back (contract v1.1): ENTRY_FILLED / ENTRY_FAILED.
@@ -2297,6 +2370,8 @@ export default async function handler(req, res) {
         // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis.
         //    Actionable grades may only be verified against the live `nifty:flow:latest`
         //    snapshot; the 14-day session payload is an informational fallback for other grades.
+        //    Exact grade matches on purpose: shadow candidates (e.g. SYNERGY_BULL_CAND) must never
+        //    match here (they are answered earlier by handleCandidateShadow; tested).
         const isTrap = payload.grade === "BEAR_TRAP_BUY" || payload.grade === "BULL_TRAP_SELL";
         const isSynergy = payload.grade === "SYNERGY_BULL" || payload.grade === "SYNERGY_BEAR";
         const isActionable = isTrap || isSynergy;

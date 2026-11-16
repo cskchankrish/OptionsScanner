@@ -68,6 +68,7 @@ export const HIT_RULES = {
   EOD_SLOT: "Directional: futures reach +band in the verdict's direction before −band, within 60 minutes (band 0.20%).",
   EOD: "BTST/STBT: next session's 09:20 futures price is beyond the final reading's reference in the verdict's direction. NO CARRY: |09:20 − reference| < 0.35%.",
   SIGNAL: "Futures-equivalent T1 is reached before the stop, within the same session (approved and vetoed alike).",
+  CANDIDATE: "Same rule as SIGNAL: futures-equivalent T1 is reached before the stop, within the same session. Shadow candidate alerts judged against the real option chain — no orders, no Telegram.",
   TRADE: "The Algo-reported rupee result is above zero, counted only when the Algo says every account's exit price is known.",
 };
 
@@ -81,6 +82,7 @@ const ENV_WHITELIST = [
   "FLOW_BRIDGE_ENABLED", "FLOW_BRIDGE_DECISIONS", "FLOW_BRIDGE_TIMEOUT_MS", "FLOW_BRIDGE_FILL_WAIT_SEC", "FLOW_ALGO_SQUAREOFF_TIME",
   "CARRY_BRIDGE_ENABLED", "CARRY_WINDOW_START", "CARRY_WINDOW_END", "CARRY_REPORT_TIME", "CARRY_REQUIRED_POLLS", "CARRY_MIN_AGREEMENT", "CARRY_MIN_POLL_GAP_SEC",
   "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT",
+  "CANDIDATE_SHADOW_ENABLED",
   ...TRAP_SHADOW_ENV_KEYS,
 ];
 
@@ -282,6 +284,33 @@ export function buildSignalEvent(fused, nowMs) {
   };
 }
 
+/**
+ * CANDIDATE event from a shadow candidate record (src/candidateShadow.js buildCandidateRecord).
+ * Same shape as a SIGNAL event (spot entry, sl, t1, t2 in data) so measureSignal applies unchanged.
+ */
+export function buildCandidateEvent(rec, nowMs) {
+  const ist = istOf(nowMs);
+  return {
+    id: `CANDIDATE:${rec?.grade}:${ist.minutes}:${nowMs}`,
+    key: String(nowMs),
+    t: nowMs,
+    time: hhmm(ist.minutes),
+    minutes: ist.minutes,
+    section: "CANDIDATE",
+    type: String(rec?.grade || "CANDIDATE"),
+    direction: rec?.direction === "LONG" ? "BULLISH" : rec?.direction === "SHORT" ? "BEARISH" : null,
+    futPrice: null,
+    spot: r2(rec?.entry),
+    data: {
+      realGrade: rec?.realGrade ?? null, category: rec?.category ?? null, decision: rec?.realDecision ?? null,
+      entry: r2(rec?.entry), sl: r2(rec?.sl), t1: r2(rec?.t1), t2: r2(rec?.t2),
+      deltaPcr: rec?.deltaPcr ?? null, serverFutQuad: rec?.serverFutQuad ?? null, chartFutQuad: rec?.chartFutQuad ?? null,
+      snapshotAgeSec: rec?.snapshotAgeSec ?? null,
+    },
+    dq: { ok: rec?.category !== "UNVERIFIABLE", text: rec?.category === "UNVERIFIABLE" ? "no fresh option-chain snapshot / ΔPCR" : null },
+  };
+}
+
 /** TRADE event (Algo-owned intraday exit or carry exit) with the Algo's rupee result. */
 export function buildTradeEvent({ kind, tradeId, exitGrade, direction, entry, exitPrice, pnlInr, pnlKnown, accountsCount, nowMs }) {
   const ist = istOf(nowMs);
@@ -470,7 +499,8 @@ export function measureEodNext(final, nextSeries, { nextDate, noCarryBandPct = S
 
 /** Outcome for any recorded event. */
 export function measureEvent(event, series, cfg = getScorecardConfig()) {
-  if (event.section === "SIGNAL") return measureSignal(event, series);
+  // CANDIDATE uses the SIGNAL rule unchanged so the two hit rates are directly comparable.
+  if (event.section === "SIGNAL" || event.section === "CANDIDATE") return measureSignal(event, series);
   if (event.section === "TRADE") {
     const d = event.data || {};
     if (d.pnlKnown === true && Number.isFinite(Number(d.pnlInr))) return { status: "MEASURED", pnlInr: Number(d.pnlInr), hit: Number(d.pnlInr) > 0 };
@@ -527,7 +557,9 @@ export function statsFor(rows, { minSample = SC_MIN_SAMPLE } = {}) {
   };
 }
 
-const SECTIONS = ["FUSION", "TURN", "RADAR", "TRAP_SHADOW", "EOD", "EOD_SLOT", "SIGNAL", "TRADE"];
+const SECTIONS = ["FUSION", "TURN", "RADAR", "TRAP_SHADOW", "EOD", "EOD_SLOT", "SIGNAL", "CANDIDATE", "TRADE"];
+export const CANDIDATE_SC_CATEGORIES = ["CONFIRMED", "UNCONFIRMED", "REJECTED", "UNVERIFIABLE"];
+export const CANDIDATE_SC_GRADES = ["SYNERGY_BULL_CAND", "SYNERGY_BEAR_CAND", "BEAR_TRAP_BUY_CAND", "BULL_TRAP_SELL_CAND"];
 
 /** Rolling aggregate over day documents. */
 export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = true } = {}) {
@@ -544,6 +576,10 @@ export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = tru
     if (sec === "TURN") out.sections[sec].byStage = Object.fromEntries(["EARLY", "LIKELY_TURN", "CONFIRMED"].map((st) => [st, statsFor(r.filter((x) => x.event.type === st), { minSample })]));
     if (sec === "TRAP_SHADOW") out.sections[sec].byVariant = Object.fromEntries(TRAP_SHADOW_VARIANTS.map(([v]) => [v, statsFor(r.filter((x) => x.event.type === v), { minSample })]));
     if (sec === "SIGNAL") out.sections[sec].byDecision = Object.fromEntries(["APPROVED", "VETOED", "NOT_EXECUTED", "BLOCKED", "DOWNGRADED"].map((c) => [c, statsFor(r.filter((x) => x.event.data?.category === c), { minSample })]));
+    if (sec === "CANDIDATE") {
+      out.sections[sec].byCategory = Object.fromEntries(CANDIDATE_SC_CATEGORIES.map((c) => [c, statsFor(r.filter((x) => x.event.data?.category === c), { minSample })]));
+      out.sections[sec].byGrade = Object.fromEntries(CANDIDATE_SC_GRADES.map((g) => [g, statsFor(r.filter((x) => x.event.type === g), { minSample })]));
+    }
   }
   return out;
 }
@@ -592,7 +628,8 @@ const plain = (v) => String(v ?? "").replace(/[_*`[\]]/g, " ").replace(/\s+/g, "
 const gapList = (gaps) => { const g = (gaps || []).map((x) => `${x.from}–${x.to}`); return g.length > 6 ? `${g.slice(0, 6).join(", ")} … (${g.length - 6} more)` : g.join(", "); };
 
 export function formatDailyTelegram(doc) {
-  const rows = rowsOf(doc);
+  // Shadow candidates are never part of the Telegram message (not even in the unmeasurable count).
+  const rows = rowsOf(doc).filter((x) => x.ev.section !== "CANDIDATE");
   const lines = [`📊 *Scorecard ${doc.date}*${doc.backfilled ? " (backfilled)" : ""}`];
   const dq = doc.dataQuality;
   lines.push(`• *Data:* ${dq ? `${dq.state} · ${dq.coveragePct ?? "?"}% coverage${dq.gaps?.length ? ` · gaps ${gapList(dq.gaps)}` : ""}` : "unknown"}`);
@@ -658,6 +695,8 @@ export function aggregateToCsv(agg) {
     for (const [k, v] of Object.entries(s.byStage || {})) out.push(line(sec, `stage:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byDecision || {})) out.push(line(sec, `decision:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byVariant || {})) out.push(line(sec, `variant:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byCategory || {})) out.push(line(sec, `category:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byGrade || {})) out.push(line(sec, `grade:${k}`, v).map(csvEsc).join(","));
   }
   return out.join("\n");
 }
