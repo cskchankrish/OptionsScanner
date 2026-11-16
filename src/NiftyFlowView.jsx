@@ -5,6 +5,13 @@ import {
   loadAndSanitizeStorageHistory,
   normalizeDateToIso,
   formatIsoToDisplayDate,
+  buildTodayEodRow,
+  eodRowsForStorage,
+  isSessionDate,
+  isSeedRow,
+  computeEodTrackStats,
+  formatEodWinRate,
+  eodUnresolvedLabel,
 } from "./eodTrackRecord.js";
 import {
   classifyFuturesQuadrant,
@@ -1548,7 +1555,8 @@ export function NiftyFlowView({ t, isDark }) {
       if (storedHistory) {
         const parsed = JSON.parse(storedHistory);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          setEodHistory(prev => mergeEodHistory(prev, parsed));
+          // Sanitised: closed-weekend rows dropped, provisional (in-progress) rows not reloaded.
+          setEodHistory(prev => mergeEodHistory(prev, eodRowsForStorage(parsed)));
         }
       } else {
         localStorage.removeItem("options_scanner_eod_history_v4");
@@ -1657,38 +1665,39 @@ export function NiftyFlowView({ t, isDark }) {
         if (data.eodHistory || data.eodDecision) {
           setEodHistory(prev => {
             let merged = prev;
-            if (Array.isArray(data.eodHistory) && data.eodHistory.length > 0) {
-              merged = mergeEodHistory(merged, data.eodHistory);
+            const serverRows = Array.isArray(data.eodHistory) ? data.eodHistory : [];
+            if (serverRows.length > 0) {
+              merged = mergeEodHistory(merged, serverRows);
             }
-            if (data.eodDecision) {
-              const todayEntry = {
-                id: `eod_${todayKey}`,
-                isoDate: todayKey,
-                date: formatIsoToDisplayDate(todayKey),
+            // Today's row: trust the server's row when it sent one. Only when it did not (and only on
+            // a session day, from a live — not settled-cache — payload) build a local provisional row
+            // with the same lifecycle as the server (IN_PROGRESS until the verdict is final).
+            const serverHasToday = serverRows.some(r => normalizeDateToIso(r?.isoDate || r?.date || r?.id) === todayKey);
+            if (data.eodDecision && !serverHasToday && isSessionDate(todayKey) && data.isLive !== false && !data.isSettledSession) {
+              const existing = merged.find(r => r.isoDate === todayKey) || null;
+              const todayEntry = buildTodayEodRow({
+                todayIso: todayKey,
+                nowMins,
+                timeStr: `${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false })} IST`,
                 dayName: new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" }),
-                time: `${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false })} IST`,
-                verdict: data.eodDecision.verdict,
-                bias: data.eodDecision.bias,
-                score: data.eodDecision.score,
-                conviction: data.eodDecision.conviction,
-                sizing: data.eodDecision.sizing,
-                entrySpot: data.spotPrice || 0,
-                outcome: data.eodDecision.bias === "NEUTRAL" ? "PRESERVED_CASH" : "PENDING",
-                floor: data.floor,
-                roof: data.roof,
-                pcr: data.pcr,
-                deltaPcr: data.deltaPcr,
-                pcrWarning: data.pcrWarning,
-                action: data.eodDecision.action,
-                stopLoss: data.eodDecision.stopLoss,
-                target: data.eodDecision.target,
-                keyReasons: (data.eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
-                audit: data.eodDecision.audit,
-              };
-              merged = mergeEodHistory(merged, [todayEntry]);
+                spot: data.spotPrice,
+                floorStrike: data.floor,
+                roofStrike: data.roof,
+                eodDecision: data.eodDecision,
+                existing,
+                extra: {
+                  stopLoss: data.eodDecision.stopLoss,
+                  target: data.eodDecision.target,
+                  audit: data.eodDecision.audit,
+                },
+              });
+              if (todayEntry && todayEntry !== existing) {
+                merged = [todayEntry, ...merged.filter(r => r.isoDate !== todayKey)];
+              }
             }
             try {
-              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(merged));
+              // Provisional rows and closed-weekend rows are never written to localStorage.
+              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(eodRowsForStorage(merged)));
             } catch (e) {}
             return merged;
           });
@@ -2346,30 +2355,38 @@ export function NiftyFlowView({ t, isDark }) {
           : (isDark ? "#291804" : "#fffbeb");
         const borderTint = isBull ? "#16a34a55" : isBear ? "#ef444455" : "#d9770655";
 
-        // Performance metrics from eodHistory
-        const carriedTrades = (eodHistory || []).filter(h => h.verdict && (h.verdict.includes("BTST") || h.verdict.includes("STBT")));
-        const resolvedCarried = carriedTrades.filter(h => h.outcome === "WIN" || h.outcome === "LOSS");
-        const wonTrades = carriedTrades.filter(h => h.outcome === "WIN");
-        const winRate = resolvedCarried.length > 0 ? ((wonTrades.length / resolvedCarried.length) * 100).toFixed(1) : "0.0";
-        const cashDays = (eodHistory || []).filter(h => h.verdict && (h.verdict.includes("CASH") || h.outcome === "PRESERVED_CASH")).length;
-        const netPts = (eodHistory || []).reduce((acc, h) => acc + (Number(h.gapPts) || 0), 0);
+        // Performance metrics from eodHistory (src/eodTrackRecord.js computeEodTrackStats):
+        // headline = rows recorded by the running system; hand-entered seed rows shown separately.
+        // IN_PROGRESS and UNRESOLVED rows count neither in the win rate nor as cash days.
+        const trackStats = computeEodTrackStats(eodHistory);
+        const liveStats = trackStats.live;
+        const seedStats = trackStats.seed;
+        const winRateText = formatEodWinRate(liveStats); // "7/10 (70.0%)" / "… — too few to judge"
+        const winRateShort = liveStats.resolved > 0
+          ? `${liveStats.wins}/${liveStats.resolved}${liveStats.tooFew ? " (too few)" : ` · ${liveStats.winRatePct.toFixed(1)}%`}`
+          : "too few";
+        const seedWinRateText = seedStats.resolved > 0 ? `${seedStats.wins}/${seedStats.resolved} (${seedStats.winRatePct.toFixed(1)}%)` : "none";
+        const netPts = liveStats.netPts;
         const netPtsFormatted = `${netPts >= 0 ? "+" : ""}${netPts.toFixed(1)}`;
+        const isCashRow = h => h.outcome === "PRESERVED_CASH" && h.bias !== "BULLISH" && h.bias !== "BEARISH";
 
         // Filtered items
         const filteredHistory = (eodHistory || []).filter(h => {
           if (historyFilter === "BTST") return h.verdict && h.verdict.includes("BTST");
           if (historyFilter === "STBT") return h.verdict && h.verdict.includes("STBT");
-          if (historyFilter === "CASH") return h.verdict && h.verdict.includes("CASH");
+          if (historyFilter === "CASH") return isCashRow(h);
           if (historyFilter === "WIN") return h.outcome === "WIN";
           return true;
         });
+        const cashFilterCount = (eodHistory || []).filter(isCashRow).length;
+        const winFilterCount = (eodHistory || []).filter(h => h.outcome === "WIN").length;
 
         const handleSaveCustomOpen = (id) => {
           const num = Number(customOpenSpot);
           if (!num || isNaN(num) || num <= 0) return;
           setEodHistory(prev => {
             const updated = prev.map(item => {
-              if (item.id === id || item.date === id) {
+              if ((item.id === id || item.date === id) && (item.outcome === "PENDING" || item.outcome === "UNRESOLVED")) {
                 const diff = Number((num - (item.entrySpot || num)).toFixed(1));
                 let outcome = "PENDING";
                 let gapPts = diff;
@@ -2388,13 +2405,14 @@ export function NiftyFlowView({ t, isDark }) {
                   nextDayOpen: num,
                   gapPts,
                   outcome,
+                  resolvedFrom: { date: null, time: null, source: "manual" },
                   notes: `Resolved open at ${num} (${gapPts >= 0 ? "+" : ""}${gapPts} pts)`
                 };
               }
               return item;
             });
             try {
-              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(updated));
+              localStorage.setItem("options_scanner_eod_history_v5", JSON.stringify(eodRowsForStorage(updated)));
               fetch("/api/nifty-oi", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -2487,7 +2505,7 @@ export function NiftyFlowView({ t, isDark }) {
                     color: eodTab === "history" ? "#ffffff" : t.text,
                     fontWeight: 900,
                   }}>
-                    {winRate}% Win
+                    {winRateShort} Win
                   </span>
                 </button>
               </div>
@@ -2738,7 +2756,10 @@ export function NiftyFlowView({ t, isDark }) {
                     color: t.accent,
                   }}
                 >
-                  <span>📜 View Track Record &amp; Audit Log ({eodHistory.length} Sessions · {winRate}% Win Rate)</span>
+                  <span>
+                    📜 View Track Record &amp; Audit Log ({liveStats.sessions} recorded sessions · win rate {winRateText})
+                    <span style={{ color: t.textMuted, fontWeight: 600 }}> · Hand-entered (before 7 Nov 2026): {seedWinRateText}</span>
+                  </span>
                   <span>Review Past Trades →</span>
                 </div>
               </>
@@ -2760,12 +2781,21 @@ export function NiftyFlowView({ t, isDark }) {
                     borderRadius: 8,
                     padding: "10px 12px",
                   }}>
-                    <div style={{ fontSize: 10, fontWeight: 800, color: "#16a34a", textTransform: "uppercase" }}>Carried Win Rate</div>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: "#16a34a", textTransform: "uppercase" }}>Carried Win Rate · Recorded live</div>
                     <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: "#16a34a", margin: "2px 0" }}>
-                      {winRate}%
+                      {liveStats.resolved > 0 ? `${liveStats.wins}/${liveStats.resolved}` : "—"}
+                      {liveStats.resolved > 0 && (
+                        <span style={{ fontSize: isMobile ? 12 : 14, fontWeight: 800, marginLeft: 6 }}>
+                          {liveStats.winRatePct.toFixed(1)}%
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 9.5, color: isDark ? "#86efac" : "#15803d" }}>
-                      {wonTrades.length} Wins / {resolvedCarried.length} Carried Trades
+                      {liveStats.tooFew ? `Too few to judge (${liveStats.resolved} resolved carr${liveStats.resolved === 1 ? "y" : "ies"}; ≥10 needed)` : `${liveStats.wins} wins / ${liveStats.resolved} resolved carries`}
+                      {(liveStats.pending + liveStats.unresolved + liveStats.inProgress) > 0 && ` · ${liveStats.pending} pending · ${liveStats.unresolved} unresolved · ${liveStats.inProgress} in progress (not scored)`}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
+                      Hand-entered (before 7 Nov 2026): {seedWinRateText}
                     </div>
                   </div>
 
@@ -2779,7 +2809,10 @@ export function NiftyFlowView({ t, isDark }) {
                     <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: netPts >= 0 ? "#16a34a" : "#ef4444", margin: "2px 0" }}>
                       {netPtsFormatted} pts
                     </div>
-                    <div style={{ fontSize: 9.5, color: t.textSub }}>Cumulative Morning Index Gaps</div>
+                    <div style={{ fontSize: 9.5, color: t.textSub }}>Morning gaps of resolved recorded-live carries</div>
+                    <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
+                      Hand-entered: {`${seedStats.netPts >= 0 ? "+" : ""}${seedStats.netPts.toFixed(1)}`} pts
+                    </div>
                   </div>
 
                   <div style={{
@@ -2790,9 +2823,12 @@ export function NiftyFlowView({ t, isDark }) {
                   }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: "#d97706", textTransform: "uppercase" }}>Capital Preserved</div>
                     <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: "#d97706", margin: "2px 0" }}>
-                      {cashDays} Days
+                      {liveStats.cashDays} Days
                     </div>
-                    <div style={{ fontSize: 9.5, color: isDark ? "#fde047" : "#b45309" }}>Avoided Chop &amp; Weekend Bleed</div>
+                    <div style={{ fontSize: 9.5, color: isDark ? "#fde047" : "#b45309" }}>Recorded-live no-carry days (final verdicts only)</div>
+                    <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
+                      Hand-entered: {seedStats.cashDays} days
+                    </div>
                   </div>
 
                   <div style={{
@@ -2803,9 +2839,14 @@ export function NiftyFlowView({ t, isDark }) {
                   }}>
                     <div style={{ fontSize: 10, fontWeight: 800, color: t.textMuted, textTransform: "uppercase" }}>Total Sessions</div>
                     <div style={{ fontSize: isMobile ? 18 : 22, fontWeight: 900, color: t.text, margin: "2px 0" }}>
-                      {eodHistory.length}
+                      {liveStats.sessions}
                     </div>
-                    <div style={{ fontSize: 9.5, color: t.textSub }}>Logged EOD Decisions</div>
+                    <div style={{ fontSize: 9.5, color: t.textSub }}>
+                      Recorded-live EOD decisions{liveStats.inProgress > 0 ? ` (+${liveStats.inProgress} in progress)` : ""}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
+                      Hand-entered: {seedStats.sessions}
+                    </div>
                   </div>
                 </div>
 
@@ -2815,8 +2856,8 @@ export function NiftyFlowView({ t, isDark }) {
                     { id: "ALL", label: `All (${eodHistory.length})` },
                     { id: "BTST", label: `🟢 BTST CE (${eodHistory.filter(h => h.verdict && h.verdict.includes("BTST")).length})` },
                     { id: "STBT", label: `🔴 STBT PE (${eodHistory.filter(h => h.verdict && h.verdict.includes("STBT")).length})` },
-                    { id: "CASH", label: `🛡️ Cash Preserved (${cashDays})` },
-                    { id: "WIN", label: `✅ Wins Only (${wonTrades.length})` },
+                    { id: "CASH", label: `🛡️ Cash Preserved (${cashFilterCount})` },
+                    { id: "WIN", label: `✅ Wins Only (${winFilterCount})` },
                   ].map(f => (
                     <button
                       key={f.id}
@@ -2848,6 +2889,19 @@ export function NiftyFlowView({ t, isDark }) {
                     const isWin = item.outcome === "WIN";
                     const isLoss = item.outcome === "LOSS";
                     const isPending = item.outcome === "PENDING";
+                    const isInProgress = item.outcome === "IN_PROGRESS";
+                    const isUnresolved = item.outcome === "UNRESOLVED";
+                    const canResolveOpen = isPending || isUnresolved;
+                    const isHandEntered = isSeedRow(item);
+                    const smallMarker = {
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: "1px 5px",
+                      borderRadius: 3,
+                      border: `1px solid ${t.border}`,
+                      color: t.textMuted,
+                      background: "transparent",
+                    };
 
                     return (
                       <div
@@ -2877,6 +2931,16 @@ export function NiftyFlowView({ t, isDark }) {
                             }}>
                               {item.verdict}
                             </span>
+                            {isHandEntered && (
+                              <span style={smallMarker} title="Typed into the source before 7 Nov 2026 (verdict written afterwards) — not recorded by the running system">
+                                hand-entered
+                              </span>
+                            )}
+                            {item.repaired && (
+                              <span style={{ ...smallMarker, cursor: "help" }} title={item.notes || "Repaired"}>
+                                repaired
+                              </span>
+                            )}
                           </div>
 
                           {/* Outcome Pill */}
@@ -2901,6 +2965,16 @@ export function NiftyFlowView({ t, isDark }) {
                                 ⏳ PENDING OPEN
                               </span>
                             )}
+                            {isInProgress && (
+                              <span title={item.notes || "session in progress — verdict not final"} style={{ fontSize: 10.5, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: "transparent", color: t.textSub, border: `1px solid ${t.border}` }}>
+                                In progress
+                              </span>
+                            )}
+                            {isUnresolved && (
+                              <span title={item.notes || "next session's opening price not available"} style={{ fontSize: 10.5, fontWeight: 800, padding: "2px 8px", borderRadius: 4, background: isDark ? "#334155" : "#e2e8f0", color: isDark ? "#94a3b8" : "#64748b" }}>
+                                {eodUnresolvedLabel(item)}
+                              </span>
+                            )}
                           </div>
                         </div>
 
@@ -2917,12 +2991,18 @@ export function NiftyFlowView({ t, isDark }) {
                           border: `1px solid ${t.border}`,
                         }}>
                           <div>
-                            <span style={{ color: t.textMuted }}>Carry Spot: </span>
+                            <span style={{ color: t.textMuted }}>{isInProgress ? "Spot now: " : "Carry Spot: "}</span>
                             <strong>₹{Number(item.entrySpot || 0).toLocaleString("en-IN")}</strong>
                             {item.nextDayOpen ? (
                               <span> → Next Open: <strong>₹{Number(item.nextDayOpen).toLocaleString("en-IN")}</strong></span>
-                            ) : (
+                            ) : isInProgress ? (
+                              <span style={{ color: t.textMuted }}> · verdict not final</span>
+                            ) : isUnresolved ? (
+                              <span style={{ color: t.textMuted }}> → Next Open: not recorded</span>
+                            ) : isPending ? (
                               <span style={{ color: t.textMuted }}> → Next Open: Awaiting 09:15 bell</span>
+                            ) : (
+                              <span style={{ color: t.textMuted }}> → Next Open: —</span>
                             )}
                           </div>
                           <div style={{ textAlign: isMobile ? "left" : "right" }}>
@@ -2941,8 +3021,8 @@ export function NiftyFlowView({ t, isDark }) {
                           {item.notes && <div style={{ color: t.textMuted, marginTop: 2 }}>📝 <strong>Notes:</strong> {item.notes}</div>}
                         </div>
 
-                        {/* Manual Open Spot Resolution if Pending */}
-                        {isPending && (
+                        {/* Manual Open Spot Resolution if Pending / Unresolved */}
+                        {canResolveOpen && (
                           <div style={{
                             marginTop: 6,
                             padding: "6px 8px",
@@ -3004,7 +3084,7 @@ export function NiftyFlowView({ t, isDark }) {
                               </div>
                             ) : (
                               <>
-                                <span style={{ color: t.textMuted }}>Trade is pending outcome:</span>
+                                <span style={{ color: t.textMuted }}>{isUnresolved ? "Opening price not recorded:" : "Trade is pending outcome:"}</span>
                                 <button
                                   onClick={() => {
                                     setEditingOpenId(item.id);

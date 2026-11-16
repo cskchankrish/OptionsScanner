@@ -1,8 +1,12 @@
 /**
  * EOD Overnight Carry Track Record & History Manager
  * Provides deterministic date normalization, deduplication, chronological sorting,
- * institutional 14:15+ closing flow weighting, and resilient storage persistence.
+ * row lifecycle (IN_PROGRESS → final → resolved), the one-off repair of stored rows and the
+ * track-record statistics. DISPLAY / HISTORY ONLY: nothing here feeds a trading decision.
+ * Pure module (no I/O); the server (api/nifty-oi.js) and the client (src/NiftyFlowView.jsx)
+ * both call it, and the timeline reader for the repair is injected.
  */
+import { getSessionKindForDate, nextIsoDate } from "./marketCalendar.js";
 
 export function normalizeDateToIso(dateStr) {
   if (!dateStr || typeof dateStr !== "string") return "";
@@ -55,7 +59,10 @@ export function formatIsoToDisplayDate(isoStr) {
   return `${d}-${monthNames[mIdx] || m}-${y}`;
 }
 
-export const CANONICAL_EOD_SEED_HISTORY = [
+// Hand-entered history: these 17 rows were typed into this file (real index prices, verdicts
+// written afterwards). They are NOT output of the running system and are reported separately
+// ("Hand-entered (before 7 Nov 2026)"). Each exported row carries `source: "seed"`.
+const RAW_EOD_SEED_HISTORY = [
   {
     id: "eod_2026-11-06",
     isoDate: "2026-11-06",
@@ -466,6 +473,522 @@ export const CANONICAL_EOD_SEED_HISTORY = [
   },
 ];
 
+/** The hand-entered rows, each marked `source: "seed"` (frozen: seed rows are never modified). */
+export const CANONICAL_EOD_SEED_HISTORY = Object.freeze(
+  RAW_EOD_SEED_HISTORY.map(row => Object.freeze({ ...row, source: "seed" }))
+);
+
+const SEED_DATE_SET = new Set(RAW_EOD_SEED_HISTORY.map(row => row.isoDate));
+
+/** First date recorded by the running system (rows before it are hand-entered seed rows). */
+export const EOD_RECORDED_FROM_ISO = "2026-11-07";
+
+export const EOD_OUTCOMES = Object.freeze({
+  WIN: "WIN",
+  LOSS: "LOSS",
+  PENDING: "PENDING",
+  PRESERVED_CASH: "PRESERVED_CASH",
+  IN_PROGRESS: "IN_PROGRESS", // today's row before the verdict is final
+  UNRESOLVED: "UNRESOLVED", // the next session's opening price is not available (or the verdict never became final)
+});
+
+const RESOLVED_OUTCOMES = new Set(["WIN", "LOSS"]);
+const OPEN_OUTCOMES = new Set(["PENDING", "UNRESOLVED"]);
+
+export const EOD_IN_PROGRESS_NOTE = "session in progress — verdict not final";
+export const EOD_OPEN_NOT_AVAILABLE_NOTE = "next session's opening price not available";
+export const EOD_VERDICT_NOT_FINAL_PREFIX = "Verdict never finalised";
+
+/**
+ * Finalisation: the stored verdict becomes final at the first refresh at or after 15:38 IST on a
+ * weekday (2 minutes before the 15:40 close; 15:58 on the Muhurat date, close 16:00). 15:38 is
+ * EOD_WINDOW_END_MINS (end of the radar / flip alerts) and the minute the carry bridge reports,
+ * after its 15:31–15:37 order window, and the scorecard's FINAL EOD reading is the last one at or
+ * before 15:38 — so the verdict stored at that point is the one a trader (or the bridge) acted on.
+ * (The older condition, `isDecisionWindow || nowMins >= closeMins`, is true from 14:45, while the
+ * verdict can still flip until 15:38.)
+ */
+export const EOD_FINAL_MINS_WEEKDAY = 938;
+export const EOD_FINAL_MINS_MUHURAT = 958;
+/** The first tick of the next session counts as its open only if recorded within this many minutes of the session open. */
+export const EOD_OPEN_TICK_MAX_DELAY_MINS = 15;
+/** Fewer resolved carries than this → "too few to judge". */
+export const EOD_TOO_FEW_RESOLVED = 10;
+
+const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function hhmmOf(mins) {
+  return `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
+}
+
+function round2(x) {
+  const v = Number(Number(x).toFixed(2));
+  return v === 0 ? 0 : v; // no -0
+}
+
+/** True for a trading session date: Mon–Fri and Muhurat dates; false for a closed weekend date or a malformed date. */
+export function isSessionDate(isoDate) {
+  const iso = normalizeDateToIso(isoDate);
+  return ISO_RE.test(iso) && getSessionKindForDate(iso) !== "CLOSED";
+}
+
+/** Open / close / finalisation minutes (IST) of a session date; nulls for a closed date. */
+export function eodSessionTimes(isoDate) {
+  const kind = getSessionKindForDate(isoDate);
+  if (kind === "MUHURAT") return { kind, openMins: 840, closeMins: 960, closeSpotMins: 960, finalMins: EOD_FINAL_MINS_MUHURAT, closeTimeStr: "16:00" };
+  if (kind === "WEEKDAY") return { kind, openMins: 555, closeMins: 940, closeSpotMins: 930, finalMins: EOD_FINAL_MINS_WEEKDAY, closeTimeStr: "15:40" };
+  return { kind, openMins: null, closeMins: null, closeSpotMins: null, finalMins: null, closeTimeStr: null };
+}
+
+/** The next session date after isoDate by the calendar (closed weekend days skipped; exchange holidays are not modelled). */
+export function nextSessionDate(isoDate) {
+  if (!ISO_RE.test(String(isoDate || ""))) return null;
+  let d = isoDate;
+  for (let i = 0; i < 10; i++) {
+    d = nextIsoDate(d);
+    if (isSessionDate(d)) return d;
+  }
+  return null;
+}
+
+export function eodRowIso(row) {
+  return row ? normalizeDateToIso(row.isoDate || row.date || row.id) : "";
+}
+
+/** A hand-entered row: its date is one of the seed dates and it was not marked as recorded by the live system. */
+export function isSeedRow(row) {
+  if (!row) return false;
+  if (row.source === "recorded") return false;
+  return SEED_DATE_SET.has(eodRowIso(row));
+}
+
+/** A carry call (BTST / STBT). */
+export function isCarryRow(row) {
+  if (!row) return false;
+  if (row.bias === "BULLISH" || row.bias === "BEARISH") return true;
+  if (row.bias === "NEUTRAL") return false;
+  return Boolean(row.verdict && (row.verdict.includes("BTST") || row.verdict.includes("STBT")));
+}
+
+function sortEodRowsDesc(rows) {
+  return rows.sort((a, b) => (b.isoDate || "").localeCompare(a.isoDate || ""));
+}
+
+/** One row with ISO id/date normalised and `source` set; null when malformed or not a session date. */
+export function normalizeEodRow(row) {
+  if (!row || typeof row !== "object") return null;
+  const iso = eodRowIso(row);
+  if (!ISO_RE.test(iso) || !isSessionDate(iso)) return null;
+  const clean = { ...row, isoDate: iso, id: `eod_${iso}`, date: formatIsoToDisplayDate(iso) };
+  clean.source = isSeedRow(clean) ? "seed" : "recorded";
+  return clean;
+}
+
+/** Normalise, drop non-session rows, dedupe by date (first occurrence wins), sort newest first. */
+export function sanitizeEodHistory(rows, { limit = null } = {}) {
+  const map = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const n = normalizeEodRow(r);
+    if (n && !map.has(n.isoDate)) map.set(n.isoDate, n);
+  }
+  const out = sortEodRowsDesc(Array.from(map.values()));
+  return limit ? out.slice(0, limit) : out;
+}
+
+/** Rows to keep in a device's localStorage: sanitised, without provisional (in-progress) rows. */
+export function eodRowsForStorage(rows) {
+  return sanitizeEodHistory(rows).filter(r => r.provisional !== true && r.outcome !== "IN_PROGRESS");
+}
+
+// ── Timeline helpers ─────────────────────────────────────────────────────────
+
+function tickMinutes(pt) {
+  const m = Number(pt?.minutes);
+  if (Number.isFinite(m)) return m;
+  const mm = /^(\d{1,2}):(\d{2})/.exec(String(pt?.time || ""));
+  return mm ? Number(mm[1]) * 60 + Number(mm[2]) : NaN;
+}
+
+/** A real recorded tick: not synthetic, not marked isLiveTick:false, with a positive spot. */
+function isRealTick(pt) {
+  return Boolean(pt) && pt.synthetic !== true && pt.isLiveTick !== false && Number(pt.spot) > 0 && Number.isFinite(tickMinutes(pt));
+}
+
+function realTicksAsc(timeline, fromMins, toMins) {
+  return (Array.isArray(timeline) ? timeline : [])
+    .filter(pt => isRealTick(pt) && tickMinutes(pt) >= fromMins && tickMinutes(pt) <= toMins)
+    .sort((a, b) => tickMinutes(a) - tickMinutes(b));
+}
+
+/** First real tick of a session's timeline: { spot, minutes, time } or null. */
+export function sessionOpenTick(timeline, isoDate) {
+  const t = eodSessionTimes(isoDate);
+  if (t.openMins == null) return null;
+  const first = realTicksAsc(timeline, t.openMins, t.closeMins)[0];
+  if (!first) return null;
+  const m = tickMinutes(first);
+  return { spot: Number(first.spot), minutes: m, time: first.time || hhmmOf(m) };
+}
+
+/** Closing spot of a session: last real tick at or before 15:30 (Muhurat: its 16:00 session close). */
+export function sessionCloseSpot(timeline, isoDate) {
+  const t = eodSessionTimes(isoDate);
+  if (t.openMins == null) return null;
+  const ticks = realTicksAsc(timeline, t.openMins, t.closeSpotMins);
+  const last = ticks[ticks.length - 1];
+  if (!last) return null;
+  const m = tickMinutes(last);
+  return { spot: Number(last.spot), minutes: m, time: last.time || hhmmOf(m) };
+}
+
+// ── Resolution ───────────────────────────────────────────────────────────────
+
+/** Score a carry row against the next session's opening tick (existing sign conventions and note texts). */
+export function resolveRowFromOpenTick(row, tick, nextIso) {
+  const open = Number(tick?.spot);
+  const entry = Number(row?.entrySpot);
+  if (!(open > 0) || !(entry > 0)) return null;
+  const diff = round2(open - entry);
+  const resolvedFrom = { date: nextIso, time: tick.time || hhmmOf(tick.minutes), source: "timeline-open" };
+  if (row.bias === "BULLISH") {
+    return { ...row, nextDayOpen: open, gapPts: diff, outcome: diff > 0 ? "WIN" : "LOSS", notes: `${diff >= 0 ? "+" : ""}${diff} pts morning gap on open`, resolvedFrom };
+  }
+  if (row.bias === "BEARISH") {
+    const pts = round2(-diff);
+    return { ...row, nextDayOpen: open, gapPts: pts, outcome: diff < 0 ? "WIN" : "LOSS", notes: `${diff <= 0 ? "+" : ""}${pts} pts gap-down on open`, resolvedFrom };
+  }
+  return { ...row, nextDayOpen: open, gapPts: 0, outcome: "PRESERVED_CASH", notes: "Avoided overnight exposure; 100% cash preserved.", resolvedFrom };
+}
+
+/**
+ * Resolve one open carry row from the next session's timeline.
+ * status RESOLVED (WIN/LOSS), WAITING (no usable tick yet and the session may still provide one:
+ * row unchanged) or UNRESOLVED (first tick too late to be the open, or `sessionOver` and no tick).
+ */
+export function resolveOpenFromTimeline(row, nextIso, timeline, { sessionOver = false } = {}) {
+  const t = eodSessionTimes(nextIso);
+  const tick = sessionOpenTick(timeline, nextIso);
+  if (tick && t.openMins != null && tick.minutes <= t.openMins + EOD_OPEN_TICK_MAX_DELAY_MINS) {
+    const resolved = resolveRowFromOpenTick(row, tick, nextIso);
+    if (resolved) return { status: "RESOLVED", row: resolved };
+    return { status: "WAITING", row };
+  }
+  if (tick) {
+    return {
+      status: "UNRESOLVED",
+      row: { ...row, outcome: "UNRESOLVED", nextDayOpen: null, gapPts: null, notes: `${capitalise(EOD_OPEN_NOT_AVAILABLE_NOTE)}: the first recorded tick of ${nextIso} is at ${tick.time}, too late to be the open.` },
+    };
+  }
+  if (sessionOver) {
+    return {
+      status: "UNRESOLVED",
+      row: { ...row, outcome: "UNRESOLVED", nextDayOpen: null, gapPts: null, notes: `${capitalise(EOD_OPEN_NOT_AVAILABLE_NOTE)} (no recorded timeline for ${nextIso}).` },
+    };
+  }
+  return { status: "WAITING", row };
+}
+
+function capitalise(s) {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+/**
+ * Resolve EVERY recorded PENDING row dated before today from the first real tick of its next
+ * session (by the calendar; exchange holidays are not modelled):
+ * - next session = today → today's timeline; no usable tick yet → stays PENDING;
+ * - next session already over → `timelinesByDate[next]` when supplied, otherwise UNRESOLVED
+ *   (the opening was not captured on that day, so it is not available now).
+ * Seed (hand-entered) rows are never touched.
+ */
+export function resolvePendingEodRows(rows, { todayIso, todayTimeline = [], timelinesByDate = null }) {
+  return rows.map(r => {
+    if (!r || r.outcome !== "PENDING" || !(r.isoDate < todayIso) || isSeedRow(r)) return r;
+    const next = nextSessionDate(r.isoDate);
+    if (!next || next > todayIso) return r;
+    if (next === todayIso) return resolveOpenFromTimeline(r, todayIso, todayTimeline, { sessionOver: false }).row;
+    const tl = timelinesByDate && Array.isArray(timelinesByDate[next]) ? timelinesByDate[next] : [];
+    return resolveOpenFromTimeline(r, next, tl, { sessionOver: true }).row;
+  });
+}
+
+/** A past row still IN_PROGRESS never received a final verdict (no refresh at or after 15:38 that day). */
+export function settleStaleProvisionalRows(rows, todayIso) {
+  return rows.map(r => {
+    if (!r || r.outcome !== "IN_PROGRESS" || !(r.isoDate < todayIso)) return r;
+    const t = eodSessionTimes(r.isoDate);
+    return {
+      ...r,
+      provisional: false,
+      outcome: "UNRESOLVED",
+      nextDayOpen: null,
+      gapPts: null,
+      notes: `${EOD_VERDICT_NOT_FINAL_PREFIX}: no refresh at or after ${t.finalMins != null ? hhmmOf(t.finalMins) : "the close"} IST that day (last snapshot ${r.time || "unknown"}). Not scored.`,
+    };
+  });
+}
+
+/** Chip text for an UNRESOLVED row. */
+export function eodUnresolvedLabel(row) {
+  return String(row?.notes || "").startsWith(EOD_VERDICT_NOT_FINAL_PREFIX) ? "Verdict not final" : "Open not recorded";
+}
+
+// ── Today's row ──────────────────────────────────────────────────────────────
+
+/**
+ * Today's row from the current EOD decision (server and client fallback use the same builder).
+ * Returns null on a non-session day; before the session opens returns `existing` (or null).
+ * - before finalisation: IN_PROGRESS, provisional, entrySpot = current spot (display only);
+ * - at/after finalisation: outcome from the FINAL bias only (NEUTRAL → PRESERVED_CASH, carry →
+ *   PENDING), entrySpot = spot at the first final snapshot, then frozen;
+ * - a finalised row is not overwritten by a later request whose closing data is invalid.
+ */
+export function buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing = null, extra = null }) {
+  if (!eodDecision || !isSessionDate(todayIso)) return null;
+  const t = eodSessionTimes(todayIso);
+  const prev = existing && eodRowIso(existing) === todayIso ? existing : null;
+  if (!(Number(nowMins) >= t.openMins)) return prev;
+  const isFinal = Number(nowMins) >= t.finalMins;
+  const prevFinal = Boolean(prev && prev.provisional === false);
+  const spotNum = Number(spot) > 0 ? Number(spot) : null;
+
+  const snapshot = {
+    id: `eod_${todayIso}`,
+    isoDate: todayIso,
+    date: formatIsoToDisplayDate(todayIso),
+    dayName,
+    time: timeStr,
+    verdict: eodDecision.verdict,
+    bias: eodDecision.bias,
+    score: eodDecision.score,
+    conviction: eodDecision.conviction,
+    sizing: eodDecision.sizing,
+    floor: floorStrike,
+    roof: roofStrike,
+    pcr: eodDecision.pcr,
+    deltaPcr: eodDecision.deltaPcr,
+    pcrWarning: eodDecision.pcrWarning,
+    action: eodDecision.action,
+    keyReasons: (eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
+    ...(extra || {}),
+    source: "recorded",
+  };
+
+  if (!isFinal) {
+    if (prevFinal) return prev; // never downgrade a final row
+    return {
+      ...(prev || {}),
+      ...snapshot,
+      entrySpot: spotNum ?? prev?.entrySpot ?? null,
+      nextDayOpen: null,
+      gapPts: null,
+      outcome: "IN_PROGRESS",
+      provisional: true,
+      notes: EOD_IN_PROGRESS_NOTE,
+    };
+  }
+
+  if (prevFinal && !eodDecision.isClosingDataValid) {
+    // Keep the finalised verdict and its frozen entry price.
+    return { ...prev, floor: floorStrike || prev.floor, roof: roofStrike || prev.roof };
+  }
+
+  const isCarry = eodDecision.bias === "BULLISH" || eodDecision.bias === "BEARISH";
+  const frozenEntry = prevFinal && Number(prev.entrySpot) > 0 ? Number(prev.entrySpot) : null;
+  return {
+    ...(prev || {}),
+    ...snapshot,
+    entrySpot: frozenEntry ?? spotNum ?? prev?.entrySpot ?? null,
+    nextDayOpen: null,
+    gapPts: null,
+    outcome: isCarry ? "PENDING" : "PRESERVED_CASH",
+    provisional: false,
+    notes: `Decision finalized at ${timeStr || hhmmOf(Number(nowMins))} (verdict final from ${hhmmOf(t.finalMins)} IST; session close ${t.closeTimeStr} IST).`,
+  };
+}
+
+/**
+ * Server step: sanitise, settle stale in-progress rows, upsert today's row, resolve every PENDING
+ * row whose next session is today from today's timeline, sort newest first.
+ */
+export function reconcileEodHistory({ history, todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, todayTimeline = [], timelinesByDate = null, limit = 60 }) {
+  let rows = sanitizeEodHistory(history);
+  if (!isSessionDate(todayIso)) return rows.slice(0, limit);
+  rows = settleStaleProvisionalRows(rows, todayIso);
+  const idx = rows.findIndex(r => r.isoDate === todayIso);
+  const existing = idx >= 0 ? rows[idx] : null;
+  const todayRow = buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, existing });
+  if (todayRow && todayRow !== existing) {
+    if (idx >= 0) rows[idx] = todayRow;
+    else rows.push(todayRow);
+  }
+  rows = resolvePendingEodRows(rows, { todayIso, todayTimeline, timelinesByDate });
+  return sortEodRowsDesc(rows).slice(0, limit);
+}
+
+// ── One-off repair of stored rows ────────────────────────────────────────────
+
+const REPAIR_VERDICT_NOTE = "Verdict as last recorded that day (not known whether it was the 15:38 final).";
+
+function fmtPts(n) {
+  return Number.isFinite(Number(n)) && Number(n) > 0 ? String(Number(n)) : "none";
+}
+
+async function repairEodRow(row, { tl, todayIso }) {
+  if (row.source === "seed" || row.isoDate < EOD_RECORDED_FROM_ISO) return { row, change: null };
+  if (todayIso && row.isoDate >= todayIso) return { row, change: null };
+  if (row.provisional === true || row.outcome === "IN_PROGRESS") return { row, change: null };
+  const carry = row.bias === "BULLISH" || row.bias === "BEARISH";
+  if (row.outcome !== "PRESERVED_CASH") return { row, change: null };
+
+  const own = await tl(row.isoDate);
+  const close = sessionCloseSpot(own, row.isoDate);
+  const oldEntry = Number(row.entrySpot);
+
+  if (!carry) {
+    if (close && (!(oldEntry > 0) || Math.abs(close.spot - oldEntry) > 1)) {
+      const what = `entry spot ${fmtPts(oldEntry)} → ${close.spot} (that day's close, ${close.time} tick)`;
+      return {
+        row: { ...row, entrySpot: close.spot, repaired: true, notes: `Repaired: ${what}; the stored price was not that day's close.${row.notes ? ` ${row.notes}` : ""}` },
+        change: { id: row.id, what },
+      };
+    }
+    return { row, change: null };
+  }
+
+  // Carry call stored as PRESERVED_CASH (outcome kept from an earlier NEUTRAL snapshot).
+  const parts = [];
+  let entry = oldEntry;
+  if (close && (!(oldEntry > 0) || Math.abs(close.spot - oldEntry) > 0.001)) {
+    parts.push(`entry spot ${fmtPts(oldEntry)} → ${close.spot} (that day's close, ${close.time} tick)`);
+    entry = close.spot;
+  }
+  const base = { ...row, entrySpot: entry > 0 ? entry : row.entrySpot, repaired: true };
+  const next = nextSessionDate(row.isoDate);
+  let result;
+  if (!next) {
+    result = { status: "UNRESOLVED", row: { ...base, outcome: "UNRESOLVED", nextDayOpen: null, gapPts: null, notes: capitalise(EOD_OPEN_NOT_AVAILABLE_NOTE) + "." } };
+  } else if (todayIso && next > todayIso) {
+    result = { status: "WAITING", row: base };
+  } else {
+    const sessionOver = !(todayIso && next === todayIso);
+    result = resolveOpenFromTimeline(base, next, await tl(next), { sessionOver });
+  }
+  let outRow = result.row;
+  if (result.status === "WAITING") {
+    outRow = { ...outRow, outcome: "PENDING", nextDayOpen: null, gapPts: null, notes: "Awaiting the next session's opening tick." };
+  }
+  parts.push(`outcome PRESERVED_CASH (kept from an earlier no-carry snapshot) → ${outRow.outcome}${outRow.resolvedFrom ? ` from the ${outRow.resolvedFrom.date} ${outRow.resolvedFrom.time} opening tick` : ""}`);
+  const what = parts.join("; ");
+  return {
+    row: { ...outRow, repaired: true, notes: `Repaired: ${what}. ${REPAIR_VERDICT_NOTE} ${outRow.notes || ""}`.trim() },
+    change: { id: row.id, what },
+  };
+}
+
+/**
+ * One-off repair of already-stored rows (I/O injected: getTimelineForDate(isoDate) → ticks[]):
+ * drops non-session rows; for recorded rows from 2026-11-07 on, re-scores carry calls stored as
+ * PRESERVED_CASH (entry = that day's close when its timeline exists; WIN/LOSS from the next
+ * session's opening tick, else UNRESOLVED) and corrects NEUTRAL rows whose entry differs from that
+ * day's close by more than 1 point. Seed rows are never modified. Idempotent.
+ * Throws if the timeline reader throws (the caller keeps the unrepaired history).
+ * @returns {Promise<{ history: object[], changes: {id, what}[], dropped: string[] }>}
+ */
+export async function repairEodHistory({ history, getTimelineForDate, todayIso = null }) {
+  const input = Array.isArray(history) ? history : [];
+  const dropped = input
+    .map(r => eodRowIso(r))
+    .filter(iso => ISO_RE.test(iso) && !isSessionDate(iso));
+  const rows = sanitizeEodHistory(input);
+  const cache = new Map();
+  const tl = async (iso) => {
+    if (!cache.has(iso)) {
+      const t = await getTimelineForDate(iso);
+      cache.set(iso, Array.isArray(t) ? t : []);
+    }
+    return cache.get(iso);
+  };
+  const out = [];
+  const changes = [];
+  for (const row of rows) {
+    const { row: next, change } = await repairEodRow(row, { tl, todayIso });
+    out.push(next);
+    if (change) changes.push(change);
+  }
+  return { history: out, changes, dropped: Array.from(new Set(dropped)) };
+}
+
+/**
+ * Run the repair at most once (claim = atomic marker, e.g. Redis SET NX). If the repair throws the
+ * marker is released and the ORIGINAL history is returned unchanged; never throws.
+ */
+export async function runEodHistoryRepairOnce({ history, claim, release, getTimelineForDate, todayIso = null }) {
+  let claimed = false;
+  try {
+    claimed = Boolean(await claim());
+  } catch (e) {
+    return { history, ran: false, error: `claim failed: ${e?.message || e}` };
+  }
+  if (!claimed) return { history, ran: false };
+  try {
+    const r = await repairEodHistory({ history, getTimelineForDate, todayIso });
+    return { history: r.history, ran: true, changes: r.changes, dropped: r.dropped };
+  } catch (e) {
+    try { await release(); } catch (_) {}
+    return { history, ran: false, error: e?.message || String(e) };
+  }
+}
+
+// ── Statistics ───────────────────────────────────────────────────────────────
+
+function tallyEodRows(rows) {
+  const inProgress = rows.filter(r => r.outcome === "IN_PROGRESS").length;
+  const unresolved = rows.filter(r => r.outcome === "UNRESOLVED").length;
+  const counted = rows.filter(r => r.outcome !== "IN_PROGRESS" && r.outcome !== "UNRESOLVED");
+  const carries = counted.filter(isCarryRow);
+  const resolvedRows = carries.filter(r => RESOLVED_OUTCOMES.has(r.outcome));
+  const wins = resolvedRows.filter(r => r.outcome === "WIN").length;
+  const losses = resolvedRows.length - wins;
+  const resolved = resolvedRows.length;
+  const netPts = round2(resolvedRows.reduce((acc, r) => acc + (Number(r.gapPts) || 0), 0));
+  return {
+    sessions: rows.length - inProgress,
+    carries: carries.length,
+    resolved,
+    wins,
+    losses,
+    pending: carries.filter(r => r.outcome === "PENDING").length,
+    // Carry calls still stored as PRESERVED_CASH (the pre-repair bug): neither a carry result nor a cash day.
+    carryStoredAsCash: carries.filter(r => r.outcome === "PRESERVED_CASH").length,
+    cashDays: counted.filter(r => !isCarryRow(r) && r.outcome === "PRESERVED_CASH").length,
+    inProgress,
+    unresolved,
+    netPts,
+    winRatePct: resolved > 0 ? (wins / resolved) * 100 : null,
+    tooFew: resolved < EOD_TOO_FEW_RESOLVED,
+  };
+}
+
+/**
+ * Track-record statistics, split into rows recorded by the running system (`live`, the headline)
+ * and hand-entered seed rows (`seed`). IN_PROGRESS and UNRESOLVED rows are excluded from the win
+ * rate and from cash days. Net points sum gapPts of resolved carries only.
+ */
+export function computeEodTrackStats(history) {
+  const rows = (Array.isArray(history) ? history : []).filter(Boolean);
+  return {
+    live: tallyEodRows(rows.filter(r => !isSeedRow(r))),
+    seed: tallyEodRows(rows.filter(r => isSeedRow(r))),
+  };
+}
+
+/** "7/10 (70.0%)", with "too few to judge" below EOD_TOO_FEW_RESOLVED resolved carries. */
+export function formatEodWinRate(tally) {
+  if (!tally || !tally.resolved) return "no resolved carries yet — too few to judge";
+  const base = `${tally.wins}/${tally.resolved} (${tally.winRatePct.toFixed(1)}%)`;
+  return tally.tooFew ? `${base} — too few to judge` : base;
+}
+
 /**
  * Deduplicates and merges history arrays into a unified, chronologically sorted list.
  * Normalizes all date formats (04-11-2026, 04-Nov-2026, 2026-11-04) to standard ISO key
@@ -474,40 +997,30 @@ export const CANONICAL_EOD_SEED_HISTORY = [
 export function mergeEodHistory(localHistory = [], serverHistory = []) {
   const map = new Map();
 
-  function add(item, isLocal) {
-    if (!item) return;
-    const isoKey = normalizeDateToIso(item.isoDate || item.date || item.id);
-    if (!isoKey || isoKey.length < 10) return;
+  // 1. Server rows take precedence (first occurrence of a date wins; later duplicates only fill gaps).
+  for (const item of Array.isArray(serverHistory) ? serverHistory : []) {
+    const row = normalizeEodRow(item);
+    if (!row) continue; // malformed or not a session date (closed weekend day)
+    const existing = map.get(row.isoDate);
+    map.set(row.isoDate, existing ? { ...row, ...existing } : row);
+  }
 
-    const cleanItem = {
-      ...item,
-      isoDate: isoKey,
-      id: `eod_${isoKey}`,
-      date: formatIsoToDisplayDate(isoKey),
-    };
-
-    if (!map.has(isoKey)) {
-      map.set(isoKey, cleanItem);
-    } else {
-      const existing = map.get(isoKey);
-      // If local item has user-resolved or morning-resolved outcome while server is pending, preserve resolution
-      if (isLocal && existing.outcome === "PENDING" && cleanItem.outcome && cleanItem.outcome !== "PENDING") {
-        map.set(isoKey, { ...existing, ...cleanItem, id: `eod_${isoKey}`, date: formatIsoToDisplayDate(isoKey) });
-      } else if (!isLocal) {
-        // Server takes precedence for audit data and live stats
-        map.set(isoKey, { ...cleanItem, ...existing, id: `eod_${isoKey}`, date: formatIsoToDisplayDate(isoKey) });
-      }
+  // 2. Local rows add dates the server did not send. For a date the server sent, a local row wins
+  // only when it carries a WIN/LOSS resolution (manual "resolve open" on this device) and the server
+  // row is still open (PENDING / UNRESOLVED). A local PRESERVED_CASH / IN_PROGRESS row never
+  // overrides the server's row (that was how a carry call kept a stale "cash" outcome).
+  for (const item of Array.isArray(localHistory) ? localHistory : []) {
+    const row = normalizeEodRow(item);
+    if (!row) continue;
+    const existing = map.get(row.isoDate);
+    if (!existing) {
+      map.set(row.isoDate, row);
+    } else if (RESOLVED_OUTCOMES.has(row.outcome) && OPEN_OUTCOMES.has(existing.outcome) && existing.provisional !== true) {
+      map.set(row.isoDate, { ...existing, ...row, id: existing.id, date: existing.date, isoDate: existing.isoDate, source: existing.source });
     }
   }
 
-  // 1. Process server history
-  (serverHistory || []).forEach(item => add(item, false));
-
-  // 2. Process local history
-  (localHistory || []).forEach(item => add(item, true));
-
-  // Sort chronologically: newest session first
-  return Array.from(map.values()).sort((a, b) => (b.isoDate || "").localeCompare(a.isoDate || ""));
+  return sortEodRowsDesc(Array.from(map.values()));
 }
 
 /**
@@ -520,12 +1033,13 @@ export function loadAndSanitizeStorageHistory() {
   }
 
   try {
-    // Check v5 (100% verified real NSE historical closing and opening numbers)
+    // Check v5. Rows are passed through the same sanitiser as server rows (closed-weekend rows
+    // dropped, `source` set); this device's provisional (in-progress) rows are not reloaded.
     const v5Raw = window.localStorage.getItem("options_scanner_eod_history_v5");
     if (v5Raw) {
       const parsed = JSON.parse(v5Raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return mergeEodHistory(parsed, CANONICAL_EOD_SEED_HISTORY);
+        return mergeEodHistory(eodRowsForStorage(parsed), CANONICAL_EOD_SEED_HISTORY);
       }
     }
 

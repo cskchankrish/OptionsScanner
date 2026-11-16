@@ -2,6 +2,9 @@ import {
   CANONICAL_EOD_SEED_HISTORY,
   normalizeDateToIso,
   formatIsoToDisplayDate,
+  sanitizeEodHistory,
+  reconcileEodHistory,
+  runEodHistoryRepairOnce,
 } from "../src/eodTrackRecord.js";
 import {
   parseNseFuturesPayload,
@@ -23,7 +26,7 @@ import {
 import { windowCoverage, computeDataQuality, mergeTimelines, hhmm as dqHhmm, DQ_WINDOW_MAX_GAP_MIN } from "../src/dataQuality.js";
 import { getCarryConfig, readCarryAutomation, storeFromCommand as carryStoreFromCommand } from "../src/carryBridge.js";
 import { buildEodCard, formatEodCardLines } from "../src/eodCard.js";
-import { recordReading, completePendingEod, finaliseDay, scStoreFromCommand, settingsSnapshot, SC_CLOSE_MEASURE_MINS } from "../src/scorecard.js";
+import { recordReading, completePendingEod, finaliseDay, scStoreFromCommand, settingsSnapshot, SC_CLOSE_MEASURE_MINS, timelineKeysFor } from "../src/scorecard.js";
 import { getTurnConfig } from "../src/turnTracker.js";
 import { evaluateShadowTraps, getTrapShadowConfig, compactTrapShadow } from "../src/trapShadow.js";
 import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "../src/smartMoneyFusion.js";
@@ -884,17 +887,20 @@ export function calculateDeltaPcr(totPutWriting, totCallWriting) {
   return 1.0;
 }
 
-export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision }) {
+// One-off repair of the stored EOD track record (repairEodHistory in src/eodTrackRecord.js), claimed
+// with an atomic Redis marker so exactly one refresh runs it. Per-instance flag: a warm instance
+// tries the claim once, so the timeline reads happen only on the one repairing refresh.
+// DISPLAY / HISTORY ONLY — nothing reads eodHistory back into a decision.
+export const EOD_HISTORY_REPAIR_KEY = "nifty_eod_history_repair_v1";
+const EOD_HISTORY_REPAIR_TTL_SEC = 180 * 86400;
+let eodRepairChecked = false;
+
+export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, eodDecision, timeline = [] }) {
   const todayIso = getISTIsoDateStr();
-  const todayDisplayDate = formatIsoToDisplayDate(todayIso);
   const dayName = new Date().toLocaleDateString("en-US", { timeZone: "Asia/Kolkata", weekday: "long" });
   const timeStr = `${getISTTimeStr()} IST`;
   const nowMins = getISTMinutes();
   const dayOfWeek = getSessionDayOfWeek(); // calendar-gated: 0 only on a Muhurat day
-  const isSunday = (dayOfWeek === 0);
-  const openMins = isSunday ? 840 : 555;
-  const closeMins = isSunday ? 960 : 940;
-  const closeTimeStr = isSunday ? "16:00" : "15:40";
 
   let history = null;
   if (REDIS_URL) {
@@ -903,109 +909,63 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   if (!Array.isArray(history) || history.length === 0) {
     history = [...CANONICAL_EOD_SEED_HISTORY];
   }
-  // A closed weekend day has no session: never resolve outcomes or record a "today" entry.
+  // A closed weekend day has no session: never resolve outcomes or record a "today" entry
+  // (stored closed-weekend rows are still not served).
   if (dayOfWeek === 6) {
-    return history;
+    return sanitizeEodHistory(history, { limit: 60 });
   }
 
-  // 1. If previous session is PENDING and market has opened today, auto-resolve next morning open outcome
-  if (nowMins >= openMins && history.length > 0) {
-    for (let i = 0; i < Math.min(3, history.length); i++) {
-      const item = history[i];
-      const itemIso = normalizeDateToIso(item?.isoDate || item?.date || item?.id);
-      if (item && item.outcome === "PENDING" && itemIso !== todayIso && spot > 0) {
-        item.nextDayOpen = spot;
-        const diff = Number((spot - (item.entrySpot || spot)).toFixed(1));
-        if (item.bias === "BULLISH") {
-          item.gapPts = diff;
-          item.outcome = diff > 0 ? "WIN" : "LOSS";
-          item.notes = `${diff >= 0 ? "+" : ""}${diff} pts morning gap on open`;
-        } else if (item.bias === "BEARISH") {
-          item.gapPts = -diff;
-          item.outcome = diff < 0 ? "WIN" : "LOSS";
-          item.notes = `${diff <= 0 ? "+" : ""}${-diff} pts gap-down on open`;
-        } else {
-          item.gapPts = 0;
-          item.outcome = "PRESERVED_CASH";
-          item.notes = "Avoided overnight exposure; 100% cash preserved.";
+  let repairRan = false;
+  if (REDIS_URL && REDIS_TOKEN && !eodRepairChecked) {
+    eodRepairChecked = true;
+    const repair = await runEodHistoryRepairOnce({
+      history,
+      todayIso,
+      claim: () => redisRestSetNx(EOD_HISTORY_REPAIR_KEY, JSON.stringify({ at: Date.now() }), EOD_HISTORY_REPAIR_TTL_SEC),
+      release: () => redisRestDel(EOD_HISTORY_REPAIR_KEY),
+      getTimelineForDate: async (iso) => {
+        if (iso === todayIso) return Array.isArray(timeline) ? timeline : [];
+        for (const k of timelineKeysFor(iso)) {
+          const t = await redisRestGet(k);
+          if (Array.isArray(t) && t.length) return t;
         }
-      }
+        return [];
+      },
+    });
+    if (repair.ran) {
+      repairRan = true;
+      history = repair.history;
+      console.log(`EOD history repair: ${repair.changes.length} row(s) changed, dropped ${repair.dropped.join(", ") || "none"}`);
+    } else if (repair.error) {
+      console.warn("EOD history repair skipped:", repair.error);
+      if (repair.error.startsWith("claim failed")) eodRepairChecked = false; // Redis unreachable: try again later
     }
   }
 
-  // 2. Add or update today's EOD recommendation in history
-  const existingIdx = history.findIndex(h => {
-    const hIso = normalizeDateToIso(h.isoDate || h.date || h.id);
-    return hIso === todayIso;
+  // Sanitise (closed-weekend rows dropped), settle stale in-progress rows, upsert today's row
+  // (IN_PROGRESS until 15:38), resolve every PENDING row whose next session is today from the
+  // first real tick of today's timeline.
+  history = reconcileEodHistory({
+    history,
+    todayIso,
+    nowMins,
+    timeStr,
+    dayName,
+    spot,
+    floorStrike,
+    roofStrike,
+    eodDecision,
+    todayTimeline: timeline,
+    limit: 60,
   });
 
-  const todayEntry = {
-    id: `eod_${todayIso}`,
-    isoDate: todayIso,
-    date: todayDisplayDate,
-    dayName,
-    time: timeStr,
-    verdict: eodDecision.verdict,
-    bias: eodDecision.bias,
-    score: eodDecision.score,
-    conviction: eodDecision.conviction,
-    sizing: eodDecision.sizing,
-    entrySpot: spot,
-    nextDayOpen: existingIdx >= 0 ? history[existingIdx].nextDayOpen : null,
-    gapPts: existingIdx >= 0 ? history[existingIdx].gapPts : null,
-    outcome: existingIdx >= 0 && history[existingIdx].outcome !== "PENDING"
-      ? history[existingIdx].outcome
-      : eodDecision.bias === "NEUTRAL" ? "PRESERVED_CASH" : "PENDING",
-    floor: floorStrike,
-    roof: roofStrike,
-    pcr: eodDecision.pcr,
-    deltaPcr: eodDecision.deltaPcr,
-    pcrWarning: eodDecision.pcrWarning,
-    action: eodDecision.action,
-    keyReasons: (eodDecision.audit || []).map(a => `${a.label} (${a.impact})`).join(" · "),
-    notes: (eodDecision.isDecisionWindow || nowMins >= closeMins) ? `Decision finalized on closing settlement (${closeTimeStr} IST).` : "Intraday monitoring snapshot.",
-  };
-
-  if (existingIdx >= 0) {
-    // If existing entry was already finalized in the execution window with valid closing data,
-    // and current calculation has unvalidated closing data (e.g. from an ad-hoc post-market request),
-    // preserve the finalized verdict and score instead of degrading to neutral/unvalidated!
-    const existing = history[existingIdx];
-    const existingWasFinalized = existing.notes?.includes("finalized") || (existing.outcome && existing.outcome !== "PENDING");
-    if (existingWasFinalized && !eodDecision.isClosingDataValid) {
-      history[existingIdx] = {
-        ...existing,
-        entrySpot: spot || existing.entrySpot,
-        floor: floorStrike || existing.floor,
-        roof: roofStrike || existing.roof,
-      };
-    } else {
-      history[existingIdx] = { ...existing, ...todayEntry };
-    }
-  } else {
-    history.unshift(todayEntry);
-  }
-
-  // Deduplicate by ISO date and sort chronologically newest first
-  const map = new Map();
-  for (const item of history) {
-    const iso = normalizeDateToIso(item.isoDate || item.date || item.id);
-    if (iso && !map.has(iso)) {
-      map.set(iso, {
-        ...item,
-        isoDate: iso,
-        id: `eod_${iso}`,
-        date: formatIsoToDisplayDate(iso),
-      });
-    }
-  }
-
-  history = Array.from(map.values())
-    .sort((a, b) => (b.isoDate || "").localeCompare(a.isoDate || ""))
-    .slice(0, 60);
-
   if (REDIS_URL) {
-    saveRedisEodHistory(history).catch(() => {});
+    if (repairRan) {
+      const saved = await saveRedisEodHistory(history);
+      if (!saved) await redisRestDel(EOD_HISTORY_REPAIR_KEY); // not persisted: let a later refresh repair again
+    } else {
+      saveRedisEodHistory(history).catch(() => {});
+    }
   }
 
   return history;
@@ -2492,11 +2452,13 @@ export default async function handler(req, res) {
     try {
       if (!body || typeof body !== "object") throw new Error("Invalid sync payload");
       if (body?.action === "sync_eod_history" && Array.isArray(body?.history)) {
+        // Closed-weekend rows are dropped; dates normalised and deduplicated (src/eodTrackRecord.js).
+        const cleanHistory = sanitizeEodHistory(body.history, { limit: 60 });
         if (REDIS_URL) {
-          await saveRedisEodHistory(body.history);
+          await saveRedisEodHistory(cleanHistory);
         }
         cache = { data: null, timestamp: 0 };
-        return res.status(200).json({ success: true, count: body.history.length });
+        return res.status(200).json({ success: true, count: cleanHistory.length });
       }
       const incoming = body?.timeline;
       if (Array.isArray(incoming) && incoming.length > 0) {
@@ -3442,6 +3404,7 @@ async function refreshLiveSnapshotCore({
       floorStrike,
       roofStrike,
       eodDecision,
+      timeline, // today's ticks: the opening tick resolves the previous session's carry
     });
 
     // A closed weekend day (Saturday or an ordinary Sunday; src/marketCalendar.js) has no session:
