@@ -9,6 +9,7 @@ import {
   eodRowsForStorage,
   isSessionDate,
   isSeedRow,
+  isCarryRow,
   computeEodTrackStats,
   formatEodWinRate,
   eodUnresolvedLabel,
@@ -2831,6 +2832,11 @@ export function NiftyFlowView({ t, isDark }) {
                     </div>
                     <div style={{ fontSize: 9.5, color: isDark ? "#fde047" : "#b45309" }}>Recorded-live no-carry days (final verdicts only)</div>
                     <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
+                      {liveStats.cashChecked > 0
+                        ? `No-carry correct: ${liveStats.cashCorrect}/${liveStats.cashChecked} (next open within ±0.35%)`
+                        : "No-carry check: no next opens recorded yet"}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: t.textMuted, marginTop: 3 }}>
                       Hand-entered: {seedStats.cashDays} days
                     </div>
                   </div>
@@ -2998,7 +3004,20 @@ export function NiftyFlowView({ t, isDark }) {
                             <span style={{ color: t.textMuted }}>{isInProgress ? "Spot now: " : "Carry Spot: "}</span>
                             <strong>₹{Number(item.entrySpot || 0).toLocaleString("en-IN")}</strong>
                             {item.nextDayOpen ? (
-                              <span> → Next Open: <strong>₹{Number(item.nextDayOpen).toLocaleString("en-IN")}</strong></span>
+                              <span> → Next Open: <strong>₹{Number(item.nextDayOpen).toLocaleString("en-IN")}</strong>
+                                {Number.isFinite(Number(item.openGapPts)) && item.cashCheck ? (
+                                  <>
+                                    <span style={{ color: t.textMuted }}> ({Number(item.openGapPts) >= 0 ? "+" : ""}{item.openGapPts} pts, {Number(item.openGapPct) >= 0 ? "+" : ""}{item.openGapPct}%)</span>
+                                    <strong style={{ color: item.cashCheck === "CORRECT" ? "#16a34a" : "#d97706" }}>
+                                      {item.cashCheck === "CORRECT" ? " · No-carry correct" : item.cashCheck === "MISSED_UP" ? " · Missed gap-up" : " · Missed gap-down"}
+                                    </strong>
+                                  </>
+                                ) : null}
+                              </span>
+                            ) : item.cashCheck === "OPEN_NOT_RECORDED" ? (
+                              <span style={{ color: t.textMuted }}> → Next Open: not recorded</span>
+                            ) : (!isCarryRow(item) && item.outcome === "PRESERVED_CASH" && !isSeedRow(item)) ? (
+                              <span style={{ color: t.textMuted }}> → Next Open: awaiting the next session (no-carry check)</span>
                             ) : isInProgress ? (
                               <span style={{ color: t.textMuted }}> · verdict not final</span>
                             ) : isUnresolved ? (

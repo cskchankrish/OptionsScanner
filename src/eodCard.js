@@ -44,6 +44,7 @@ export function buildEodCard({ bias, score, thresh, conviction, thresholdDistanc
   const net = formatLots(b.net);
   let bWords;
   if (b.pending) bWords = `Pending — window from ${b.anchor} scores after ${b.activate}`;
+  else if (b.unverified && b.chainExpiry && !b.coverage) bWords = `Expiry day: ${b.chainExpiry} closing flow not recorded`;
   else if (b.unverified) bWords = b.coverage?.worstGap ? `Not enough data (gap ${b.coverage.worstGap.from}–${b.coverage.worstGap.to})` : "Not enough closing-flow data";
   else if (/CALL_BLITZ|^BEARISH$|MILD_BEARISH/.test(b.status)) bWords = `Fresh call writing since ${b.anchor} (net ${net})`;
   else if (/PUT_BLITZ|^BULLISH$|MILD_BULLISH/.test(b.status)) bWords = `Fresh put writing since ${b.anchor} (net ${net})`;
@@ -70,7 +71,7 @@ export function buildEodCard({ bias, score, thresh, conviction, thresholdDistanc
       row("C", "Futures", c, cWords),
     ],
     stop: stop ?? null,
-    contract: targetContract ? `${targetContract}${isRollover ? " (next-week rollover)" : ""}` : null,
+    contract: targetContract ? `${targetContract}${isRollover ? " (expiry-day rollover)" : ""}` : null,
     caveat: dataQualityCaveat,
     automation: null,
     dataLine: null,

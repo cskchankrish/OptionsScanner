@@ -8,6 +8,7 @@ import {
   repairEodHistory,
   repairEodHistoryV2,
   nseTimestampIstMinutes,
+  cashCheckDatesNeeded,
 } from "../src/eodTrackRecord.js";
 import {
   parseNseFuturesPayload,
@@ -1020,9 +1021,28 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     }
   }
 
+  // No-carry check for past cash rows: read the next sessions' timelines it needs (only for rows not
+  // yet checked, so after one save this reads nothing). A date Redis no longer holds comes back
+  // empty and the row is marked "open not recorded".
+  let timelinesByDate = null;
+  if (REDIS_URL && REDIS_TOKEN) {
+    const need = cashCheckDatesNeeded(sanitizeEodHistory(history), todayIso).slice(0, 10);
+    if (need.length) {
+      const read = eodRepairTimelineReader(todayIso, timeline);
+      timelinesByDate = {};
+      for (const iso of need) {
+        try {
+          timelinesByDate[iso] = await read(iso);
+        } catch (e) {
+          // unreadable now: leave it out so the row is retried on a later refresh
+        }
+      }
+    }
+  }
+
   // Sanitise (closed-weekend rows dropped), settle stale in-progress rows, upsert today's row
   // (IN_PROGRESS until 15:38), resolve every PENDING row whose next session is today from the
-  // first real tick of today's timeline.
+  // first real tick of today's timeline, and record the next open of no-carry rows.
   history = reconcileEodHistory({
     history,
     todayIso,
@@ -1034,6 +1054,7 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
     roofStrike,
     eodDecision,
     todayTimeline: timeline,
+    timelinesByDate,
     limit: 60,
     spotIsReal, // finalise only from NSE's real spot ...
     nseDataMins, // ... with data from after the closing-session freeze
@@ -1278,7 +1299,7 @@ function getISTTimeStr() {
   return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
+function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null, nextChain = null) {
   const today = getISTDateStr();
   const now = Date.now();
   const nowMins = getISTMinutes();
@@ -1301,6 +1322,12 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
   } : {};
   // Floor / roof strikes at this tick (used by the Turn Tracker for strike migration since an extreme).
   const lv = levels && Number(levels.floor) > 0 && Number(levels.roof) > 0 ? { floor: Number(levels.floor), roof: Number(levels.roof) } : {};
+  // Expiry-day afternoon: the NEXT expiry's corridor writing totals at this tick. The expiring
+  // contract's writing collapses mechanically into settlement (17-Nov: 21.6L → 6.0L puts in the
+  // last 85 minutes), so the EOD closing flow is scored on these instead (see calculateEODDecision).
+  const nx = nextChain && Number.isFinite(Number(nextChain.putWriting)) && Number.isFinite(Number(nextChain.callWriting))
+    ? { nextPutWriting: Number(nextChain.putWriting), nextCallWriting: Number(nextChain.callWriting), ...(nextChain.expiry ? { nextExpiry: String(nextChain.expiry) } : {}) }
+    : {};
 
   // 1. Outside Live Market Hours (Weekends, Evenings, Nights, Pre-market)
   // Preserve settled session timeline until the new market session actually opens
@@ -1344,6 +1371,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
         spot: spot,
         isLiveTick: false,
         ...fut,
+        ...nx,
       });
       if (REDIS_URL) {
         setRedisTimeline(today, intradayHistory).catch(() => {});
@@ -1354,6 +1382,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
       last.netDiff = totPut - totCall;
       last.spot = spot;
       if (fut.futPrice !== undefined) Object.assign(last, fut);
+      Object.assign(last, nx);
     }
 
     return intradayHistory;
@@ -1381,6 +1410,7 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
       ...(isSpotFrozenAt(capMins) && !isSunday ? { spotFrozen: true } : {}),
       ...fut,
       ...lv,
+      ...nx,
     });
     didUpdate = true;
   } else if (last) {
@@ -1393,6 +1423,8 @@ function buildTimeline(totPut, totCall, spot, futuresMetrics, levels = null) {
     if (isSpotFrozenAt(capMins) && !isSunday) last.spotFrozen = true;
     if (fut.futPrice !== undefined) Object.assign(last, fut);
     Object.assign(last, lv);
+    // A refresh whose next-chain fetch failed keeps the values an earlier refresh of this minute stored.
+    Object.assign(last, nx);
     didUpdate = true;
   }
 
@@ -1892,6 +1924,11 @@ export function calculateEODDecision({
   futuresQuadrant = null,
   futuresMetrics = null,
   macroTurn = null,
+  // Expiry-day afternoon rollover: { expiry, nextChainAvailable }. When set, group B (closing flow)
+  // is scored on the next expiry's per-tick writing (nextPutWriting / nextCallWriting) and ticks
+  // without it count as gaps, so a missing next-chain series makes group B UNVERIFIED (0 pts,
+  // carry blocked) instead of reading the expiring contract's settlement unwind as smart money.
+  expiryRollover = null,
   // Only the weekend-closed status label reads this: true when tomorrow is a Muhurat date
   // (src/marketCalendar.js). dayOfWeek must be calendar-gated by the caller: 0 = the Muhurat
   // session, 6 = a closed weekend day (Saturday or an ordinary Sunday).
@@ -2042,9 +2079,23 @@ export function calculateEODDecision({
   // Tiers on |Δ netDiff| since 14:15: ≥75k → 3, ≥30k → 2, ≥10k → 1. Full weight only when the
   // move is WRITING-driven (opposing-side writing up). UNWINDING-driven, MIXED or leg-less
   // flow is one tier lower and never labelled a blitz.
-  const validTimeline = (Array.isArray(timeline) ? timeline : []).filter(
+  const sessionTimeline = (Array.isArray(timeline) ? timeline : []).filter(
     pt => pt && Number.isFinite(pt.minutes) && pt.minutes >= openMins && pt.minutes <= closeMins && Number.isFinite(pt.netDiff)
   );
+  const rolloverExpiry = expiryRollover && expiryRollover.expiry ? String(expiryRollover.expiry) : null;
+  // On the expiry-day afternoon the closing flow is measured on the next expiry's series only.
+  const validTimeline = rolloverExpiry
+    ? sessionTimeline
+        .filter(pt => Number.isFinite(Number(pt.nextPutWriting)) && Number.isFinite(Number(pt.nextCallWriting)) &&
+          (!pt.nextExpiry || String(pt.nextExpiry) === rolloverExpiry))
+        .map(pt => ({
+          ...pt,
+          putWriting: Number(pt.nextPutWriting),
+          callWriting: Number(pt.nextCallWriting),
+          netDiff: Number(pt.nextPutWriting) - Number(pt.nextCallWriting),
+        }))
+    : sessionTimeline;
+  const rolloverNote = rolloverExpiry ? ` [next expiry ${rolloverExpiry} chain — expiring contract excluded]` : "";
 
   let isClosingDataValid = false;
   let p1415 = null;
@@ -2139,6 +2190,10 @@ export function calculateEODDecision({
     closingFlowStatus = "AWAITING_DATA";
     closingFlowDetail = "Data Integrity Notice: Insufficient intraday timeline ticks (< 3). Scoring held neutral.";
     closingImpact = "0 pts (Data Pending)";
+  }
+
+  if (rolloverExpiry && closingFlowDetail && !closingFlowDetail.includes(rolloverNote)) {
+    closingFlowDetail += rolloverNote;
   }
 
   // Once the closing window is active, missing / gappy data makes group B UNVERIFIED (0 pts).
@@ -2304,7 +2359,7 @@ export function calculateEODDecision({
 
   const groups = {
     A: { id: "A", name: "Options positioning (PCR / ΔPCR / walls)", contribution: groupA, raw: rawA, cap: EOD_GROUP_CAPS.A },
-    B: { id: "B", name: `Closing options flow (${flowAnchorStr}+)`, contribution: groupB, raw: groupB, cap: EOD_GROUP_CAPS.B, driver: closingFlow?.driver || null, unverified: groupBUnverified, pending: !closingWindowActive || closingFlowPending, coverage: closingCoverage },
+    B: { id: "B", name: `Closing options flow (${flowAnchorStr}+)`, contribution: groupB, raw: groupB, cap: EOD_GROUP_CAPS.B, driver: closingFlow?.driver || null, unverified: groupBUnverified, pending: !closingWindowActive || closingFlowPending, coverage: closingCoverage, chainExpiry: rolloverExpiry },
     C: { id: "C", name: "Futures (quadrant + basis)", contribution: groupC, raw: quadPts + basisPts, cap: EOD_GROUP_CAPS.C, quadrant, quadrantSource: quadSource, unverified: groupCUnverified, unverifiedReason: groupCReason },
   };
   groups.A.unverified = false;
@@ -2461,7 +2516,7 @@ export function calculateEODDecision({
     stop: bias === "NEUTRAL" ? null : decisionStop, targetContract, isRollover,
     a: { contribution: groupA, fullDayStatus, pcrStatus, levelStatus, levelDetail },
     b: { contribution: groupB, pending: !closingWindowActive || closingFlowPending, unverified: groupBUnverified, coverage: closingCoverage,
-      status: closingFlowStatus, net: lastHourNetDelta, anchor: flowAnchorStr, activate: minsToHHMM(flowActivateMins) },
+      status: closingFlowStatus, net: lastHourNetDelta, anchor: flowAnchorStr, activate: minsToHHMM(flowActivateMins), chainExpiry: rolloverExpiry },
     c: { contribution: groupC, unverified: groupCUnverified, quadrant, basisPts, quadDir, basisDetail },
   });
 
@@ -3312,8 +3367,11 @@ async function refreshLiveSnapshotCore({
     // Near expiry: always record the tick (buildTimeline appends the first tick of the
     // session even when history is empty). Any other expiry: read-only copy of the real
     // near-expiry history (possibly empty) — never synthetic ticks, never a mutation.
+    const nextChainForTick = (isAfternoonRollover && nextMetrics)
+      ? { putWriting: nextMetrics.totPutWriting, callWriting: nextMetrics.totCallWriting, expiry: nextExpiry }
+      : null;
     const timeline = (targetExpiry === nearExpiry)
-      ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics, { floor: floorStrike, roof: roofStrike })
+      ? buildTimeline(totPutWriting, totCallWriting, spot, futuresMetrics, { floor: floorStrike, roof: roofStrike }, nextChainForTick)
       : (Array.isArray(intradayHistory) ? intradayHistory.map(pt => ({ ...pt })) : []);
 
     // Compute Smart Money / Institutional Analysis
@@ -3340,7 +3398,13 @@ async function refreshLiveSnapshotCore({
       muhuratTomorrow: Boolean(sessionInfo.isMuhuratTomorrow),
       nowMins: getISTMinutes(),
       fusion,
-      targetContract: targetExpiry,
+      // On the expiry-day afternoon the carry is evaluated on the next expiry, so name that contract.
+      targetContract: (isAfternoonRollover && nextExpiry) ? nextExpiry : targetExpiry,
+      // Expiry-day afternoon: score the closing flow on the next expiry's writing (recorded per tick
+      // as nextPutWriting / nextCallWriting), never on the expiring contract's settlement unwind.
+      expiryRollover: isAfternoonRollover && nextExpiry
+        ? { expiry: nextExpiry, nextChainAvailable: Boolean(nextMetrics) }
+        : null,
       isRollover: Boolean(isTargetRollover || isAfternoonRollover),
       futuresQuadrant: fusion?.quadrantInfo || null,
       futuresMetrics,

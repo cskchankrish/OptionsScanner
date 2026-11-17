@@ -150,8 +150,10 @@ test("dteFromExpiry matches calculateDte semantics", () => {
 // ─────────────────────────── buildDailySummary ───────────────────────────
 function syntheticTimeline() {
   return [
-    { minutes: 555, spot: 25000, futPrice: 25300, futCombinedOI: 190000 }, // stale carry-over futures quote
-    { minutes: 556, spot: 25010, futPrice: 25310, futCombinedOI: 190500 },
+    // Stale carry-over futures quotes: the previous session's price, OI and cumulative volume, as
+    // the real feed repeats them (13-Nov, 16-Nov, 17-Nov). The volume reset at 09:17 marks the live open.
+    { minutes: 555, spot: 25000, futPrice: 25300, futCombinedOI: 190000, futVolume: 3500000 },
+    { minutes: 556, spot: 25010, futPrice: 25310, futCombinedOI: 190500, futVolume: 3500000 },
     { minutes: 557, spot: 25020, futPrice: 25050, futCombinedOI: 200000, futVolume: 1000 },
     { minutes: 600, spot: 25200, futPrice: 25230, futCombinedOI: 201000, futVolume: 5000 },
     { minutes: 650, spot: 26000, futPrice: 26100, futCombinedOI: 999999, synthetic: true },
@@ -161,7 +163,7 @@ function syntheticTimeline() {
   ];
 }
 
-test("buildDailySummary: OHLC from real ticks; synthetic and frozen ticks excluded; futures from 09:17", () => {
+test("buildDailySummary: OHLC from real ticks; synthetic and frozen ticks excluded; futures from the first live tick", () => {
   const near = summariseChain({ rows: rows(25100), spot: 25100, expiry: "17-Nov-2026", dte: 6 });
   const s = buildDailySummary({ date: "2026-11-11", timeline: syntheticTimeline(), near, dataQuality: { coveragePct: 97 }, nowMs: Date.UTC(2026, 10, 11, 10, 5) });
   assert.deepEqual(s.spot, { open: 25000, high: 25200, low: 24900, close: 25100 });
@@ -172,9 +174,9 @@ test("buildDailySummary: OHLC from real ticks; synthetic and frozen ticks exclud
   assert.equal(s.fut.oiOpen, 200000);
   assert.equal(s.fut.oiClose, 204000);
   assert.equal(s.fut.oiChangePct, 2);
-  assert.equal(s.fut.volume, 12000);
+  assert.equal(s.fut.volume, 12000, "the carry-over quote's previous-session volume (3.5M) is not today's volume");
   assert.equal(s.ticks, 7);
-  assert.ok(s.notes.some((n) => /09:17/.test(n)));
+  assert.ok(s.notes.some((n) => /from 09:17: 2 opening carry-over quote\(s\) skipped/.test(n)));
   assert.equal(s.nearIntraday.floor, 25000);
   assert.equal(s.nearIntraday.totalPutWriting, 300);
   assert.equal(s.chains.near.expiry, "17-Nov-2026");
@@ -234,10 +236,23 @@ test("buildDailySummary: fewer than 30 live ticks → falls back to all non-synt
   assert.equal(lowered.spot.low, 25170);
 });
 
-test("buildDailySummary: futures open falls back to the first tick when nothing from 09:17", () => {
+test("buildDailySummary: no carry-over evidence → futures open from the first tick", () => {
   const s = buildDailySummary({ date: "2026-11-11", timeline: [{ minutes: 555, spot: 1, futPrice: 10, futCombinedOI: 5 }, { minutes: 556, spot: 2, futPrice: 11, futCombinedOI: 6 }] });
   assert.equal(s.fut.open, 10);
-  assert.ok(s.notes.some((n) => /first available tick/.test(n)));
+  assert.ok(s.notes.some((n) => /futures open from the first tick \(09:15\)/.test(n)));
+});
+
+test("buildDailySummary: 17-Nov opening — the live open is 09:16 (volume reset), same as the scorecard", () => {
+  // Real 17-Nov series start: 09:15 repeats Monday's close (cumulative volume 2,642,640).
+  const tl = [
+    { minutes: 555, spot: 25277.3, futPrice: 25318.5, futCombinedOI: 205523, futVolume: 2642640 },
+    { minutes: 556, spot: 25312, futPrice: 25333.7, futCombinedOI: 203776, futVolume: 50440 },
+    { minutes: 557, spot: 25329.85, futPrice: 25360, futCombinedOI: 203907, futVolume: 92495 },
+    { minutes: 558, spot: 25340, futPrice: 25380, futCombinedOI: 204000, futVolume: 120000 },
+  ];
+  const s = buildDailySummary({ date: "2026-11-17", timeline: tl });
+  assert.equal(s.fut.open, 25333.7, "not the 09:17 print (25360) the old fixed cut-off used");
+  assert.equal(s.fut.oiOpen, 203776);
 });
 
 // ─────────────────────────── summaryFromScorecardDoc ───────────────────────────
@@ -249,7 +264,8 @@ function scorecardDoc(date = "2026-11-13") {
       s: [25300, 25310, 25400, 25600, 25350],
       f: [25500, 25320, 25420, 25390, 25370],
       o: [210000, 211000, 212000, 213000, 214000],
-      v: [null, 100, 200, 300, 400],
+      // 09:15 repeats the previous session's cumulative volume (13-Nov real: 3,559,335).
+      v: [3559335, 100, 200, 300, 400],
       p: [0, 10, 20, 30, 40],
       c: [0, 5, 10, 15, 20],
     },
@@ -467,6 +483,7 @@ test("evaluateOutlookOutcome: each regime's hit and miss", () => {
   assert.equal(evaluateOutlookOutcome({ outlook: OUT("BREAK_RISK_DOWN", h), laterDays: flat }).hit, false);
   const ins = evaluateOutlookOutcome({ outlook: OUT("INSUFFICIENT_DATA", h), laterDays: up });
   assert.equal(ins.hit, null);
+  assert.equal(ins.status, "NOT_MEASURED");
   assert.match(ins.reason, /not measured/);
   assert.match(evaluateOutlookOutcome({ outlook: OUT("RANGE", h), laterDays: flat }).rule, /every daily spot close/);
 });

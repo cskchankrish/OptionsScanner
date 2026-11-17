@@ -202,7 +202,7 @@ export function ScorecardView({ t, isDark }) {
                   {o?.reason && <div style={{ fontWeight: 500, fontSize: 10.5 }}>{o.reason}</div>}
                 </td>
                 <td style={cell}>{o?.horizons?.[15]?.pts !== undefined ? pts(o.horizons[15].pts) : "—"}</td>
-                <td style={cell}>{o?.horizons?.[60]?.pts !== undefined ? pts(o.horizons[60].pts) : o?.move0920Pts !== undefined ? `09:20 ${pts(o.move0920Pts)}` : "—"}</td>
+                <td style={cell}>{o?.horizons?.[60]?.pts !== undefined ? pts(o.horizons[60].pts) : o?.move0920Pts !== undefined ? `${o.price0920At || "09:20"} ${pts(o.move0920Pts)}` : "—"}</td>
                 <td style={cell}>{o?.band60?.first || o?.first || "—"}</td>
                 <td style={cell}>{e.dq?.ok === false ? "⚠️ gaps" : "ok"}</td>
               </tr>

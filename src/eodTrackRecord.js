@@ -514,6 +514,29 @@ export const EOD_FINAL_MINS_MUHURAT = 958;
 export const EOD_OPEN_TICK_MAX_DELAY_MINS = 15;
 /** Fewer resolved carries than this → "too few to judge". */
 export const EOD_TOO_FEW_RESOLVED = 10;
+/**
+ * No-carry check: a NO CARRY day is "correct" when the next session opens within this % of the
+ * carry spot (no carry-worthy gap was missed). Same 0.35% band as the scorecard's no-carry rule,
+ * which measures the 09:20 futures price; the track record measures the index open like its carries.
+ */
+export const EOD_CASH_MISSED_MOVE_PCT = 0.35;
+export const EOD_CASH_CHECK = Object.freeze({
+  CORRECT: "CORRECT", // opened within ±0.35%: staying in cash was right
+  MISSED_UP: "MISSED_UP", // gapped up beyond 0.35%: a BTST would have paid
+  MISSED_DOWN: "MISSED_DOWN", // gapped down beyond 0.35%: an STBT would have paid
+  OPEN_NOT_RECORDED: "OPEN_NOT_RECORDED", // next session's open not captured
+});
+
+/** No-carry check from the next session's open versus the carry spot. */
+export function cashCheckFromOpen(entrySpot, open) {
+  const entry = Number(entrySpot);
+  const o = Number(open);
+  if (!(entry > 0) || !(o > 0)) return null;
+  const gap = round2(o - entry);
+  const pct = round2((gap / entry) * 100);
+  const check = Math.abs(pct) <= EOD_CASH_MISSED_MOVE_PCT ? EOD_CASH_CHECK.CORRECT : gap > 0 ? EOD_CASH_CHECK.MISSED_UP : EOD_CASH_CHECK.MISSED_DOWN;
+  return { gap, pct, check };
+}
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -689,7 +712,24 @@ export function resolveRowFromOpenTick(row, tick, nextIso) {
     const pts = round2(-diff);
     return { ...row, nextDayOpen: open, gapPts: pts, outcome: diff < 0 ? "WIN" : "LOSS", notes: `${diff <= 0 ? "+" : ""}${pts} pts gap-down on open`, resolvedFrom };
   }
-  return { ...row, nextDayOpen: open, gapPts: 0, outcome: "PRESERVED_CASH", notes: "Avoided overnight exposure; 100% cash preserved.", resolvedFrom };
+  // No carry: the outcome stays PRESERVED_CASH (it is not a win/loss and never enters the carry
+  // stats or net points); the open, the index gap and whether staying in cash was right are recorded.
+  const c = cashCheckFromOpen(entry, open);
+  const sign = (v) => `${v >= 0 ? "+" : ""}${v}`;
+  const verdictNote = c.check === EOD_CASH_CHECK.CORRECT
+    ? `no-carry correct (within ±${EOD_CASH_MISSED_MOVE_PCT}%)`
+    : `missed a ${c.check === EOD_CASH_CHECK.MISSED_UP ? "gap-up (BTST would have paid)" : "gap-down (STBT would have paid)"} beyond ±${EOD_CASH_MISSED_MOVE_PCT}%`;
+  return {
+    ...row,
+    nextDayOpen: open,
+    gapPts: null,
+    openGapPts: c.gap,
+    openGapPct: c.pct,
+    cashCheck: c.check,
+    outcome: "PRESERVED_CASH",
+    notes: `No carry. Next open ${open} (${sign(c.gap)} pts, ${sign(c.pct)}%): ${verdictNote}.`,
+    resolvedFrom,
+  };
 }
 
 /**
@@ -732,8 +772,48 @@ function capitalise(s) {
  *   (the opening was not captured on that day, so it is not available now).
  * Seed (hand-entered) rows are never touched.
  */
+/** A recorded NO CARRY row whose next-session open has not been checked yet. */
+export function isCashRowAwaitingOpen(r) {
+  return Boolean(r && r.outcome === "PRESERVED_CASH" && !isCarryRow(r) && !isSeedRow(r) &&
+    r.cashCheck == null && Number(r.entrySpot) > 0);
+}
+
+/**
+ * Next-session dates (before today) whose timelines the no-carry check needs — the caller reads
+ * them (Redis keeps timelines 14 days) and passes them as `timelinesByDate`.
+ */
+export function cashCheckDatesNeeded(rows, todayIso) {
+  const out = new Set();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!isCashRowAwaitingOpen(r) || !(r.isoDate < todayIso)) continue;
+    const next = nextSessionDate(r.isoDate);
+    if (next && next < todayIso) out.add(next);
+  }
+  return [...out];
+}
+
+/** No-carry row: record the next open when available; never turns the row UNRESOLVED. */
+function resolveCashRowOpen(r, { todayIso, todayTimeline, timelinesByDate }) {
+  const next = nextSessionDate(r.isoDate);
+  if (!next || next > todayIso) return r;
+  const sessionOver = next !== todayIso;
+  const tl = next === todayIso
+    ? todayTimeline
+    : (timelinesByDate && Array.isArray(timelinesByDate[next]) ? timelinesByDate[next] : null);
+  if (tl == null) return r; // that day's timeline was not read on this refresh: try again later
+  const res = resolveOpenFromTimeline(r, next, tl, { sessionOver });
+  if (res.status === "RESOLVED") return res.row;
+  if (res.status === "UNRESOLVED") {
+    return { ...r, cashCheck: EOD_CASH_CHECK.OPEN_NOT_RECORDED, nextDayOpen: null, openGapPts: null, openGapPct: null };
+  }
+  return r;
+}
+
 export function resolvePendingEodRows(rows, { todayIso, todayTimeline = [], timelinesByDate = null }) {
   return rows.map(r => {
+    if (r && r.isoDate < todayIso && isCashRowAwaitingOpen(r)) {
+      return resolveCashRowOpen(r, { todayIso, todayTimeline, timelinesByDate });
+    }
     if (!r || r.outcome !== "PENDING" || !(r.isoDate < todayIso) || isSeedRow(r)) return r;
     const next = nextSessionDate(r.isoDate);
     if (!next || next > todayIso) return r;
@@ -1172,6 +1252,10 @@ function tallyEodRows(rows) {
     // Carry calls still stored as PRESERVED_CASH (the pre-repair bug): neither a carry result nor a cash day.
     carryStoredAsCash: carries.filter(r => r.outcome === "PRESERVED_CASH").length,
     cashDays: counted.filter(r => !isCarryRow(r) && r.outcome === "PRESERVED_CASH").length,
+    // No-carry check (cash days with the next open recorded): staying in cash was right when the
+    // open was within ±EOD_CASH_MISSED_MOVE_PCT of the carry spot.
+    cashChecked: counted.filter(r => !isCarryRow(r) && /^(CORRECT|MISSED_UP|MISSED_DOWN)$/.test(String(r.cashCheck || ""))).length,
+    cashCorrect: counted.filter(r => !isCarryRow(r) && r.cashCheck === "CORRECT").length,
     inProgress,
     unresolved,
     netPts,

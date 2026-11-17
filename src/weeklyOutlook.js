@@ -468,7 +468,8 @@ export function evaluateOutlookOutcome({ outlook, laterDays = [] } = {}) {
     if (!outlook || !outlook.asOf) return { ...base, reason: "no outlook" };
     const regime = outlook.regime;
     const rule = OUTLOOK_HIT_RULES[regime] || "Not measured.";
-    if (regime === "INSUFFICIENT_DATA" || !OUTLOOK_HIT_RULES[regime]) return { ...base, status: "MEASURED", rule, reason: "INSUFFICIENT_DATA outlooks are not measured." };
+    // Not a measurement: say so (it was reported as "MEASURED" with a null hit). The tally never counted it.
+    if (regime === "INSUFFICIENT_DATA" || !OUTLOOK_HIT_RULES[regime]) return { ...base, status: "NOT_MEASURED", rule, reason: "INSUFFICIENT_DATA outlooks are not measured." };
     const later = cleanDays(laterDays).filter((d) => d.date > outlook.asOf && hasSpotBar(d));
     const expIso = expiryToIso(outlook.horizon?.expiry || outlook.expectedRange?.expiry);
     const idxExp = expIso ? later.findIndex((d) => d.date >= expIso) : -1;

@@ -1477,6 +1477,54 @@ export async function checkStuckAcceptedTrade(redis, trade, deps = getWebhookDep
   }
 }
 
+// The day's signal list stores each approved signal as it was dispatched ("ACCEPTED"). The Algo's
+// later entry report is kept here per trade id and overlaid when the list is read, so the list
+// never keeps showing "accepted" for a trade that filled or failed (17-Nov 11:00 SYNERGY_BULL).
+export const EXEC_UPDATE_PREFIX = "nifty:tv:exec:";
+const EXEC_UPDATE_TTL_SEC = 14 * 86400;
+const EXEC_OVERLAY_STATUSES = new Set(["PENDING", "ACCEPTED", "UNKNOWN"]);
+
+async function saveExecutionUpdate(redis, tradeId, update) {
+  if (!redis || !tradeId) return;
+  try {
+    await redis.set(EXEC_UPDATE_PREFIX + tradeId, JSON.stringify(update), { ex: EXEC_UPDATE_TTL_SEC });
+  } catch (e) {
+    console.warn("[tv-webhook] execution update not stored (list may show the dispatch status):", e?.message || e);
+  }
+}
+
+/**
+ * Returns the records with the latest Algo entry report applied (newest state wins). Records whose
+ * execution is already final, or that have no trade id, are returned unchanged. Never throws.
+ */
+export async function overlayExecutionUpdates(redis, records) {
+  const list = Array.isArray(records) ? records : [];
+  if (!redis) return list;
+  const ids = [...new Set(list
+    .filter((r) => r && r.tradeId && EXEC_OVERLAY_STATUSES.has(r.execution?.status))
+    .map((r) => r.tradeId))];
+  if (!ids.length) return list;
+  const updates = {};
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const raw = await redis.get(EXEC_UPDATE_PREFIX + id);
+      const u = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (u && u.status) {
+        updates[id] = u;
+        return;
+      }
+      // Entries reported before this key existed: the ENTRY_FAILED marker still says what happened.
+      const rawFailed = await redis.get(BRIDGE_FAILED_PREFIX + id);
+      const f = typeof rawFailed === "string" ? JSON.parse(rawFailed) : rawFailed;
+      if (f) updates[id] = { status: "NOT_EXECUTED", outcome: "ENTRY_FAILED", reason: f.reason ?? null, at: f.at ?? null };
+    } catch (e) { /* leave this record as dispatched */ }
+  }));
+  return list.map((r) => {
+    const u = r && r.tradeId && EXEC_OVERLAY_STATUSES.has(r.execution?.status) ? updates[r.tradeId] : null;
+    return u ? { ...r, execution: { ...r.execution, ...u, dispatchStatus: r.execution.status, updatedBy: "algo-sync-back" } } : r;
+  });
+}
+
 /**
  * ENTRY_FILLED / ENTRY_FAILED sync-back (contract v1.1). Requires a tradeId matching the open
  * trade; repeats are 200 no-ops; ENTRY_FAILED after FILLED (or FILLED after a FAILED) is a 409
@@ -1558,6 +1606,10 @@ async function handleEntrySync({ redis, payload, res }) {
       filledAt: new Date(filledAtMs).toISOString(),
     };
     await redis.set(ACTIVE_TRADE_KEY, JSON.stringify(activeTrade), { ex: tradeTtlSec(activeTrade) });
+    await saveExecutionUpdate(redis, tradeId, {
+      status: "FILLED", contract: sync.contract ?? null, optionFill: sync.optionFill ?? null, lots: sync.lots ?? null,
+      mode: activeTrade.execution.mode, at: activeTrade.execution.filledAt,
+    });
     const record = {
       type: "ENTRY_FILLED", timestamp: nowIso, istTime: nowIst, trade: activeTrade, decision: "ENTRY_FILLED",
       recommendedLots: 0, sync,
@@ -1598,6 +1650,9 @@ async function handleEntrySync({ redis, payload, res }) {
   try {
     await redis.set(BRIDGE_FAILED_PREFIX + tradeId, JSON.stringify({ reason: sync.reason, at: nowIso }), { ex: BRIDGE_MARKER_TTL_SEC });
   } catch (e) {}
+  await saveExecutionUpdate(redis, tradeId, {
+    status: "NOT_EXECUTED", outcome: "ENTRY_FAILED", reason: sync.reason ?? null, mode: activeTrade.execution.mode, at: nowIso,
+  });
   await releaseActiveTradeIfOwned(redis, tradeId);
   const record = {
     type: "ENTRY_FAILED", timestamp: nowIso, istTime: nowIst, trade: activeTrade, decision: "NOT_EXECUTED",
@@ -2159,6 +2214,10 @@ export default async function handler(req, res) {
         }
       } else {
         latestSignal = await redisRestGet("nifty:tv:latest_signal");
+      }
+      if (redis) {
+        signals = await overlayExecutionUpdates(redis, signals);
+        if (latestSignal) [latestSignal] = await overlayExecutionUpdates(redis, [latestSignal]);
       }
 
       // Automatic lifecycle evaluation if spot or high/low provided in GET

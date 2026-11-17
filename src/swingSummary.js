@@ -10,12 +10,14 @@
  * Every function here is pure (or takes its I/O as injected deps) and never throws.
  */
 import { isSpotFrozenAt } from "./flowCalc.js";
+import { firstLiveIndex } from "./sessionOpen.js";
+
+const hhmmOf = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 import { keys as scKeys, isSessionDayDoc } from "./scorecard.js";
 import { computeWeeklyOutlook, getOutlookConfig, expiryToIso } from "./weeklyOutlook.js";
 
 export const SWING_SUMMARY_VERSION = 1;
 export const SWING_CAPTURE_END_MINS = 940; // 15:40 IST, last F&O minute
-export const SWING_FUT_OPEN_FROM_MINS = 557; // 09:17 IST: skip the opening carry-over quotes
 export const SWING_PARTIAL_COVERAGE_PCT = 50; // a captured day below this tick coverage is partial
 // With at least this many live ticks (isLiveTick !== false), OHLC/OI use live ticks only, so
 // gap-bridging (interpolated) ticks synced back by a browser cannot set a high or low.
@@ -160,16 +162,27 @@ function ohlcFromTicks(ticks, notes) {
   const futAll = ticks.filter((p) => Number(p.futPrice) > 0);
   let fut = null;
   if (futAll.length) {
-    const fromOpen = futAll.filter((p) => Number(p.minutes) >= SWING_FUT_OPEN_FROM_MINS);
-    const src = fromOpen.length ? fromOpen : futAll;
-    if (fromOpen.length) notes.push("futures open/high/low/OI-open taken from 09:17 onward (opening carry-over quotes skipped)");
-    else notes.push("no futures ticks from 09:17 onward; futures open from the first available tick");
+    // Same first-live-tick rule as the scorecard and the EOD anchor (src/sessionOpen.js): skip the
+    // opening carry-over quotes the feed repeats from the previous session. (Was a fixed 09:17 cut,
+    // which on 17-Nov dropped the real 09:16 open and disagreed with the other panels by 26 points.)
+    const live = firstLiveIndex({
+      m: futAll.map((p) => Number(p.minutes)),
+      f: futAll.map((p) => Number(p.futPrice)),
+      o: futAll.map((p) => Number(p.futCombinedOI) || null),
+      v: futAll.map((p) => Number(p.futVolume) || null),
+    });
+    const startIdx = live.index > 0 ? live.index : 0;
+    const src = futAll.slice(startIdx);
+    const startMins = Number(src[0].minutes);
+    if (startIdx > 0) notes.push(`futures open/high/low/OI-open from ${hhmmOf(startMins)}: ${startIdx} opening carry-over quote(s) skipped (${live.reason})`);
+    else notes.push(`futures open from the first tick (${hhmmOf(startMins)}): ${live.reason}`);
     const oiTicks = ticks.filter((p) => Number(p.futCombinedOI) > 0);
-    const oiFrom = oiTicks.filter((p) => Number(p.minutes) >= SWING_FUT_OPEN_FROM_MINS);
+    const oiFrom = oiTicks.filter((p) => Number(p.minutes) >= startMins);
     const oiSrc = oiFrom.length ? oiFrom : oiTicks;
     const oiOpen = oiSrc.length ? Number(oiSrc[0].futCombinedOI) : null;
     const oiClose = oiTicks.length ? Number(oiTicks[oiTicks.length - 1].futCombinedOI) : null;
-    const vols = ticks.map((p) => Number(p.futVolume)).filter((v) => v > 0);
+    // Live ticks only: a carry-over quote carries the PREVIOUS session's cumulative volume.
+    const vols = src.map((p) => Number(p.futVolume)).filter((v) => v > 0);
     fut = {
       open: r2(Number(src[0].futPrice)),
       high: r2(Math.max(...src.map((p) => Number(p.futPrice)))),

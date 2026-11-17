@@ -546,7 +546,10 @@ export function measureEodNext(final, nextSeries, { nextDate, noCarryBandPct = S
   const open = ticks.find((t) => t.minutes >= SC_OPEN_MINS && t.minutes <= SC_OPEN_MINS + DQ_WINDOW_MAX_GAP_MIN);
   const c = windowCoverage(ticks, SC_OPEN_MINS, SC_EOD_CHECK_MINS, { label: "the next session's 09:15–09:20 window" });
   if (!open || !c.ok) return { status: "UNMEASURABLE", reason: !open ? "no futures tick in the first minutes of the next session" : c.text, nextDate };
-  const p920 = lastAtOrBefore(ticks, SC_EOD_CHECK_MINS).futPrice;
+  // The 09:20 price is the last tick AT OR BEFORE 09:20; when 09:20 itself is missing that is an
+  // earlier minute, and the outcome says which (price0920At) instead of calling it 09:20.
+  const t920 = lastAtOrBefore(ticks, SC_EOD_CHECK_MINS);
+  const p920 = t920.futPrice;
   const category = final.data?.category ?? final.category;
   const dir = category === "BTST" ? 1 : category === "STBT" ? -1 : 0;
   const movePct = Math.round(((p920 - ref) / ref) * 100000) / 1000;
@@ -560,6 +563,7 @@ export function measureEodNext(final, nextSeries, { nextDate, noCarryBandPct = S
   }
   const out = {
     status: "MEASURED", nextDate, refPrice: ref, openPrice: openTick.futPrice, openAt: hhmm(openTick.minutes), price0920: p920,
+    price0920At: hhmm(t920.minutes),
     openGapPts: r2(openTick.futPrice - ref), move0920Pts: r2(p920 - ref), move0920Pct: movePct,
   };
   if (live.skipped > 0 && openTick !== open) out.openStaleSkipped = live.skipped;
@@ -815,7 +819,7 @@ export function formatDailyTelegram(doc, { candidates = true } = {}) {
 export function formatMorningTelegram(date, final, outcome) {
   if (!final || !outcome) return null;
   if (outcome.status !== "MEASURED") return `🌅 *EOD outcome ${date}:* ${plain(final.data?.category)} — unmeasurable: ${plain(outcome.reason)}`;
-  return `🌅 *EOD outcome ${date}:* ${plain(final.data?.category)} (score ${final.data?.score}) · ref fut ${outcome.refPrice} → open ${outcome.openPrice} (${outcome.openGapPts >= 0 ? "+" : ""}${outcome.openGapPts}) → 09:20 ${outcome.price0920} (${outcome.move0920Pct >= 0 ? "+" : ""}${outcome.move0920Pct}%) · ${outcome.hit ? "HIT" : "MISS"} (${outcome.nextDate})`;
+  return `🌅 *EOD outcome ${date}:* ${plain(final.data?.category)} (score ${final.data?.score}) · ref fut ${outcome.refPrice} → open ${outcome.openPrice} (${outcome.openGapPts >= 0 ? "+" : ""}${outcome.openGapPts}) → 09:20 ${outcome.price0920}${outcome.price0920At && outcome.price0920At !== "09:20" ? ` (${outcome.price0920At} tick; 09:20 missing)` : ""} (${outcome.move0920Pct >= 0 ? "+" : ""}${outcome.move0920Pct}%) · ${outcome.hit ? "HIT" : "MISS"} (${outcome.nextDate})`;
 }
 
 const csvEsc = (v) => {
