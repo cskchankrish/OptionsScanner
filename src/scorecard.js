@@ -23,6 +23,7 @@ import { getSessionKindForDate } from "./marketCalendar.js";
 import { TRAP_SHADOW_ENV_KEYS } from "./trapShadow.js";
 import { measurePlanCall, getPlanDocConfig, PLAN_DOC_ENV_KEYS } from "./planDocShadow.js";
 import { firstLiveIndex } from "./sessionOpen.js";
+import { isCandidateTelegramEnabled, formatCandidateOutcomeLine } from "./candidateShadow.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -95,7 +96,7 @@ const ENV_WHITELIST = [
   "FLOW_BRIDGE_ENABLED", "FLOW_BRIDGE_DECISIONS", "FLOW_BRIDGE_TIMEOUT_MS", "FLOW_BRIDGE_FILL_WAIT_SEC", "FLOW_ALGO_SQUAREOFF_TIME",
   "CARRY_BRIDGE_ENABLED", "CARRY_WINDOW_START", "CARRY_WINDOW_END", "CARRY_REPORT_TIME", "CARRY_REQUIRED_POLLS", "CARRY_MIN_AGREEMENT", "CARRY_MIN_POLL_GAP_SEC",
   "SCORECARD_ENABLED", "SCORECARD_BAND_PCT", "SCORECARD_MIN_SAMPLE", "SCORECARD_NO_CARRY_BAND_PCT", "SCORECARD_FUSION_REARM_MIN",
-  "CANDIDATE_SHADOW_ENABLED",
+  "CANDIDATE_SHADOW_ENABLED", "CANDIDATE_TELEGRAM_ENABLED",
   ...TRAP_SHADOW_ENV_KEYS,
   ...PLAN_DOC_ENV_KEYS,
 ];
@@ -763,9 +764,12 @@ function rowsOf(doc) {
 const plain = (v) => String(v ?? "").replace(/[_*`[\]]/g, " ").replace(/\s+/g, " ").trim();
 const gapList = (gaps) => { const g = (gaps || []).map((x) => `${x.from}–${x.to}`); return g.length > 6 ? `${g.slice(0, 6).join(", ")} … (${g.length - 6} more)` : g.join(", "); };
 
-export function formatDailyTelegram(doc) {
-  // Shadow candidates and plan-document calls are never part of the Telegram message (not even in
-  // the unmeasurable count).
+export const SC_TG_MAX_CANDIDATE_LINES = 25;
+
+export function formatDailyTelegram(doc, { candidates = true } = {}) {
+  // Shadow candidates and plan-document calls never count in the sections below or in the
+  // unmeasurable count. Candidates get their own "Candidates" block at the end (one line each, the
+  // SIGNAL-rule outcome unchanged) unless CANDIDATE_TELEGRAM_ENABLED is off.
   const rows = rowsOf(doc).filter((x) => x.ev.section !== "CANDIDATE" && x.ev.section !== "PLAN_DOC");
   const lines = [`📊 *Scorecard ${doc.date}*${doc.backfilled ? " (backfilled)" : ""}`];
   const dq = doc.dataQuality;
@@ -796,6 +800,14 @@ export function formatDailyTelegram(doc) {
       reasons[k] = (reasons[k] || 0) + 1;
     }
     lines.push(`• *Unmeasurable:* ${unm.length} — ${Object.entries(reasons).slice(0, 3).map(([k, v]) => `${v}× ${plain(k)}`).join("; ")}`);
+  }
+  if (candidates) {
+    const cand = rowsOf(doc).filter((x) => x.ev.section === "CANDIDATE").sort((a, b) => (a.ev.t ?? 0) - (b.ev.t ?? 0));
+    if (cand.length) {
+      lines.push(`• *Candidates* (shadow, no orders): ${cand.length}`);
+      for (const x of cand.slice(0, SC_TG_MAX_CANDIDATE_LINES)) lines.push(formatCandidateOutcomeLine(x.ev, x.out));
+      if (cand.length > SC_TG_MAX_CANDIDATE_LINES) lines.push(`  – … ${cand.length - SC_TG_MAX_CANDIDATE_LINES} more (see the Scorecard tab)`);
+    }
   }
   return lines.join("\n");
 }
@@ -952,7 +964,7 @@ export async function finaliseDay({ store, date, deps, env = process.env, future
     if (final) await store.set(keys.eodPending, { date, final }, 30 * 86400);
     await store.del(keys.finLock(date));
     if (deps.send && (await store.setNx(keys.tgDaily(date), 1, 3 * 86400))) {
-      const ok = await deps.send(formatDailyTelegram(doc));
+      const ok = await deps.send(formatDailyTelegram(doc, { candidates: isCandidateTelegramEnabled(env) }));
       if (!ok) await store.del(keys.tgDaily(date));
     }
     return { status: "FINALISED", doc };

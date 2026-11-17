@@ -142,7 +142,9 @@ const telegramCalls = (fetchCalls) => fetchCalls.filter((c) => c.url.includes("a
 
 function assertNoLiveSideEffects({ redis, sent, bridgeCalls, fetchCalls }, { activeBefore = undefined } = {}) {
   assert.equal(bridgeCalls.length, 0, "bridgeFetch never called");
-  assert.equal(sent.length, 0, "no deps.sendText Telegram");
+  // The only Telegram a candidate may send is its shadow verdict (test/candidateTelegram.test.js).
+  assert.equal(sent.filter((t) => !String(t).startsWith("🧪 *SHADOW CANDIDATE*")).length, 0, "no other deps.sendText Telegram");
+  assert.ok(sent.length <= 1, "at most one shadow verdict message");
   assert.equal(fetchCalls.length, 0, "no global fetch at all (no Telegram sender)");
   assert.equal(redis.store[ACTIVE], activeBefore, "nifty:tv:active_trade untouched");
   assert.equal(redis.calls.some(([op, k]) => k === ACTIVE && op !== "get"), false, "no write to the active-trade key");
@@ -451,10 +453,13 @@ test("scorecard: aggregate byCategory / byGrade, CSV rows; old documents aggrega
   assert.equal(old.sections.CANDIDATE.events, 0);
   assert.equal(old.sections.CANDIDATE.byCategory.CONFIRMED.events, 0);
   assert.equal(old.sections.SIGNAL.events, 1);
-  // Day CSV carries candidate rows; the daily Telegram text is unchanged by candidates.
+  // Day CSV carries candidate rows. The daily Telegram's other sections are unchanged by candidates:
+  // with the candidate block switched off the text is identical; on, only the "Candidates" block is added.
   assert.ok(sc.dayToCsv(day).includes("CANDIDATE"));
   const base = { date: "2026-11-13", dataQuality: { state: "OK", coveragePct: 100 }, events: [], outcomes: {} };
-  assert.equal(sc.formatDailyTelegram({ ...base, events: day.events, outcomes: day.outcomes }), sc.formatDailyTelegram(base));
+  const withCand = { ...base, events: day.events, outcomes: day.outcomes };
+  assert.equal(sc.formatDailyTelegram(withCand, { candidates: false }), sc.formatDailyTelegram(base));
+  assert.ok(sc.formatDailyTelegram(withCand).startsWith(`${sc.formatDailyTelegram(base)}\n• *Candidates*`));
 });
 
 test("settings snapshot whitelists CANDIDATE_SHADOW_ENABLED", () => {

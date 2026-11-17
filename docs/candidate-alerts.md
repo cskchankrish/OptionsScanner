@@ -11,8 +11,10 @@ the chart and futures conditions hold *without* the option-writing guess. The sc
 normal rules what the real alert would have got against the live option chain, and **only records
 the answer**.
 
-Candidates **never place an order, never send Telegram, never open or block a trade, and never
-appear in the normal signal log** (`latest_signal`, the daily signals list, the master archive).
+Candidates **never place an order, never open or block a trade, and never appear in the normal
+signal log** (`latest_signal`, the daily signals list, the master archive). Their only outbound
+effect is one clearly labelled **shadow Telegram** per verdict (see below; switch
+`CANDIDATE_TELEGRAM_ENABLED`).
 
 ## The four grades
 
@@ -46,6 +48,50 @@ Each fires once when its condition starts (rising edge), at most once every 4 ba
 - **GET `/api/tv-webhook`**: the `candidates` field lists the day's candidates, newest first
   (stored in `nifty:tv:candidates:<date>`, last 200, kept 14 days).
 
+- **Telegram, per candidate**: one message per verdict. It can never be read as a trade: the
+  first line always starts with 🧪 SHADOW CANDIDATE and ends with "no order placed".
+
+  | Verdict | First line |
+  |---|---|
+  | CONFIRMED | `🧪 SHADOW CANDIDATE · CONFIRMED · SYNERGY_BULL (LONG) — no order placed` |
+  | UNCONFIRMED | `🧪 SHADOW CANDIDATE · UNCONFIRMED · <real grade> (<direction>) — no order placed` |
+  | REJECTED | `🧪 SHADOW CANDIDATE · REJECTED · <real grade> (<direction>) — no order placed` |
+  | UNVERIFIABLE | `🧪 SHADOW CANDIDATE · UNVERIFIABLE · <real grade> (<direction>) — no order placed` |
+
+  The body gives the candidate grade and chart time; entry, stop, T1 and T2; the verdict in plain
+  words (confirmed: the real decision it would have got; unconfirmed: what was missing, from the
+  stored reasoning; rejected: the veto and why; unverifiable: "Could not judge", saying whether the
+  snapshot was missing, too old (with its age and the limit) or had no ΔPCR); ΔPCR, floor and roof;
+  the scanner's futures quadrant against the chart's; the snapshot source and age. It ends
+  "Shadow only: not sent to the Algo; outcome will appear in the scorecard."
+- **Telegram, daily scorecard**: the existing end-of-day scorecard message gets a "Candidates"
+  block with one line per candidate: time, grade, direction, verdict and its outcome (T1 first /
+  stop first / neither by the close / unmeasurable with the reason). At most 25 lines, then
+  "… N more". Outcomes are the scorecard's own (same rule as real signals, unchanged). There is no
+  separate per-candidate outcome message.
+
+### When and how the verdict message is sent
+
+1. The candidate is judged, its record is stored in `nifty:tv:candidates:<date>` and its scorecard
+   event is recorded, exactly as before.
+2. Only then does the send start. It is **never awaited before the reply to TradingView**:
+   - on Vercel with a confirmed `waitUntil` (the same check the TradingView ack deadline uses), the
+     send is handed to `waitUntil` and the 200 `CANDIDATE_SHADOW` reply goes out immediately;
+   - without a confirmed `waitUntil`, the reply is written first and the send is awaited afterwards.
+   Candidates do not go through the 2-second ack-deadline wrapper at all: they answer on their own
+   (after a Redis read and the record writes), well inside it.
+3. **Exactly once**: before sending, an atomic `SET NX` claims
+   `nifty:tv:candidate_tg:<date>:<grade>:<bar>` (kept 3 days). `<bar>` is `t=<time>` when the alert
+   carries a `t` field; Pine v4.3.1 sends none, so it is a digest of the alert's bar fields (symbol,
+   timeframe, direction, close, stop, signal count). A TradingView re-delivery or a concurrent
+   invocation finds the claim taken and sends nothing. No Redis, or a failed claim → no message.
+4. **Failures**: a Telegram failure, error or hang (capped at 5 s) is logged and nothing else. The
+   claim is kept, so there is no retry and no retry storm. The stored verdict, the scorecard event
+   and the reply to TradingView are unaffected.
+
+Re-deliveries are still *recorded* twice in the candidate list, as before; only the message is
+deduplicated.
+
 ## How to read them
 
 After 20–30 sessions, compare the hit rate of **CONFIRMED** candidates with the hit rate of the real
@@ -57,7 +103,10 @@ the chain's filtering is worth.
 ## Switching off
 
 - Scanner: set `CANDIDATE_SHADOW_ENABLED=false` (or `0`). Candidates are then answered
-  `CANDIDATE_IGNORED` and nothing is recorded.
+  `CANDIDATE_IGNORED` and nothing is recorded or sent.
+- Telegram only: set `CANDIDATE_TELEGRAM_ENABLED=false` (or `0`; default on). Candidates are then
+  judged and recorded exactly as before, with no verdict message, no dedupe key and no "Candidates"
+  block in the daily scorecard Telegram.
 - Indicator: untick "Send shadow candidate alerts (no orders)".
 
 ## Install (owner)

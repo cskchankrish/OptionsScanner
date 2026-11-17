@@ -56,6 +56,11 @@ import {
   candidateListKey,
   CANDIDATE_LIST_CAP,
   CANDIDATE_TTL_SEC,
+  isCandidateTelegramEnabled,
+  candidateTelegramDedupeKey,
+  formatCandidateTelegram,
+  CANDIDATE_TG_DEDUPE_TTL_SEC,
+  CANDIDATE_TG_TIMEOUT_MS,
 } from "../src/candidateShadow.js";
 
 /** Appends one scorecard event (measurement only; never throws, never changes a response). */
@@ -1813,8 +1818,10 @@ export async function evaluateActiveTradeLifecycle(currentSpot, high = null, low
  * Asks fuseChartWithOptionChain what the REAL grade would get against the live `nifty:flow:latest`
  * snapshot (no session fallback, no on-demand NSE refresh), classifies it and records it in its own
  * list `nifty:tv:candidates:<date>` plus a scorecard CANDIDATE event. It never reads or writes
- * nifty:tv:active_trade, never dispatches to the Algo, never sends Telegram and never writes
- * nifty:tv:latest_signal, the daily signals list or the master archive.
+ * nifty:tv:active_trade, never dispatches to the Algo and never writes nifty:tv:latest_signal, the
+ * daily signals list or the master archive. Its one outbound effect is the shadow verdict Telegram
+ * (notifyCandidateVerdict, CANDIDATE_TELEGRAM_ENABLED), which starts after the record is stored and
+ * never holds up the response to TradingView.
  */
 async function handleCandidateShadow({ redis, payload, res, istDate }) {
   if (!isCandidateShadowEnabled()) {
@@ -1848,7 +1855,71 @@ async function handleCandidateShadow({ redis, payload, res, istDate }) {
   }
   await scRecord(redis, buildCandidateEvent(record, nowMs));
 
-  return res.status(200).json({ ok: true, event: "CANDIDATE_SHADOW", grade, realGrade, category, decision: "SHADOW_ONLY", realDecision: fused.decision });
+  const body = { ok: true, event: "CANDIDATE_SHADOW", grade, realGrade, category, decision: "SHADOW_ONLY", realDecision: fused.decision };
+  if (!isCandidateTelegramEnabled()) return res.status(200).json(body);
+
+  // Shadow verdict Telegram: started only now (the verdict is already recorded) and never awaited
+  // before the response. With a confirmed Vercel waitUntil it is registered there before answering
+  // (same pattern as the ack deadline); without one, the answer goes out first and the send is then
+  // awaited (bounded). notifyCandidateVerdict never throws and never changes the stored record.
+  const notify = notifyCandidateVerdict({
+    redis, record, payload, istDate, deps,
+    snapshotSource: liveScanner ? describeSnapshotSource(liveScanner, false) : null,
+  });
+  let waitUntil = null;
+  try {
+    waitUntil = typeof deps.getWaitUntil === "function" ? await deps.getWaitUntil() : null;
+  } catch (e) {
+    waitUntil = null;
+  }
+  if (typeof waitUntil === "function") {
+    try {
+      waitUntil(notify);
+    } catch (e) {
+      waitUntil = null;
+    }
+  }
+  res.status(200).json(body);
+  if (typeof waitUntil !== "function") await notify;
+  return res;
+}
+
+/**
+ * Sends the one shadow verdict Telegram for a recorded candidate, at most once per candidate:
+ * an atomic SET NX claim on candidateTelegramDedupeKey comes first, so a TradingView re-delivery or
+ * a concurrent invocation finds the claim taken and sends nothing. The claim is kept even when the
+ * send fails (at most once — no retry, no storm). Bounded by CANDIDATE_TG_TIMEOUT_MS. Never throws.
+ * Returns "SENT" | "SEND_FAILED" | "DUPLICATE" | "NO_STORE" | "CLAIM_FAILED" | "TIMEOUT" | "ERROR".
+ */
+export async function notifyCandidateVerdict({ redis, record, payload, istDate, deps, snapshotSource = null, timeoutMs = CANDIDATE_TG_TIMEOUT_MS }) {
+  let timer = null;
+  const work = (async () => {
+    if (!redis || typeof redis.set !== "function") return "NO_STORE"; // cannot guarantee once: skip
+    const key = candidateTelegramDedupeKey({ istDate, grade: record?.grade, payload });
+    let claimed = null;
+    try {
+      claimed = await redis.set(key, String(record?.t ?? Date.now()), { nx: true, ex: CANDIDATE_TG_DEDUPE_TTL_SEC });
+    } catch (e) {
+      console.warn("[tv-webhook] candidate Telegram claim failed; not sent:", e?.message || e);
+      return "CLAIM_FAILED";
+    }
+    if (claimed === null || claimed === undefined || claimed === false || claimed === 0) return "DUPLICATE";
+    const text = formatCandidateTelegram(record, { snapshotSource, maxAgeSec: getFlowMaxAgeSec() });
+    const ok = await deps.sendText(text);
+    if (!ok) console.warn(`[tv-webhook] candidate Telegram not delivered (${record?.grade}); not retried`);
+    return ok ? "SENT" : "SEND_FAILED";
+  })().catch((e) => {
+    console.warn("[tv-webhook] candidate Telegram error (verdict unaffected):", e?.message || e);
+    return "ERROR";
+  });
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("TIMEOUT"), Math.max(1, Number(timeoutMs) || CANDIDATE_TG_TIMEOUT_MS));
+    if (typeof timer?.unref === "function") timer.unref();
+  });
+  const out = await Promise.race([work, timeout]);
+  clearTimeout(timer);
+  if (out === "TIMEOUT") console.warn("[tv-webhook] candidate Telegram timed out (verdict unaffected)");
+  return out;
 }
 
 export default async function handler(req, res) {
