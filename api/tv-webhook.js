@@ -1912,12 +1912,17 @@ export async function notifyCandidateVerdict({ redis, record, payload, istDate, 
     console.warn("[tv-webhook] candidate Telegram error (verdict unaffected):", e?.message || e);
     return "ERROR";
   });
+  // Not unref'd: the timer is what guarantees this promise settles (a hung send must still end at
+  // the bound). It is always cleared once the race settles, so it never outlives the send.
   const timeout = new Promise((resolve) => {
     timer = setTimeout(() => resolve("TIMEOUT"), Math.max(1, Number(timeoutMs) || CANDIDATE_TG_TIMEOUT_MS));
-    if (typeof timer?.unref === "function") timer.unref();
   });
-  const out = await Promise.race([work, timeout]);
-  clearTimeout(timer);
+  let out;
+  try {
+    out = await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
   if (out === "TIMEOUT") console.warn("[tv-webhook] candidate Telegram timed out (verdict unaffected)");
   return out;
 }
