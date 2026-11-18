@@ -25,6 +25,7 @@ import { EodVerdictCard } from "./EodVerdictCard.jsx";
 import { WeeklyOutlookCard } from "./WeeklyOutlookCard.jsx";
 import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
+import { tvSignalTone } from "./tvSignalTone.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
@@ -2101,19 +2102,22 @@ export function NiftyFlowView({ t, isDark }) {
             <PanelDataMarker panel={oiData?.dataQuality?.panels?.intradayQuadrant} isDark={isDark} isMobile={isMobile} />
 
             {/* TradingView v4.3 Real-Time Webhook Bridge Live Strip */}
-            {tvSignal && (
+            {tvSignal && (() => {
+              const tone = tvSignalTone(tvSignal);
+              const pal = {
+                VETO: { bg: isDark ? "rgba(239,68,68,0.18)" : "#fee2e2", border: "#ef4444", text: "#ef4444" },
+                BLOCKED: { bg: isDark ? "rgba(148,163,184,0.16)" : "#f1f5f9", border: "#94a3b8", text: t.textSub },
+                INFO: { bg: isDark ? "rgba(148,163,184,0.16)" : "#f1f5f9", border: "#94a3b8", text: t.textSub },
+                LONG: { bg: isDark ? "rgba(16,185,129,0.18)" : "#ecfdf5", border: "#10b981", text: "#16a34a" },
+                SHORT: { bg: isDark ? "rgba(245,158,11,0.18)" : "#fef3c7", border: "#f59e0b", text: "#d97706" },
+              }[tone.kind];
+              return (
               <div style={{
                 marginTop: 10,
                 padding: "8px 12px",
                 borderRadius: 8,
-                background: tvSignal.decision === "VETO_SIGNAL"
-                  ? (isDark ? "rgba(239,68,68,0.18)" : "#fee2e2")
-                  : tvSignal.direction === "LONG"
-                  ? (isDark ? "rgba(16,185,129,0.18)" : "#ecfdf5")
-                  : (isDark ? "rgba(245,158,11,0.18)" : "#fef3c7"),
-                border: `1px solid ${
-                  tvSignal.decision === "VETO_SIGNAL" ? "#ef4444" : tvSignal.direction === "LONG" ? "#10b981" : "#f59e0b"
-                }`,
+                background: pal.bg,
+                border: `1px solid ${pal.border}`,
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
@@ -2127,10 +2131,10 @@ export function NiftyFlowView({ t, isDark }) {
                   <span style={{
                     fontSize: 11,
                     fontWeight: 900,
-                    color: tvSignal.decision === "VETO_SIGNAL" ? "#ef4444" : tvSignal.direction === "LONG" ? "#16a34a" : "#d97706",
+                    color: pal.text,
                   }}>
-                    {tvSignal.decision === "VETO_SIGNAL" ? "🚫 " : tvSignal.direction === "LONG" ? "🟢 " : "🔴 "}
-                    {tvSignal.decision} · {tvSignal.grade} ({tvSignal.direction})
+                    {tone.icon} {tvSignal.decision} · {tvSignal.grade} ({tvSignal.direction})
+                    {tone.note ? <span style={{ fontWeight: 700 }}> · {tone.note}</span> : null}
                   </span>
                   <span style={{ fontSize: 10.5, fontWeight: 700, color: t.textSub }}>
                     Size: <strong style={{ color: t.text }}>{tvSignal.recommendedLots} Lot(s)</strong> ({tvSignal.tier})
@@ -2142,10 +2146,13 @@ export function NiftyFlowView({ t, isDark }) {
                   )}
                 </div>
                 <div style={{ fontSize: 10, color: t.textMuted, fontStyle: "italic" }}>
-                  {tvSignal.reasoning || tvSignal.istTime}
+                  {tvSignal.istTime ? <strong style={{ fontStyle: "normal" }}>{tvSignal.istTime}</strong> : null}
+                  {tvSignal.istTime && tvSignal.reasoning ? " · " : null}
+                  {tvSignal.reasoning}
                 </div>
               </div>
-            )}
+              );
+            })()}
           </div>
         );
       })()}

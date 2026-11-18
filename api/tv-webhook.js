@@ -884,27 +884,46 @@ export async function sendTelegramText(text) {
 }
 
 /**
- * Telegram Notification Helper
+ * Free text (reasoning, symbol, provenance) for Telegram legacy Markdown: `_ * ` [` are escaped
+ * with a backslash so they print literally. An unpaired `_` (e.g. "SYNERGY_BEAR" in a BLOCKED
+ * reason) otherwise makes Telegram reject the whole message with 400 "can't parse entities".
+ */
+export function mdEscape(v) {
+  return String(v ?? "").replace(/([_*`[])/g, "\\$1");
+}
+
+/**
+ * Telegram Notification Helper. Returns true when Telegram accepted the message. A rejected
+ * Markdown message (HTTP 400) is logged and re-sent ONCE as plain text, so a formatting slip can
+ * never silently swallow a signal again. Never throws.
  */
 export async function sendTelegramAlert(fused) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!botToken || !chatId) return;
+  if (!botToken || !chatId) return false;
 
   const msg = formatTelegramAlert(fused);
+  const post = (body) => fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, ...body }),
+    signal: AbortSignal.timeout(3000),
+  });
 
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: msg,
-        parse_mode: "Markdown",
-      }),
-    });
+    const r = await post({ text: msg, parse_mode: "Markdown" });
+    if (r.ok) return true;
+    let detail = "";
+    try { detail = (await r.text()).slice(0, 200); } catch (e) { detail = ""; }
+    console.error(`[tv-webhook] Telegram rejected ${fused?.grade} ${fused?.decision} alert (HTTP ${r.status}) ${detail}`);
+    if (r.status !== 400) return false;
+    const plainText = msg.replace(/\\([_*`[])/g, "$1");
+    const r2 = await post({ text: plainText });
+    if (!r2.ok) console.error(`[tv-webhook] Telegram plain-text fallback also failed (HTTP ${r2.status})`);
+    return r2.ok;
   } catch (err) {
     console.error("Telegram webhook error:", err.message);
+    return false;
   }
 }
 
@@ -932,9 +951,9 @@ export function formatTelegramAlert(fused) {
 
   const kindBadge =
     fused.swingKind === "CONTINUATION"
-      ? " [TREND CONTINUATION]"
+      ? " \\[TREND CONTINUATION]" // "\[" = literal "[" in Telegram legacy Markdown
       : fused.swingKind === "REVERSAL"
-      ? " [STRUCTURAL REVERSAL]"
+      ? " \\[STRUCTURAL REVERSAL]"
       : "";
 
   const armedBadge = fused.isHtfArmed ? " ⚡ (HTF Armed)" : "";
@@ -945,27 +964,27 @@ export function formatTelegramAlert(fused) {
     lines = [
       `🚫 *VETOED · OPTION CHAIN SNAPSHOT STALE OR MISSING*`,
       `• *Chart Signal:* \`${fused.grade}\`${kindBadge} (${fused.direction})`,
-      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Symbol / TF:* ${mdEscape(fused.symbol)} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
       `• *Chart Price:* \`${fused.entryPrice}\``,
-      `• *Verdict:* ${fused.reasoning}`,
+      `• *Verdict:* ${mdEscape(fused.reasoning)}`,
       `• *Directive:* 🚫 *DO NOT TRADE (0 Lots)*. The signal could not be verified against a fresh option chain.`,
     ].filter(Boolean);
   } else if (fused.decision === "VETO_DIVERGENT_SYNERGY" || fused.decision === "VETO_SIGNAL") {
     lines = [
       `🚫 *VETOED · REAL OPTION CHAIN DIVERGENCE*`,
       `• *Chart Signal:* \`${fused.grade}\`${kindBadge} (${fused.direction})`,
-      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Symbol / TF:* ${mdEscape(fused.symbol)} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
       `• *Chart Price:* \`${fused.entryPrice}\``,
       fused.stopLoss ? `• *Reference SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)` : null,
       `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
       `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
-      `• *Institutional Verdict:* ${fused.reasoning}`,
+      `• *Institutional Verdict:* ${mdEscape(fused.reasoning)}`,
       `• *Directive:* 🚫 *DO NOT TRADE (0 Lots)*. The TradingView proxy triggered, but live institutional option writers are defending the opposite side!`,
     ].filter(Boolean);
   } else if (fused.decision === "LOG_ONLY") {
     lines = [
       `${icon} *LOG_ONLY* · \`${fused.grade}\`${kindBadge} (${fused.direction})`,
-      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Symbol / TF:* ${mdEscape(fused.symbol)} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
       `• *Signal Close:* \`${fused.entryPrice}\``,
       fused.stopLoss ? `• *Reference SL:* \`${fused.stopLoss}\` (${fused.riskPoints ?? "--"} pts)` : null,
       `• *Status:* Informational alert logged for review. Forward paper trading strictly executes Traps & Verified Synergy.`,
@@ -973,9 +992,9 @@ export function formatTelegramAlert(fused) {
   } else if (fused.decision === "BLOCKED_BY_ACTIVE_TRADE") {
     lines = [
       `${icon} *BLOCKED_BY_ACTIVE_TRADE* · \`${fused.grade}\` (${fused.direction})`,
-      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m)`,
+      `• *Symbol / TF:* ${mdEscape(fused.symbol)} (${fused.timeframe}m)`,
       `• *Signal Close:* \`${fused.entryPrice}\``,
-      `• *Verdict:* ${fused.reasoning}`,
+      `• *Verdict:* ${mdEscape(fused.reasoning)}`,
       `• *Rule:* Strictly 1 position at a time (as backtested). Close existing trade before entering a new one.`,
     ].filter(Boolean);
   } else {
@@ -989,7 +1008,7 @@ export function formatTelegramAlert(fused) {
     const squareOff = process.env.FLOW_ALGO_SQUAREOFF_TIME ? `${process.env.FLOW_ALGO_SQUAREOFF_TIME} IST` : "the Algo's configured square-off time";
     lines = [
       `${icon} *${fused.decision}* · \`${fused.grade}\`${kindBadge} (${fused.direction})${armedBadge}`,
-      `• *Symbol / TF:* ${fused.symbol} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
+      `• *Symbol / TF:* ${mdEscape(fused.symbol)} (${fused.timeframe}m | Swing: ${fused.swingTimeframe})`,
       algoHandled
         ? `• *Signal Close (spot):* \`${fused.entryPrice}\``
         : `• *Entry (Signal Close):* \`${fused.entryPrice}\` *(Fill at next bar open)*`,
@@ -1004,7 +1023,7 @@ export function formatTelegramAlert(fused) {
       fused.execution ? `• *Algo Execution:* ${describeExecution(fused.execution)}` : null,
       `• *Real Fut OI:* \`${fused.chartMetrics.futQuad}\` (${fused.chartMetrics.futOiPct}% · ${fused.chartMetrics.futOiSrc}) | *Basis:* \`${fused.chartMetrics.basis}\``,
       `• *22-Strike Option Chain:* ΔPCR \`${fused.liveOptionChainMetrics.deltaPCR ?? "N/A"}\` | Floor \`${fused.liveOptionChainMetrics.floorStrike}\` | Roof \`${fused.liveOptionChainMetrics.roofStrike}\``,
-      `• *Verdict:* ${fused.reasoning}`,
+      `• *Verdict:* ${mdEscape(fused.reasoning)}`,
     ].filter(Boolean);
 
     if (algoHandled && (isTrap || isSynergy) && fused.decision.startsWith("EXECUTE")) {
@@ -1039,7 +1058,7 @@ export function formatTelegramAlert(fused) {
   }
 
   if (fused.snapshotProvenance && fused.decision !== "LOG_ONLY") {
-    lines.splice(Math.min(3, lines.length), 0, `• *Option-Chain Snapshot:* ${fused.snapshotProvenance}`);
+    lines.splice(Math.min(3, lines.length), 0, `• *Option-Chain Snapshot:* ${mdEscape(fused.snapshotProvenance)}`);
   }
 
   if (fused.openCarry) lines.push(describeOpenCarry(fused.openCarry));
