@@ -26,6 +26,7 @@ import { WeeklyOutlookCard } from "./WeeklyOutlookCard.jsx";
 import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { tvSignalTone } from "./tvSignalTone.js";
+import { formatSignalStamp } from "./signalStamp.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 
 // ─── MODULE-LEVEL CACHE (Prevents refetching or freezing on tab switches) ──
@@ -2119,11 +2120,10 @@ export function NiftyFlowView({ t, isDark }) {
                 background: pal.bg,
                 border: `1px solid ${pal.border}`,
                 display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                flexWrap: "wrap",
-                gap: 8,
+                flexDirection: "column",
+                gap: 6,
               }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, flexWrap: "wrap" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   <span style={{ fontSize: 9.5, fontWeight: 900, padding: "2px 6px", borderRadius: 4, background: isDark ? "#0f172a" : "#ffffff", color: t.text, border: `1px solid ${t.border}` }}>
                     ⚡ TV v4.3 BRIDGE
@@ -2145,11 +2145,30 @@ export function NiftyFlowView({ t, isDark }) {
                     </span>
                   )}
                 </div>
-                <div style={{ fontSize: 10, color: t.textMuted, fontStyle: "italic" }}>
-                  {tvSignal.istTime ? <strong style={{ fontStyle: "normal" }}>{tvSignal.istTime}</strong> : null}
-                  {tvSignal.istTime && tvSignal.reasoning ? " · " : null}
-                  {tvSignal.reasoning}
+                {(formatSignalStamp(tvSignal) || tvSignal.istTime) && (
+                  <span
+                    title="When the scanner received this TradingView alert (IST)"
+                    style={{
+                      marginLeft: "auto",
+                      fontSize: isMobile ? 10 : 10.5,
+                      fontWeight: 800,
+                      padding: "2px 7px",
+                      borderRadius: 4,
+                      whiteSpace: "nowrap",
+                      background: isDark ? "#0f172a" : "#ffffff",
+                      color: t.text,
+                      border: `1px solid ${t.border}`,
+                    }}
+                  >
+                    🕒 {formatSignalStamp(tvSignal) || tvSignal.istTime}
+                  </span>
+                )}
                 </div>
+                {tvSignal.reasoning && (
+                  <div style={{ fontSize: 10, color: t.textMuted, fontStyle: "italic" }}>
+                    {tvSignal.reasoning}
+                  </div>
+                )}
               </div>
               );
             })()}
