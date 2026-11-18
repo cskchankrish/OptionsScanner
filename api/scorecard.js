@@ -21,6 +21,7 @@ import {
 } from "../src/scorecard.js";
 import { getSessionKindForDate } from "../src/marketCalendar.js";
 import { planKeys } from "../src/planDocShadow.js";
+import { evaluateDayExitRules, aggregateExitRules } from "../src/exitRuleShadow.js";
 
 async function defaultDeps() {
   const { redisRestCommand, scorecardSettings } = await import("./nifty-oi.js");
@@ -117,7 +118,7 @@ export function createScorecardHandler(overrides = {}) {
         const series = compactSeries(timeline);
         const cfg = getScorecardConfig();
         doc = {
-          v: 1, date, provisional: true, finalisedAt: null, events,
+          v: 1, date, provisional: true, finalisedAt: null, events, series,
           outcomes: Object.fromEntries(events.map((e) => [e.id, measureEvent(e, series, cfg)])),
           eodFinal: finalEodEvent(state), eodOutcome: null,
           dataQuality: timeline.length ? (() => { const { _gapMins, ...dq } = computeDataQuality({ timeline, nowMins: today.minutes, isLive: true }); return dq; })() : null,
@@ -138,7 +139,9 @@ export function createScorecardHandler(overrides = {}) {
       } catch (e) {
         planDoc = null;
       }
-      return res.status(200).json({ ok: true, authenticated: authed, ...light, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
+      // Exit-rule shadow: every position of the day replayed under rules A–E (measurement only).
+      const exitRules = evaluateDayExitRules(view);
+      return res.status(200).json({ ok: true, authenticated: authed, ...light, exitRules, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
     }
 
     // ── rolling aggregate ──
@@ -155,6 +158,7 @@ export function createScorecardHandler(overrides = {}) {
     }
     const agg = aggregate(docs, { minSample: getScorecardConfig().minSample, includeTrades: authed });
     agg.days = n;
+    agg.exitRules = aggregateExitRules(docs); // shadow: rules A–E replayed on every position
     agg.datesWithData = docs.map((d) => ({ date: d.date, backfilled: Boolean(d.backfilled), coveragePct: d.dataQuality?.coveragePct ?? null }));
     if (csv) {
       res.setHeader("Content-Type", "text/csv");

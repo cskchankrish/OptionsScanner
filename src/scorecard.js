@@ -25,6 +25,7 @@ import { measurePlanCall, getPlanDocConfig, PLAN_DOC_ENV_KEYS } from "./planDocS
 import { firstLiveIndex } from "./sessionOpen.js";
 import { isCandidateTelegramEnabled, formatCandidateOutcomeLine } from "./candidateShadow.js";
 import { ivCuts, ivBandOf, IV_BANDS } from "./ivShadow.js";
+import { evaluateDayExitRules, formatExitRuleLines } from "./exitRuleShadow.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -814,6 +815,10 @@ export function formatDailyTelegram(doc, { candidates = true } = {}) {
       reasons[k] = (reasons[k] || 0) + 1;
     }
     lines.push(`• *Unmeasurable:* ${unm.length} — ${Object.entries(reasons).slice(0, 3).map(([k, v]) => `${v}× ${plain(k)}`).join("; ")}`);
+  }
+  // Exit-rule shadow (measurement only): the day's positions under rules A–E, in futures points.
+  if (doc.series) {
+    try { lines.push(...formatExitRuleLines(evaluateDayExitRules(doc))); } catch (e) { /* never blocks the message */ }
   }
   if (candidates) {
     const cand = rowsOf(doc).filter((x) => x.ev.section === "CANDIDATE").sort((a, b) => (a.ev.t ?? 0) - (b.ev.t ?? 0));
