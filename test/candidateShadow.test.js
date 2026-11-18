@@ -396,7 +396,7 @@ test("scorecard: CANDIDATE event shape", () => {
   assert.equal(e.type, "SYNERGY_BEAR_CAND");
   assert.equal(e.direction, "BEARISH");
   assert.equal(e.minutes, 600);
-  assert.deepEqual(Object.keys(e.data).sort(), ["category", "chartFutQuad", "decision", "deltaPcr", "entry", "realGrade", "serverFutQuad", "sl", "snapshotAgeSec", "t1", "t2"].sort());
+  assert.deepEqual(Object.keys(e.data).sort(), ["category", "chartFutQuad", "decision", "deltaPcr", "entry", "realGrade", "serverFutQuad", "sl", "snapshotAgeSec", "t1", "t2", "iv"].sort());
 });
 
 test("scorecard: CANDIDATE measured with the SIGNAL rule (hit and miss)", () => {

@@ -24,8 +24,8 @@ function chainRows(spot) {
   for (let k = spot - 500; k <= spot + 500; k += 50) {
     rows.push({
       strikePrice: k,
-      PE: { changeinOpenInterest: k <= spot ? 4000 : 500, openInterest: 50000 },
-      CE: { changeinOpenInterest: k >= spot ? 3000 : 400, openInterest: 50000 },
+      PE: { changeinOpenInterest: k <= spot ? 4000 : 500, openInterest: 50000, impliedVolatility: 13.2, lastPrice: 180 },
+      CE: { changeinOpenInterest: k >= spot ? 3000 : 400, openInterest: 50000, impliedVolatility: 11.4, lastPrice: 175 },
     });
   }
   return rows;
@@ -133,4 +133,15 @@ test("legacy ?cron=1 still answers 200 LIVE_POLL_SUCCESS / FALLBACK_CACHED as be
   await mod.default({ method: "GET", query: { cron: "1" }, headers: {} }, res);
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.status, "FALLBACK_CACHED");
+}));
+
+test("refresh core: nifty:flow:latest carries the ATM IV shadow (ivAtm) from the chain", withEnv({}, async (writes) => {
+  const r = await mod.refreshLiveSnapshot({ queryExpiry: "near", awaitPersist: true, source: "poller", deadlineMs: Date.now() + 12000 });
+  assert.equal(r.ok, true, r.error);
+  const flow = JSON.parse(writes["nifty:flow:latest"]);
+  assert.deepEqual(
+    { strike: flow.ivAtm.strike, ceIv: flow.ivAtm.ceIv, peIv: flow.ivAtm.peIv, atmIv: flow.ivAtm.atmIv, skew: flow.ivAtm.skew, ceLtp: flow.ivAtm.ceLtp, peLtp: flow.ivAtm.peLtp },
+    { strike: 25000, ceIv: 11.4, peIv: 13.2, atmIv: 12.3, skew: 1.8, ceLtp: 175, peLtp: 180 },
+  );
+  assert.equal(flow.ivAtm.expiry, r.payload.expiryDate);
 }));

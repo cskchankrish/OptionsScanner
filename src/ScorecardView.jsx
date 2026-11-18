@@ -30,8 +30,24 @@ const SPLIT_LABEL = {
   "conviction:MEDIUM": "Conviction MEDIUM",
   "conviction:LOW": "Conviction LOW",
 };
+/** IV-band sub-rows (SIGNAL / CANDIDATE), labelled with the window's cut-offs. Shadow measurement. */
+function ivSplitsOf(s, cuts) {
+  if (!s.byIv) return [];
+  const label = {
+    LOW: cuts ? `IV shadow — low (ATM IV ≤ ${cuts.lo}%)` : "IV shadow — low",
+    MID: cuts ? `IV shadow — mid (${cuts.lo}–${cuts.hi}%)` : "IV shadow — mid",
+    HIGH: cuts ? `IV shadow — high (> ${cuts.hi}%)` : "IV shadow — high",
+    UNKNOWN: cuts ? "IV shadow — not recorded" : `IV shadow — bands need ≥ 3 IV readings`,
+  };
+  return Object.entries(s.byIv).map(([k, v]) => [`iv:${k}`, label[k] || k, v]);
+}
+
 /** Sub-rows of a section: [key, label, stats]. CANDIDATE has two splits (category and grade). */
-function splitsOf(s) {
+function splitsOf(s, cuts = null) {
+  return [...baseSplitsOf(s), ...ivSplitsOf(s, cuts)];
+}
+
+function baseSplitsOf(s) {
   if (s.byHalf || s.byCall || s.byConviction) {
     return ["half", "call", "conviction"].flatMap((p) => Object.entries(s[`by${p[0].toUpperCase()}${p.slice(1)}`] || {}).map(([k, v]) => [`${p}:${k}`, SPLIT_LABEL[`${p}:${k}`] || k, v]));
   }
@@ -154,7 +170,7 @@ export function ScorecardView({ t, isDark }) {
                 <td style={cell}>{pts(s.meanExcursion60.mfePts)}</td>
                 <td style={cell}>{pts(s.meanExcursion60.maePts)}</td>
               </tr>,
-              ...splitsOf(s).map(([k, label, v]) => (
+              ...splitsOf(s, agg.ivBands).map(([k, label, v]) => (
                 <tr key={`${sec}:${k}`} style={{ color: t.textSub }}>
                   <td style={{ ...cell, paddingLeft: 22 }}>{label}</td>
                   <td style={cell}><Rate s={v} t={t} /></td>

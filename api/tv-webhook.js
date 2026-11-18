@@ -62,6 +62,7 @@ import {
   CANDIDATE_TG_DEDUPE_TTL_SEC,
   CANDIDATE_TG_TIMEOUT_MS,
 } from "../src/candidateShadow.js";
+import { ivShadowFromSnapshot } from "../src/ivShadow.js";
 
 /** Appends one scorecard event (measurement only; never throws, never changes a response). */
 async function scRecord(redis, event) {
@@ -1912,6 +1913,7 @@ async function handleCandidateShadow({ redis, payload, res, istDate }) {
   }
   const nowMs = deps.now();
   const fused = fuseChartWithOptionChain({ ...payload, grade: realGrade }, liveScanner, nowMs);
+  fused.ivShadow = ivShadowFromSnapshot(liveScanner); // measurement only
   const snapshotAgeSec = fused.liveOptionChainMetrics.snapshotAgeSec;
   const snapshotOk = Boolean(liveScanner) && snapshotAgeSec !== null && snapshotAgeSec <= getFlowMaxAgeSec();
   const category = classifyCandidate({ realGrade, fused, snapshotOk });
@@ -2573,6 +2575,8 @@ export default async function handler(req, res) {
         // 3. Fuse TradingView v4.3 Signal with Live 22-Strike Option Chain
         const nowMs = deps.now();
         const fusedVerdict = fuseChartWithOptionChain(payload, liveScanner, nowMs);
+        // IV shadow (measurement only; read by the scorecard, never by any decision below).
+        fusedVerdict.ivShadow = ivShadowFromSnapshot(liveScanner);
 
         // 4. Enforce Baseline Paper Trading Policy (Traps & High-Conviction Synergy)
         const snapshotAgeSec = fusedVerdict.liveOptionChainMetrics.snapshotAgeSec;

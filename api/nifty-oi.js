@@ -42,6 +42,7 @@ export { buildEodCard, formatEodCardLines };
 import { computeTurnTracker, dispatchTurnAlert } from "../src/turnTracker.js";
 import { istParts, getSessionKindForDate, isMuhuratTomorrow, getSessionDayOfWeek } from "../src/marketCalendar.js";
 import { getSwingConfig, shouldCaptureSwing, runSwingCapture } from "../src/swingSummary.js";
+import { summariseAtmIv } from "../src/ivShadow.js";
 
 let cache = {
   data: null,
@@ -3644,6 +3645,8 @@ async function refreshLiveSnapshotCore({
       totalCallOI: fullExpiryCallOI,
       pcrWarning: eodDecision.pcrWarning,
       strikes,
+      // IV shadow (measurement only): ATM implied volatility of this chain, recorded on signals.
+      ivAtm: summariseAtmIv(filteredRows, spot, { expiry: expiryDate }),
       smartMoney,
       futures: futuresMetrics,
       fusion,

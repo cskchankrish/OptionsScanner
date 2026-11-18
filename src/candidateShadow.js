@@ -113,6 +113,7 @@ export function buildCandidateRecord({ grade, realGrade, fused, category, snapsh
     floor: finiteOrNull(m.floorStrike),
     roof: finiteOrNull(m.roofStrike),
     snapshotAgeSec: snapshotAgeSec ?? null,
+    iv: fused?.ivShadow ?? null, // IV shadow (src/ivShadow.js), measurement only
     shadowOnly: true,
   };
 }

@@ -24,6 +24,7 @@ import { TRAP_SHADOW_ENV_KEYS } from "./trapShadow.js";
 import { measurePlanCall, getPlanDocConfig, PLAN_DOC_ENV_KEYS } from "./planDocShadow.js";
 import { firstLiveIndex } from "./sessionOpen.js";
 import { isCandidateTelegramEnabled, formatCandidateOutcomeLine } from "./candidateShadow.js";
+import { ivCuts, ivBandOf, IV_BANDS } from "./ivShadow.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -309,6 +310,7 @@ export function buildSignalEvent(fused, nowMs) {
       grade: fused?.grade, decision: dec, category, reason, tradeId: fused?.tradeId || null,
       execution: fused?.execution?.status || null, entry: r2(fused?.entryPrice), sl: r2(fused?.stopLoss), t1: r2(fused?.target1Price), t2: r2(fused?.target2Price),
       snapshotAgeSec: fused?.liveOptionChainMetrics?.snapshotAgeSec ?? null,
+      iv: fused?.ivShadow ?? null, // IV shadow (src/ivShadow.js), measurement only
     },
     dq: { ok: fused?.decision !== "VETO_STALE_OPTION_CHAIN", text: fused?.snapshotProvenance || null },
   };
@@ -336,6 +338,7 @@ export function buildCandidateEvent(rec, nowMs) {
       entry: r2(rec?.entry), sl: r2(rec?.sl), t1: r2(rec?.t1), t2: r2(rec?.t2),
       deltaPcr: rec?.deltaPcr ?? null, serverFutQuad: rec?.serverFutQuad ?? null, chartFutQuad: rec?.chartFutQuad ?? null,
       snapshotAgeSec: rec?.snapshotAgeSec ?? null,
+      iv: rec?.iv ?? null,
     },
     dq: { ok: rec?.category !== "UNVERIFIABLE", text: rec?.category === "UNVERIFIABLE" ? "no fresh option-chain snapshot / ΔPCR" : null },
   };
@@ -700,6 +703,12 @@ export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = tru
     if (d?.eodFinal) rows.push({ date: d.date, event: d.eodFinal, outcome: d.eodOutcome || { status: "PENDING" } });
   }
   const out = { sessions: days.length, backfilledSessions: days.filter((d) => d.backfilled).length, minSample, sections: {} };
+  // IV shadow: one set of LOW/MID/HIGH cut-offs (terciles of the ATM IV recorded on this window's
+  // signals and candidates), so the two sections' IV bands mean the same thing. Measurement only.
+  const ivRows = rows.filter((x) => (x.event.section === "SIGNAL" || x.event.section === "CANDIDATE"));
+  const cuts = ivCuts(ivRows.map((x) => x.event.data?.iv?.atmIv));
+  out.ivBands = cuts;
+  const byIv = (r) => Object.fromEntries([...IV_BANDS, "UNKNOWN"].map((b) => [b, statsFor(r.filter((x) => ivBandOf(x.event.data?.iv?.atmIv, cuts) === b), { minSample })]));
   for (const sec of SECTIONS) {
     if (sec === "TRADE" && !includeTrades) continue;
     const r = rows.filter((x) => x.event.section === sec);
@@ -711,6 +720,7 @@ export function aggregate(days, { minSample = SC_MIN_SAMPLE, includeTrades = tru
       out.sections[sec].byCategory = Object.fromEntries(CANDIDATE_SC_CATEGORIES.map((c) => [c, statsFor(r.filter((x) => x.event.data?.category === c), { minSample })]));
       out.sections[sec].byGrade = Object.fromEntries(CANDIDATE_SC_GRADES.map((g) => [g, statsFor(r.filter((x) => x.event.type === g), { minSample })]));
     }
+    if (sec === "SIGNAL" || sec === "CANDIDATE") out.sections[sec].byIv = byIv(r);
     if (sec === "PLAN_DOC") {
       const s = out.sections[sec];
       s.notScored = r.filter((x) => x.outcome?.status === "NOT_SCORED").length;
@@ -854,6 +864,7 @@ export function aggregateToCsv(agg) {
     for (const [k, v] of Object.entries(s.byHalf || {})) out.push(line(sec, `half:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byCall || {})) out.push(line(sec, `call:${k}`, v).map(csvEsc).join(","));
     for (const [k, v] of Object.entries(s.byConviction || {})) out.push(line(sec, `conviction:${k}`, v).map(csvEsc).join(","));
+    for (const [k, v] of Object.entries(s.byIv || {})) out.push(line(sec, `iv:${k}`, v).map(csvEsc).join(","));
     // Base rate: windows (events column) whose futures move was UP / DOWN / FLAT.
     if (s.outcomeMix) for (const k of ["UP", "DOWN", "FLAT"]) out.push([sec, `outcome:${k}`, "", s.outcomeMix[k]].map(csvEsc).join(","));
   }
