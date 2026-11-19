@@ -130,3 +130,76 @@ test("API: read-only, today's live timeline stands in as the next session", asyn
   assert.equal(calls.timeline, 1);
   assert.ok(out.summary.byMetric.BREAKDOWN_COMBO);
 });
+
+// ── exit policies (owner 2026-11-19) ──────────────────────────────────────────────────────────
+import { runExitPolicy, CARRY_EXIT_POLICIES } from "../src/carryCheck.js";
+const POL = Object.fromEntries(CARRY_EXIT_POLICIES.map((p) => [p.key, p]));
+const ticksOf = (pairs) => pairs.map(([minutes, f]) => ({ minutes, f }));
+
+// 19-Nov shape, from 18-Nov's 15:36 price 25231: down to 25100 by 09:31, back to 25236 by 09:54.
+function nov19() {
+  const out = [];
+  for (let m = 556; m <= 630; m++) {
+    // real path: 25155 at 09:16, 25100 at 09:31, 25216.5 at 09:45, 25236 at 09:54
+    const f = m <= 571 ? 25155 - (m - 556) * 3.66 : m <= 585 ? 25100 + (m - 571) * 8.32 : m <= 594 ? 25216.5 + (m - 585) * 2.17 : 25236 + (m - 594) * 0.5;
+    out.push([m, Math.round(f * 100) / 100]);
+  }
+  return ticksOf(out);
+}
+
+test("19-Nov shape: a held short keeps the drop with a target, gives it back on a clock", () => {
+  const t = nov19();
+  const ref = 25231;
+  const at0945 = runExitPolicy(t, ref, -1, POL.TIME_0945);
+  const br35 = runExitPolicy(t, ref, -1, POL.BRACKET_035_025);
+  const br50 = runExitPolicy(t, ref, -1, POL.BRACKET_050_030);
+  assert.equal(at0945.exit, "TIME");
+  assert.ok(at0945.pts < 30, "the bounce has taken most of it back by 09:45");
+  assert.equal(br35.exit, "TARGET");
+  assert.ok(br35.pts >= 88, "0.35% of 25231 = 88 pts, kept");
+  assert.equal(br50.exit, "TARGET");
+  assert.ok(br50.pts >= 126);
+  // the wrong-way long is stopped at the open instead of riding the drop
+  const longBr = runExitPolicy(t, ref, 1, POL.BRACKET_035_025);
+  assert.equal(longBr.exit, "STOP");
+  assert.equal(longBr.at, "09:16");
+});
+
+test("a gap through the stop at the open fills at the open price", () => {
+  const r = runExitPolicy(ticksOf([[556, 24900], [557, 25300]]), 25000, 1, POL.BRACKET_050_030);
+  assert.equal(r.exit, "STOP");
+  assert.equal(r.pts, -100, "not −75 (the 0.30% stop level): the open was already beyond it");
+});
+
+test("a time exit waits for its minute; before then it is pending", () => {
+  const early = ticksOf([[556, 25010], [570, 25020]]);
+  assert.equal(runExitPolicy(early, 25000, 1, POL.TIME_0945).status, "PENDING");
+  assert.equal(runExitPolicy(early, 25000, 1, POL.BRACKET_035_025).status, "PENDING");
+});
+
+test("each vote is scored under every policy, and summarised per policy", () => {
+  const daySer = seriesOf([[930, 25240], [936, 25231]]);
+  const t = nov19();
+  const nextSer = { m: [555, ...t.map((x) => x.minutes)], f: [25231, ...t.map((x) => x.f)], v: [6000000, ...t.map((_, i) => 50000 + i * 1000)], s: [25200, ...t.map((x) => x.f - 20)] };
+  const o = measureCarryOutcome({ daySeries: daySer, nextSeries: nextSer });
+  assert.equal(o.status, "MEASURED");
+  for (const p of CARRY_EXIT_POLICIES) assert.ok(o.policies[p.key].long && o.policies[p.key].short);
+  const short = scoreVote("BEARISH", o);
+  assert.equal(short.policies.BRACKET_035_025.hit, true);
+  assert.equal(short.policies.BRACKET_035_025.exit, "TARGET");
+  const rows = buildCarryRows({ swingDays: [D17, D18], scDocs: { "2026-11-18": { date: "2026-11-18", series: daySer, eodFinal: EOD18 }, "2026-11-19": { date: "2026-11-19", series: nextSer } } });
+  const bp = summariseCarry(rows).byMetric.CONFLUENCE.byPolicy;
+  assert.equal(bp.BRACKET_035_025.hits, 1);
+  assert.equal(bp.BRACKET_035_025.targets, 1);
+  assert.equal(Object.keys(bp).length, 4);
+});
+
+test("before 10:30 the outcome is pending but already carries the policies that resolved", () => {
+  const daySer = seriesOf([[930, 25240], [936, 25231]]);
+  const t = nov19().filter((x) => x.minutes <= 580);
+  const nextSer = { m: [555, ...t.map((x) => x.minutes)], f: [25231, ...t.map((x) => x.f)], v: [6000000, ...t.map((_, i) => 50000 + i * 1000)], s: [25200, ...t.map((x) => x.f - 20)] };
+  const o = measureCarryOutcome({ daySeries: daySer, nextSeries: nextSer });
+  assert.equal(o.status, "PENDING");
+  assert.equal(o.policies.BRACKET_035_025.short.exit, "TARGET");
+  assert.equal(o.policies.TIME_1030.short.status, "PENDING");
+});

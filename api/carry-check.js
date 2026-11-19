@@ -9,7 +9,7 @@
 import { loadSwingHistory, lastDates, getSwingConfig } from "../src/swingSummary.js";
 import { keys, istOf, compactSeries, isSessionDayDoc, timelineKeysFor } from "../src/scorecard.js";
 import { getSessionKindForDate } from "../src/marketCalendar.js";
-import { buildCarryRows, summariseCarry, CARRY_CHECK_DEFAULTS, CARRY_METRICS } from "../src/carryCheck.js";
+import { buildCarryRows, summariseCarry, CARRY_CHECK_DEFAULTS, CARRY_METRICS, CARRY_EXIT_POLICIES } from "../src/carryCheck.js";
 
 export const CARRY_API_DEFAULT_DAYS = 30;
 export const CARRY_API_MAX_DAYS = 120;
@@ -80,6 +80,8 @@ export function createCarryCheckHandler(overrides = {}) {
         shadow: true,
         note: "Measurement only: what holding overnight in each metric's direction would have done versus exiting at the 15:36 square-off. Not a recommendation; nothing here changes a decision or an order.",
         hitRule: "Holding in the voted direction was ahead of the 15:36 exit at 10:30 next session (futures).",
+        exitPolicies: CARRY_EXIT_POLICIES.map(({ key, label }) => ({ key, label })),
+        policyHitRule: "Under each exit policy: holding in the voted direction ended ahead of the 15:36 exit (futures).",
         majorMove: `A move of at least ${CARRY_CHECK_DEFAULTS.majorPct}% in a direction before 11:00 next session.`,
         config: CARRY_CHECK_DEFAULTS,
         metrics: CARRY_METRICS.map(([id, label]) => ({ id, label })),

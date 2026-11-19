@@ -36,6 +36,20 @@ export const CARRY_CHECK_DEFAULTS = Object.freeze({
   confluenceMin: 3, // at least this many independent metrics on one side and none opposed
 });
 
+/**
+ * How a held position is exited the next morning (owner 2026-11-19: a fixed clock gives back moves
+ * like 19-Nov, which hit 25100 at 09:31 and bounced by 09:54). Every policy is measured on futures
+ * from D's 15:36 price, for both a held long and a held short; each metric is then scored under all
+ * of them side by side, so the exit rule is chosen from evidence too. A target/stop is checked on
+ * each minute's price in order; a gap through it at the open fills at the open.
+ */
+export const CARRY_EXIT_POLICIES = [
+  { key: "TIME_0945", label: "Exit at 09:45", tEnd: 585 },
+  { key: "TIME_1030", label: "Exit at 10:30", tEnd: 630 },
+  { key: "BRACKET_035_025", label: "Target +0.35% / stop −0.25% / else 10:30", tgt: 0.35, stp: 0.25, tEnd: 630 },
+  { key: "BRACKET_050_030", label: "Target +0.50% / stop −0.30% / else 10:30", tgt: 0.5, stp: 0.3, tEnd: 630 },
+];
+
 export const CARRY_METRICS = [
   ["DAY_QUADRANT", "Whole-day futures reading (price vs previous close, OI open→close)"],
   ["STRONG_BUILDUP", "Build-up with a large OI rise (≥ 5%)"],
@@ -133,6 +147,21 @@ function futTicks(series) {
 }
 const atOrBefore = (ticks, m) => { let b = null; for (const t of ticks) if (t.minutes <= m) b = t; return b; };
 
+/** One exit policy for a position held in direction dir (+1 long / −1 short). Pure. */
+export function runExitPolicy(ticks, refPrice, dir, policy) {
+  for (const t of ticks) {
+    if (t.minutes > policy.tEnd) break;
+    const mv = dir * (t.f - refPrice);
+    if (policy.tgt != null && mv >= (refPrice * policy.tgt) / 100) return { status: "MEASURED", pts: r2(mv), exit: "TARGET", at: hhmm(t.minutes) };
+    if (policy.stp != null && mv <= -(refPrice * policy.stp) / 100) return { status: "MEASURED", pts: r2(mv), exit: "STOP", at: hhmm(t.minutes) };
+  }
+  const last = ticks[ticks.length - 1];
+  if (!last || last.minutes < policy.tEnd) return { status: "PENDING" };
+  const e = atOrBefore(ticks, policy.tEnd);
+  if (!e || policy.tEnd - e.minutes > 4) return { status: "UNMEASURABLE", reason: `no tick near ${hhmm(policy.tEnd)}` };
+  return { status: "MEASURED", pts: r2(dir * (e.f - refPrice)), exit: "TIME", at: hhmm(e.minutes) };
+}
+
 /**
  * What the next session did versus D's 15:36 futures price. Unsigned (up = +); each metric signs it.
  */
@@ -146,7 +175,8 @@ export function measureCarryOutcome({ daySeries, nextSeries, dayExpiry = null, n
   const n = futTicks(nextSeries).filter((t) => t.minutes >= Number(nextSeries.m[Math.max(0, live.index)] ?? 0));
   if (!n.length || n[0].minutes > 555 + 10) return { status: "UNMEASURABLE", reason: "next session's open not recorded", nextDate };
   const last = n[n.length - 1];
-  if (last.minutes < cfg.checkMins) return { status: "PENDING", reason: `next session not yet at ${hhmm(cfg.checkMins)}`, nextDate, refPrice: r2(ref.f) };
+  const policies = Object.fromEntries(CARRY_EXIT_POLICIES.map((pol) => [pol.key, { long: runExitPolicy(n, ref.f, 1, pol), short: runExitPolicy(n, ref.f, -1, pol) }]));
+  if (last.minutes < cfg.checkMins) return { status: "PENDING", reason: `next session not yet at ${hhmm(cfg.checkMins)}`, nextDate, refPrice: r2(ref.f), policies };
   const p = (m) => atOrBefore(n, m);
   const t0920 = p(560), t1030 = p(cfg.checkMins);
   if (!t1030 || cfg.checkMins - t1030.minutes > 4) return { status: "UNMEASURABLE", reason: `no tick near ${hhmm(cfg.checkMins)}`, nextDate };
@@ -161,6 +191,7 @@ export function measureCarryOutcome({ daySeries, nextSeries, dayExpiry = null, n
     at1030: { at: hhmm(t1030.minutes), pts: r2(t1030.f - ref.f), pct: pct(t1030.f) },
     high: { at: hhmm(hiT.minutes), pts: r2(hiT.f - ref.f), pct: pct(hiT.f) },
     low: { at: hhmm(loT.minutes), pts: r2(loT.f - ref.f), pct: pct(loT.f) },
+    policies,
   };
 }
 
@@ -183,7 +214,17 @@ export function scoreVote(vote, outcome, cfg = CARRY_CHECK_DEFAULTS) {
     worstPts: worst,
     majorFor: bestPct >= cfg.majorPct,
     majorAgainst: worstPct <= -cfg.majorPct,
+    policies: policyScores(vote, outcome),
   };
+}
+
+/** The vote's result under each exit policy: { KEY: { status, pts, hit, exit, at } }. */
+function policyScores(vote, outcome) {
+  const side = vote === "BULLISH" ? "long" : "short";
+  return Object.fromEntries(CARRY_EXIT_POLICIES.map((pol) => {
+    const r = outcome?.policies?.[pol.key]?.[side];
+    return [pol.key, r && r.status === "MEASURED" ? { ...r, hit: r.pts > 0 } : { status: r?.status || "UNMEASURABLE" }];
+  }));
 }
 
 /** One row per session: metrics at the close, the next-session outcome, and each vote's score. */
@@ -232,6 +273,21 @@ export function summariseCarry(rows, { minSample = 20 } = {}) {
       meanAt1030Pts: mean("at1030Pts"),
       meanBestPts: mean("bestPts"),
       meanWorstPts: mean("worstPts"),
+      // each exit policy side by side (hit = holding beat exiting at the 15:36 square-off)
+      byPolicy: Object.fromEntries(CARRY_EXIT_POLICIES.map((pol) => {
+        const ps = sc.map((x) => x.s.policies?.[pol.key]).filter((v) => v?.status === "MEASURED");
+        const h = ps.filter((v) => v.hit).length;
+        return [pol.key, {
+          label: pol.label,
+          votes: ps.length,
+          hits: h,
+          hitRate: ps.length ? r2(h / ps.length) : null,
+          meanPts: ps.length ? r2(ps.reduce((a, v) => a + v.pts, 0) / ps.length) : null,
+          totalPts: r2(ps.reduce((a, v) => a + v.pts, 0)),
+          targets: ps.filter((v) => v.exit === "TARGET").length,
+          stops: ps.filter((v) => v.exit === "STOP").length,
+        }];
+      })),
       majorCaught: sc.filter((x) => x.s.majorFor).length,
       majorAgainst: sc.filter((x) => x.s.majorAgainst).length,
       // of the sessions that delivered a major overnight move, how many did this metric vote for in the right direction
