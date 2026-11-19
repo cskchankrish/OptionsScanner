@@ -140,3 +140,28 @@ None of these thresholds has been fitted to data. They are starting points chose
 read. Every raw input behind each group is stored with each daily outlook snapshot, so after 20–30
 sessions they should be re-fitted from the recorded inputs and the measured outcomes (the past
 outlook tally), not tuned to a handful of days.
+
+## Invalidation ladder (added 2026-11-19)
+
+The invalidation used to be the whole-chain call wall (bearish view) or put wall (bullish). Those
+sit on far round strikes that collect hedges: 26000 / 24000 on 18-Nov-2026, about 800 points
+away. On NIFTY daily bars from Oct-2021 to Nov-2026 a level that far was reached 7 times, never in
+time to matter.
+
+An invalidation is a **risk boundary, not a forecast**. On the same bars, a first daily close
+beyond the last swing level was followed by a move in the new direction over the next 3 days 51%
+(up) and 56% (down) of the time, against 54% for any day. So the outlook now shows the nearest
+real structure, in three steps, each a daily close beyond the level:
+
+| Step | Bearish view (mirror for bullish) |
+|---|---|
+| 1 Warning | back above the multi-session volume centre: the higher of the point of control and the volume-weighted average (5 sessions; futures volume at spot price, 15:15–15:30 skipped) |
+| 2 Invalidated | above the previous day's high, merged with the value-area high and the largest near-money call OI when within max(25 pts, 0.15 × straddle) |
+| 3 Narrative flipped | above the last confirmed swing high (a day whose high beat the days either side), merged with the near-money call wall when close; the expected-range high when no swing is recorded |
+
+A range view shows both an upper and a lower ladder. `levels.invalidation` is step 2 (or step 3
+when there is no step 2) with `source: "ladder"`; the whole-chain walls are still reported as
+information. Near-money walls (`nearCallWall` / `nearPutWall` in each chain summary: the largest
+call OI above and put OI below spot within spot ± straddle) are recorded from the first daily
+capture after this change; earlier days use price and volume levels only. Stored outlooks record
+when each step was first breached (`outcome.ladderBreaches`), so the ladder is measured too.

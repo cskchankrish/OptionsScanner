@@ -11,6 +11,7 @@
  */
 import { isSpotFrozenAt } from "./flowCalc.js";
 import { firstLiveIndex } from "./sessionOpen.js";
+import { profileFromTicks, profileFromSeries } from "./volumeProfile.js";
 
 const hhmmOf = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 import { keys as scKeys, isSessionDayDoc } from "./scorecard.js";
@@ -108,6 +109,12 @@ export function summariseChain({ rows, spot, expiry = null, nowMs = Date.now(), 
     const topPut = clean.filter((r) => r.peOi > 0).sort((a, b) => b.peOi - a.peOi || a.strike - b.strike).slice(0, 3).map((r) => ({ strike: r.strike, oi: r.peOi }));
     if (!topCall.length) notes.push("no call open interest in the chain");
     if (!topPut.length) notes.push("no put open interest in the chain");
+    // Near-money walls (owner 2026-11-19): the largest call OI ABOVE spot and the largest put OI
+    // BELOW spot within the expected range (spot ± straddle). The whole-chain walls sit on far
+    // round strikes (26000 / 24000 on 18-Nov) that collect hedges and are useless as nearby levels.
+    const inRange = (r) => r.strike >= s - straddle && r.strike <= s + straddle;
+    const nc = clean.filter((r) => r.strike > s && inRange(r) && r.ceOi > 0).sort((a, b) => b.ceOi - a.ceOi || a.strike - b.strike)[0] || null;
+    const np = clean.filter((r) => r.strike < s && inRange(r) && r.peOi > 0).sort((a, b) => b.peOi - a.peOi || b.strike - a.strike)[0] || null;
     const totCallOI = clean.reduce((a, r) => a + r.ceOi, 0);
     const totPutOI = clean.reduce((a, r) => a + r.peOi, 0);
     const d = finite(dte) ? Number(dte) : dteFromExpiry(expiry, nowMs);
@@ -124,6 +131,8 @@ export function summariseChain({ rows, spot, expiry = null, nowMs = Date.now(), 
       topPutOi: topPut,
       callWall: topCall[0]?.strike ?? null,
       putWall: topPut[0]?.strike ?? null,
+      nearCallWall: nc ? { strike: nc.strike, oi: nc.ceOi } : null,
+      nearPutWall: np ? { strike: np.strike, oi: np.peOi } : null,
       totCallOI,
       totPutOI,
       pcr: totCallOI > 0 ? r2(totPutOI / totCallOI) : null,
@@ -250,6 +259,7 @@ export function buildDailySummary({ date, timeline = [], futuresMetrics = null, 
       fut,
       chains: { near: near || null, nextWeekly: nextWeekly || null, monthly: monthly || null },
       nearIntraday: nearIntradayOut,
+      volProfile: profileFromTicks(ohlcTicks), // volume at price (src/volumeProfile.js)
       coveragePct,
       partial,
       notes,
@@ -298,6 +308,7 @@ export function summaryFromScorecardDoc(doc) {
         totalPutWriting: finite(last.putWriting) ? Number(last.putWriting) : null,
         totalCallWriting: finite(last.callWriting) ? Number(last.callWriting) : null,
       },
+      volProfile: profileFromSeries(s),
       coveragePct: finite(doc.dataQuality?.coveragePct) ? Number(doc.dataQuality.coveragePct) : null,
       partial: true,
       notes,

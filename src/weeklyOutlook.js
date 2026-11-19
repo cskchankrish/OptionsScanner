@@ -10,6 +10,7 @@
  * thresholds can be re-fitted later. Pure; never throws. See docs/weekly-outlook.md.
  */
 import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "./smartMoneyFusion.js";
+import { combineProfiles } from "./volumeProfile.js";
 
 export const OUTLOOK_VERSION = 1;
 export const REGIMES = ["TREND_UP", "TREND_DOWN", "RANGE", "BREAK_RISK_UP", "BREAK_RISK_DOWN", "INSUFFICIENT_DATA"];
@@ -302,6 +303,136 @@ function weekLevels(ds, last, cfg) {
   };
 }
 
+/**
+ * Invalidation ladder (owner 2026-11-19). The old invalidation was the whole-chain call/put wall:
+ * 26000 / 24000 on 18-Nov, ~800 pts away — on 5 years of daily bars a level that far was reached
+ * 7 times, never in time to matter. A level beyond which the view is wrong is a RISK boundary, not
+ * a forecast (a close beyond the last swing level predicted the next 3 days no better than chance:
+ * 51% / 56% vs 54% base, 2021-10 to 2026-11), so it should sit at the nearest real structure:
+ *
+ *   1 WARNING      a daily close back across the multi-session volume centre (POC / VWAP)
+ *   2 INVALIDATED  a daily close beyond the previous day's high (bearish view) / low (bullish),
+ *                  merged with the value-area edge and the near-money OI wall when they are close
+ *   3 FLIPPED      a daily close beyond the last confirmed swing high / low, merged with the
+ *                  near-money OI wall when close; the expected-range edge when no swing is recorded
+ *
+ * "Merged" = within max(25 pts, 0.15 × straddle) of the anchor: the step is then a ZONE and is
+ * breached by a daily close beyond its far edge. Every component is listed with its source.
+ */
+export const LADDER_PROFILE_SESSIONS = 5;
+
+function confirmedSwings(ds) {
+  const bars = ds.filter(hasSpotBar);
+  let hi = null, lo = null;
+  for (let i = 1; i < bars.length - 1; i++) {
+    const h = Number(bars[i].spot.high), l = Number(bars[i].spot.low);
+    if (h > Number(bars[i - 1].spot.high) && h > Number(bars[i + 1].spot.high)) hi = { value: h, date: bars[i].date };
+    if (l < Number(bars[i - 1].spot.low) && l < Number(bars[i + 1].spot.low)) lo = { value: l, date: bars[i].date };
+  }
+  return { hi, lo };
+}
+
+function zoneOf(components, side, tol) {
+  const anchor = components[0];
+  const kept = components.filter((c, i) => i === 0 || Math.abs(c.value - anchor.value) <= tol);
+  const vals = kept.map((c) => c.value);
+  const low = Math.min(...vals), high = Math.max(...vals);
+  return { value: r2(side === "above" ? high : low), zone: { low: r2(low), high: r2(high) }, components: kept };
+}
+
+function buildLadder({ side, close, prevDay, swing, profile, nearWall, expectedRange, tol }) {
+  const steps = [];
+  const beyond = (v) => isFin(v) && (side === "above" ? Number(v) > close : Number(v) < close);
+  const fmtC = (c) => `${c.note} ${f0(c.value)}`;
+  const wallComp = () => ({ type: side === "above" ? "NEAR_CALL_WALL" : "NEAR_PUT_WALL", value: Number(nearWall.strike), note: `largest near-money ${side === "above" ? "call" : "put"} OI (${Math.round(nearWall.oi / 1000)}k)` });
+  // 1 WARNING: the volume centre, on the view's wrong side
+  if (profile) {
+    const centre = side === "above" ? Math.max(profile.poc, profile.vwap) : Math.min(profile.poc, profile.vwap);
+    const comps = [
+      { type: "POC", value: profile.poc, note: `${profile.sessions}-session volume point of control` },
+      { type: "VWAP", value: profile.vwap, note: `${profile.sessions}-session volume-weighted average` },
+    ];
+    steps.push({
+      key: "WARNING",
+      value: r2(centre),
+      zone: { low: r2(Math.min(profile.poc, profile.vwap)), high: r2(Math.max(profile.poc, profile.vwap)) },
+      components: comps,
+      status: beyond(centre) ? "NOT_REACHED" : "ALREADY_BEYOND",
+      basis: `a daily close ${side} the volume centre ${f0(centre)} (${comps.map(fmtC).join(", ")})`,
+    });
+  }
+  // 2 INVALIDATED: previous day's extreme, merged with the value-area edge and the near-money wall
+  const pdx = side === "above" ? prevDay.high : prevDay.low;
+  if (beyond(pdx)) {
+    const comps = [{ type: side === "above" ? "PREV_DAY_HIGH" : "PREV_DAY_LOW", value: Number(pdx), note: `${prevDay.date} ${side === "above" ? "high" : "low"}` }];
+    const va = profile ? (side === "above" ? profile.vah : profile.val) : null;
+    if (beyond(va)) comps.push({ type: side === "above" ? "VALUE_AREA_HIGH" : "VALUE_AREA_LOW", value: va, note: `${profile.sessions}-session value-area ${side === "above" ? "high" : "low"}` });
+    if (nearWall && beyond(nearWall.strike)) comps.push(wallComp());
+    const z = zoneOf(comps, side, tol);
+    steps.push({ key: "INVALIDATED", ...z, status: "NOT_REACHED", basis: `a daily close ${side} ${f0(z.value)} (${z.components.map(fmtC).join(", ")})` });
+  }
+  // 3 FLIPPED: the last confirmed swing extreme beyond step 2, merged with the near-money wall
+  const s2 = steps.find((x) => x.key === "INVALIDATED");
+  const past2 = (v) => beyond(v) && (!s2 || (side === "above" ? Number(v) > s2.zone.high + tol : Number(v) < s2.zone.low - tol));
+  const sw = side === "above" ? swing.hi : swing.lo;
+  let comps3 = null;
+  if (sw && past2(sw.value)) comps3 = [{ type: side === "above" ? "SWING_HIGH" : "SWING_LOW", value: sw.value, note: `last swing ${side === "above" ? "high" : "low"} (${sw.date})` }];
+  else if (expectedRange && past2(side === "above" ? expectedRange.high : expectedRange.low)) {
+    const v = side === "above" ? expectedRange.high : expectedRange.low;
+    comps3 = [{ type: "EXPECTED_RANGE", value: v, note: `expected-range ${side === "above" ? "high" : "low"} (no recorded swing beyond step 2)` }];
+  }
+  if (comps3) {
+    if (nearWall && past2(nearWall.strike)) comps3.push(wallComp());
+    const z = zoneOf(comps3, side, tol);
+    steps.push({ key: "FLIPPED", ...z, status: "NOT_REACHED", basis: `a daily close ${side} ${f0(z.value)} (${z.components.map(fmtC).join(", ")})` });
+  }
+  for (const st of steps) st.distance = r2(Math.abs(st.value - close));
+  return { side, steps };
+}
+
+/** The ladder(s) for a regime: one side for a trend / break view, both sides for a range. Never throws. */
+export function computeInvalidationLadder({ ds, last, chain, regime }) {
+  try {
+    if (!hasSpotBar(last)) return null;
+    const close = Number(last.spot.close);
+    const straddle = chain && Number(chain.straddle) > 0 ? Number(chain.straddle) : null;
+    const tol = Math.max(25, straddle ? 0.15 * straddle : 0);
+    const profile = combineProfiles(ds.slice(-LADDER_PROFILE_SESSIONS).map((d) => d.volProfile).filter(Boolean));
+    const swing = confirmedSwings(ds);
+    const expectedRange = straddle
+      ? { low: Number(chain.expectedRange?.low ?? chain.spot - straddle), high: Number(chain.expectedRange?.high ?? chain.spot + straddle) }
+      : null;
+    const prevDay = { date: last.date, high: Number(last.spot.high), low: Number(last.spot.low) };
+    const common = { close, prevDay, swing, profile, expectedRange, tol };
+    const up = () => buildLadder({ ...common, side: "above", nearWall: chain?.nearCallWall || null });
+    const dn = () => buildLadder({ ...common, side: "below", nearWall: chain?.nearPutWall || null });
+    const inputs = {
+      close, tolerance: r2(tol), profile, swingHigh: swing.hi, swingLow: swing.lo,
+      nearCallWall: chain?.nearCallWall || null, nearPutWall: chain?.nearPutWall || null,
+      nearWallsRecorded: Boolean(chain && ("nearCallWall" in chain || "nearPutWall" in chain)),
+    };
+    if (regime === "TREND_DOWN" || regime === "BREAK_RISK_DOWN") return { view: "BEARISH", ladders: [up()], inputs };
+    if (regime === "TREND_UP" || regime === "BREAK_RISK_UP") return { view: "BULLISH", ladders: [dn()], inputs };
+    if (regime === "RANGE") return { view: "RANGE", ladders: [up(), dn()], inputs };
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** First later daily close beyond each step of a stored outlook's ladder (within its horizon). */
+export function ladderBreaches(ladder, laterDays) {
+  if (!ladder?.ladders) return null;
+  return ladder.ladders.map((l) => ({
+    side: l.side,
+    steps: l.steps.map((st) => {
+      const far = l.side === "above" ? st.zone.high : st.zone.low;
+      const hit = laterDays.find((d) => hasSpotBar(d) && (l.side === "above" ? Number(d.spot.close) > far : Number(d.spot.close) < far));
+      return { key: st.key, level: far, breachedOn: hit ? hit.date : null, close: hit ? Number(hit.spot.close) : null };
+    }),
+  }));
+}
+
 function emptyGroup(needs) {
   return { available: false, score: null, reasons: [], needs, inputs: {} };
 }
@@ -379,7 +510,12 @@ export function computeWeeklyOutlook({ days = [], config = null } = {}) {
     const callWall = chain && isFin(chain.callWall) ? Number(chain.callWall) : null;
     const putWall = chain && isFin(chain.putWall) ? Number(chain.putWall) : null;
     let invalidation = { value: null, side: null, basis: "no regime yet" };
-    if (regime === "TREND_UP" || regime === "BREAK_RISK_UP") {
+    const ladder = computeInvalidationLadder({ ds, last, chain, regime });
+    const ladderStep = (l) => l?.steps.find((x) => x.key === "INVALIDATED") || l?.steps.find((x) => x.key === "FLIPPED") || null;
+    if (ladder && ladder.view !== "RANGE" && ladderStep(ladder.ladders[0])) {
+      const stp = ladderStep(ladder.ladders[0]);
+      invalidation = { value: stp.value, side: ladder.ladders[0].side, basis: stp.basis, source: "ladder", step: stp.key };
+    } else if (regime === "TREND_UP" || regime === "BREAK_RISK_UP") {
       invalidation = putWall !== null
         ? { value: putWall, side: "below", basis: `a daily close below the put wall ${putWall}` }
         : expectedRange ? { value: expectedRange.low, side: "below", basis: `a daily close below the expected-range low ${f0(expectedRange.low)} (no put wall)` } : { value: null, side: "below", basis: "no put wall or expected range recorded" };
@@ -401,6 +537,7 @@ export function computeWeeklyOutlook({ days = [], config = null } = {}) {
       prevWeekLow: wl.prevWeek?.low ?? null,
       prevWeek: wl.prevWeek,
       invalidation,
+      ladder,
     };
 
     const exp = horizon.expiry || "the next expiry";
@@ -476,7 +613,7 @@ export function evaluateOutlookOutcome({ outlook, laterDays = [] } = {}) {
     const idx5 = later.length >= 5 ? 4 : -1;
     const cands = [idxExp, idx5].filter((i) => i >= 0);
     if (!cands.length) {
-      return { ...base, rule, reason: `${plural(later.length, "later session")} recorded; waiting for ${expIso ? `the first session on/after ${expIso} or ` : ""}the 5th later session.` };
+      return { ...base, rule, ladderBreaches: ladderBreaches(outlook.levels?.ladder, later), reason: `${plural(later.length, "later session")} recorded; waiting for ${expIso ? `the first session on/after ${expIso} or ` : ""}the 5th later session.` };
     }
     const h = Math.min(...cands);
     const win = later.slice(0, h + 1);
@@ -493,6 +630,7 @@ export function evaluateOutlookOutcome({ outlook, laterDays = [] } = {}) {
       minClose: Math.min(...closes),
       movePct: ref > 0 ? r2(((closeAtHorizon - ref) / ref) * 100) : null,
       rule,
+      ladderBreaches: ladderBreaches(outlook.levels?.ladder, win),
     };
     const er = outlook.expectedRange;
     if (regime === "TREND_UP" || regime === "TREND_DOWN") {

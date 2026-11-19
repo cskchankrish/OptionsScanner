@@ -39,6 +39,44 @@ function GroupLine({ name, g, t, isMobile }) {
   );
 }
 
+const STEP_STYLE = {
+  WARNING: { n: 1, label: "Warning", color: "#d97706" },
+  INVALIDATED: { n: 2, label: "Invalidated", color: "#ef4444" },
+  FLIPPED: { n: 3, label: "Narrative flipped", color: "#7c3aed" },
+};
+
+/** Invalidation ladder: where the view weakens, is wrong, and has flipped (src/weeklyOutlook.js). */
+function LadderBlock({ ladder, t, isMobile, isDark }) {
+  if (!ladder || !ladder.ladders?.length) return null;
+  const n0l = (v) => (v == null || !Number.isFinite(Number(v)) ? "—" : Math.round(Number(v)).toLocaleString("en-IN"));
+  const heading = (l) => (ladder.view === "BEARISH" ? "Levels that would prove the down view wrong" : ladder.view === "BULLISH" ? "Levels that would prove the up view wrong" : l.side === "above" ? "Range: upside break levels" : "Range: downside break levels");
+  return (
+    <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+      {ladder.ladders.map((l) => (
+        <div key={l.side} style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "6px 8px", background: isDark ? "#0f172a" : "#f8fafc" }}>
+          <div style={{ fontSize: isMobile ? 10.5 : 11.5, fontWeight: 800, color: t.textSub, marginBottom: 4 }}>{heading(l)} — daily close {l.side}</div>
+          {l.steps.length === 0 && <div style={{ fontSize: 11, color: t.textMuted }}>No structural level recorded on this side yet.</div>}
+          {l.steps.map((stp) => {
+            const sty = STEP_STYLE[stp.key] || { n: "?", label: stp.key, color: t.textSub };
+            const zone = stp.zone && stp.zone.low !== stp.zone.high ? ` (zone ${n0l(stp.zone.low)}–${n0l(stp.zone.high)})` : "";
+            return (
+              <div key={stp.key} style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap", fontSize: isMobile ? 11.5 : 12.5, marginBottom: 2 }}>
+                <span style={{ fontWeight: 900, color: "#fff", background: sty.color, borderRadius: 4, padding: "0 6px", fontSize: 10.5, whiteSpace: "nowrap" }}>{sty.n} {sty.label}</span>
+                <strong style={{ fontFamily: "monospace", color: t.text }}>{l.side === "above" ? "above" : "below"} {n0l(stp.value)}</strong>
+                <span style={{ color: t.textMuted }}>{stp.status === "ALREADY_BEYOND" ? "already crossed" : `${n0l(stp.distance)} pts away`}{zone}</span>
+                <span style={{ color: t.textMuted, fontSize: isMobile ? 10.5 : 11 }}>{(stp.components || []).map((c) => `${c.note} ${n0l(c.value)}`).join(" · ")}</span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      {ladder.inputs && ladder.inputs.nearWallsRecorded === false && (
+        <div style={{ fontSize: isMobile ? 10 : 10.5, color: t.textMuted }}>Near-money option walls are recorded from the next daily capture; this ladder uses price and volume levels only.</div>
+      )}
+    </div>
+  );
+}
+
 export function WeeklyOutlookCard({ t, isDark, isMobile }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -105,11 +143,11 @@ export function WeeklyOutlookCard({ t, isDark, isMobile }) {
       <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: "4px 16px", fontSize: isMobile ? 11.5 : 12.5 }}>
         {kv("Expected range", er ? `${n0(er.low)}–${n0(er.high)} (±${n0(er.straddle)}, ${er.pctOfSpot ?? "?"}%) to ${er.expiry || "?"}` : "not recorded yet")}
         {kv("Pivot", lv.pivot?.value != null ? n0(lv.pivot.value) : "—")}
-        {kv("Call wall", n0(lv.callWall))}
-        {kv("Put wall", n0(lv.putWall))}
-        {kv("Invalidation", lv.invalidation?.value != null ? `${lv.invalidation.side} ${n0(lv.invalidation.value)}` : (o.regime === "RANGE" ? "close outside range" : "—"))}
+        {kv("Call wall (whole chain)", n0(lv.callWall))}
+        {kv("Put wall (whole chain)", n0(lv.putWall))}
       </div>
       {lv.pivot?.basis && <div style={{ fontSize: isMobile ? 10.5 : 11, color: t.textMuted, marginTop: 2 }}>Pivot: {lv.pivot.basis}</div>}
+      <LadderBlock ladder={lv.ladder} t={t} isMobile={isMobile} isDark={isDark} />
 
       <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
         <GroupLine name="Price" g={o.groups?.price} t={t} isMobile={isMobile} />

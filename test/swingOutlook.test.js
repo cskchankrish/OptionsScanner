@@ -325,8 +325,9 @@ test("outlook: 0 / 1 / 2 days → INSUFFICIENT_DATA, expected range present when
   assert.doesNotThrow(() => computeWeeklyOutlook());
 });
 
-test("outlook: 6-day uptrend with long build-up and a rising put wall → TREND_UP, invalidation at the put wall", () => {
-  const o = computeWeeklyOutlook({ days: uptrendDays(), config: CFG });
+test("outlook: 6-day uptrend with long build-up and a rising put wall → TREND_UP, invalidation from the ladder", () => {
+  const ups = uptrendDays();
+  const o = computeWeeklyOutlook({ days: ups, config: CFG });
   assert.equal(o.groups.price.score, 2);
   assert.equal(o.groups.futures.score, 2);
   assert.equal(o.groups.futures.inputs.quadrant, "LONG_BUILDUP");
@@ -335,20 +336,30 @@ test("outlook: 6-day uptrend with long build-up and a rising put wall → TREND_
   assert.equal(o.score, 6);
   assert.equal(o.regime, "TREND_UP");
   assert.equal(o.confidence, "HIGH");
-  assert.deepEqual(o.levels.invalidation, { value: 25300, side: "below", basis: "a daily close below the put wall 25300" });
+  // Owner 2026-11-19: invalidation is the ladder's INVALIDATED step (previous day's low here; the
+  // fixture has no volume profile or near-money walls), not the whole-chain put wall.
+  const lastUp = ups[ups.length - 1];
+  assert.equal(o.levels.invalidation.source, "ladder");
+  assert.equal(o.levels.invalidation.side, "below");
+  assert.equal(o.levels.invalidation.value, lastUp.spot.low);
+  assert.match(o.levels.invalidation.basis, /a daily close below/);
+  assert.equal(o.levels.putWall, 25300, "the whole-chain wall is still reported");
   assert.equal(o.asOf, "2026-11-16");
   assert.equal(o.reference.spotClose, 25500);
   assert.match(o.headline, /Uptrend/);
   assert.equal(o.horizon.expiry, "24-Nov-2026");
 });
 
-test("outlook: mirror → TREND_DOWN, invalidation at the call wall", () => {
-  const o = computeWeeklyOutlook({ days: downtrendDays(), config: CFG });
+test("outlook: mirror → TREND_DOWN, invalidation from the ladder", () => {
+  const dns = downtrendDays();
+  const o = computeWeeklyOutlook({ days: dns, config: CFG });
   assert.equal(o.groups.futures.inputs.quadrant, "SHORT_BUILDUP");
   assert.ok(o.groups.price.score < 0 && o.groups.options.score < 0);
   assert.equal(o.regime, "TREND_DOWN");
-  assert.equal(o.levels.invalidation.value, 25200);
+  assert.equal(o.levels.invalidation.source, "ladder");
   assert.equal(o.levels.invalidation.side, "above");
+  assert.equal(o.levels.invalidation.value, dns[dns.length - 1].spot.high);
+  assert.equal(o.levels.callWall, 25200, "the whole-chain wall is still reported");
 });
 
 test("outlook: flat days inside the walls → RANGE", () => {
@@ -362,11 +373,14 @@ test("outlook: flat days inside the walls → RANGE", () => {
 });
 
 test("outlook: close pressing the call wall with expanding realised range → BREAK_RISK_UP", () => {
-  const o = computeWeeklyOutlook({ days: breakUpDays(), config: CFG });
+  const bus = breakUpDays();
+  const o = computeWeeklyOutlook({ days: bus, config: CFG });
   assert.ok(o.score < CFG.trendScore, `score ${o.score}`);
   assert.equal(o.groups.volatility.state, "EXPANDING");
   assert.equal(o.regime, "BREAK_RISK_UP");
-  assert.equal(o.levels.invalidation.value, 24800);
+  assert.equal(o.levels.invalidation.source, "ladder");
+  assert.equal(o.levels.invalidation.value, bus[bus.length - 1].spot.low);
+  assert.equal(o.levels.putWall, 24800, "the whole-chain wall is still reported");
   assert.equal(o.breakInfo.wall, 25250);
 });
 

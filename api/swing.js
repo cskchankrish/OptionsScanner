@@ -10,7 +10,8 @@
  */
 import { getSwingConfig, loadSwingHistory, lastDates } from "../src/swingSummary.js";
 import { computeWeeklyOutlook, evaluateOutlookOutcome, getOutlookConfig, REGIMES, OUTLOOK_HIT_RULES, OUTLOOK_HORIZON_RULE } from "../src/weeklyOutlook.js";
-import { istOf } from "../src/scorecard.js";
+import { istOf, keys as scKeys } from "../src/scorecard.js";
+import { profileFromSeries } from "../src/volumeProfile.js";
 import { getSessionKindForDate } from "../src/marketCalendar.js";
 
 export const SWING_API_DEFAULT_DAYS = 30;
@@ -78,6 +79,18 @@ export function createSwingHandler(overrides = {}) {
       const today = istOf(deps.now()).date;
       const dates = lastDates(today, n).filter((d) => getSessionKindForDate(d) !== "CLOSED");
       const { days, outlooks } = await loadSwingHistory({ mget: deps.mget, dates, includeOutlooks: true });
+      // Volume profiles for the invalidation ladder: summaries captured before 19-Nov-2026 carry
+      // none, so derive them (on read, never written) from that day's scorecard minute series.
+      const needVp = days.filter((d) => !d.volProfile);
+      if (needVp.length) {
+        try {
+          const docs = (await deps.mget(needVp.map((d) => scKeys.day(d.date)))) || [];
+          needVp.forEach((d, i) => {
+            const doc = docs[i];
+            if (doc && doc.date === d.date && doc.series) d.volProfile = profileFromSeries(doc.series);
+          });
+        } catch (e) { /* ladder works without volume levels */ }
+      }
       const outlook = computeWeeklyOutlook({ days, config: getOutlookConfig(env) });
       const pastOutlooks = outlooks.map(({ date, outlook: o }) => ({
         date,
