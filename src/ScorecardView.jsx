@@ -8,6 +8,7 @@ import { isSessionLiveNow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 import { ExitRulesPanel } from "./ExitRulesPanel.jsx";
+import { CarryCheckPanel } from "./CarryCheckPanel.jsx";
 
 const VARIANT_LABEL = { BEAR_TRAP_BASE: "Bear trap — current rule", BEAR_TRAP_STRICT: "Bear trap — tighter (shadow)", BULL_TRAP_BASE: "Bull trap — current rule", BULL_TRAP_STRICT: "Bull trap — tighter (shadow)" };
 const SECTION_LABEL = { FUSION: "Fusion (whole day)", TURN: "Turn Tracker", RADAR: "30-min radar", TRAP_SHADOW: "Trap rules — current vs tighter (shadow)", EOD: "EOD final verdict", EOD_SLOT: "EOD slots / flips", SIGNAL: "TradingView signals", CANDIDATE: "Candidate alerts — real-chain verdict (shadow, no orders)", TRADE: "Algo trades (₹)", PLAN_DOC: "Plan document (Gemini) — half-day calls, shadow" };
@@ -191,6 +192,8 @@ export function ScorecardView({ t, isDark }) {
       </div>
 
       <ExitRulesPanel t={t} rolling={agg?.exitRules} dayRows={day?.exitRules} />
+
+      <CarryCheckPanel t={t} days={days} />
 
       <div style={{ fontWeight: 800, margin: "16px 0 4px" }}>
         {date}{day?.backfilled ? " (backfilled)" : ""}{day?.provisional ? " (in progress — outcomes so far)" : ""} · data {day?.dataQuality?.state || "—"} {day?.dataQuality?.coveragePct != null ? `${day.dataQuality.coveragePct}%` : ""}
