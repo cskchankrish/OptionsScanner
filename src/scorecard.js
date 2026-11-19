@@ -26,6 +26,7 @@ import { firstLiveIndex } from "./sessionOpen.js";
 import { isCandidateTelegramEnabled, formatCandidateOutcomeLine } from "./candidateShadow.js";
 import { ivCuts, ivBandOf, IV_BANDS } from "./ivShadow.js";
 import { evaluateDayExitRules, formatExitRuleLines } from "./exitRuleShadow.js";
+import { evaluateDayOverrides, formatOverrideLines } from "./overrideCost.js";
 
 export const SC_TTL_SEC = 180 * 86400;
 export const SC_MAX_EVENTS_PER_DAY = 300; // worst-case day document ≈ 300 × ~1.4 KB + ~30 KB series < 0.5 MB
@@ -46,6 +47,7 @@ export const keys = {
   tgDaily: (d) => `nifty:sc:tg:${d}`,
   tgMorning: (d) => `nifty:sc:tg_eod:${d}`,
   eodPending: "nifty:sc:eod_pending",
+  outside: (d) => `nifty:sc:outside:${d}`, // owner-logged trades taken outside the system (override cost)
 };
 
 const num = (v, d) => {
@@ -378,7 +380,7 @@ export function buildPlanEvents(snapshot) {
 }
 
 /** TRADE event (Algo-owned intraday exit or carry exit) with the Algo's rupee result. */
-export function buildTradeEvent({ kind, tradeId, exitGrade, direction, entry, exitPrice, pnlInr, pnlKnown, accountsCount, nowMs }) {
+export function buildTradeEvent({ kind, tradeId, exitGrade, direction, entry, exitPrice, pnlInr, pnlKnown, accountsCount, qty = null, closeReason = null, nowMs }) {
   const ist = istOf(nowMs);
   return {
     id: `TRADE:${kind}:${tradeId || nowMs}:${exitGrade}`,
@@ -391,7 +393,9 @@ export function buildTradeEvent({ kind, tradeId, exitGrade, direction, entry, ex
     direction: direction === "LONG" ? "BULLISH" : direction === "SHORT" ? "BEARISH" : direction || null,
     futPrice: null,
     spot: r2(exitPrice),
-    data: { kind, tradeId: tradeId || null, exitGrade, entry: r2(entry), exitPrice: r2(exitPrice), pnlInr: Number.isFinite(Number(pnlInr)) ? Number(pnlInr) : null, pnlKnown: typeof pnlKnown === "boolean" ? pnlKnown : null, accounts: accountsCount ?? null },
+    data: { kind, tradeId: tradeId || null, exitGrade, entry: r2(entry), exitPrice: r2(exitPrice), pnlInr: Number.isFinite(Number(pnlInr)) ? Number(pnlInr) : null, pnlKnown: typeof pnlKnown === "boolean" ? pnlKnown : null, accounts: accountsCount ?? null,
+      ...(Number.isFinite(Number(qty)) && Number(qty) > 0 ? { qty: Number(qty) } : {}),
+      ...(closeReason ? { closeReason: String(closeReason).slice(0, 120) } : {}) },
     dq: { ok: true, text: null },
   };
 }
@@ -781,7 +785,7 @@ const gapList = (gaps) => { const g = (gaps || []).map((x) => `${x.from}–${x.t
 
 export const SC_TG_MAX_CANDIDATE_LINES = 25;
 
-export function formatDailyTelegram(doc, { candidates = true } = {}) {
+export function formatDailyTelegram(doc, { candidates = true, outside = [] } = {}) {
   // Shadow candidates and plan-document calls never count in the sections below or in the
   // unmeasurable count. Candidates get their own "Candidates" block at the end (one line each, the
   // SIGNAL-rule outcome unchanged) unless CANDIDATE_TELEGRAM_ENABLED is off.
@@ -820,6 +824,8 @@ export function formatDailyTelegram(doc, { candidates = true } = {}) {
   if (doc.series) {
     try { lines.push(...formatExitRuleLines(evaluateDayExitRules(doc))); } catch (e) { /* never blocks the message */ }
   }
+  // Override cost (measurement only): manual closes and logged outside trades vs the system.
+  try { lines.push(...formatOverrideLines(evaluateDayOverrides(doc, outside, { authed: true }))); } catch (e) { /* never blocks the message */ }
   if (candidates) {
     const cand = rowsOf(doc).filter((x) => x.ev.section === "CANDIDATE").sort((a, b) => (a.ev.t ?? 0) - (b.ev.t ?? 0));
     if (cand.length) {
@@ -984,7 +990,9 @@ export async function finaliseDay({ store, date, deps, env = process.env, future
     if (final) await store.set(keys.eodPending, { date, final }, 30 * 86400);
     await store.del(keys.finLock(date));
     if (deps.send && (await store.setNx(keys.tgDaily(date), 1, 3 * 86400))) {
-      const ok = await deps.send(formatDailyTelegram(doc, { candidates: isCandidateTelegramEnabled(env) }));
+      let outside = [];
+      try { outside = (await store.get(keys.outside(date))) || []; } catch (e) { outside = []; }
+      const ok = await deps.send(formatDailyTelegram(doc, { candidates: isCandidateTelegramEnabled(env), outside: Array.isArray(outside) ? outside : [] }));
       if (!ok) await store.del(keys.tgDaily(date));
     }
     return { status: "FINALISED", doc };

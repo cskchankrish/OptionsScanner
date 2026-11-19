@@ -6,6 +6,9 @@
  *                      and is never written or sent to Telegram.
  *   ?days=30           rolling aggregate per section (1–180), Wilson 95% intervals, "too few to judge"
  *   &format=csv        CSV of either
+ *   POST {action:"outside_trade", date, trade:{direction, entryTime, exitTime?, pnlInr, instrument?, note?}}
+ *        (authenticated) — logs a trade taken outside the system for the override-cost tracker;
+ *        {action:"outside_trade_delete", date, id} removes one.
  *   POST {action:"backfill", day:{...}} (authenticated) — writes one prepared backfilled day document
  *                      (produced by scripts/backfill-scorecard.mjs). Never automatic.
  *
@@ -22,6 +25,7 @@ import {
 import { getSessionKindForDate } from "../src/marketCalendar.js";
 import { planKeys } from "../src/planDocShadow.js";
 import { evaluateDayExitRules, aggregateExitRules } from "../src/exitRuleShadow.js";
+import { evaluateDayOverrides, aggregateOverrides, normaliseOutsideTrade } from "../src/overrideCost.js";
 
 async function defaultDeps() {
   const { redisRestCommand, scorecardSettings } = await import("./nifty-oi.js");
@@ -66,6 +70,21 @@ export function createScorecardHandler(overrides = {}) {
 
     if (req.method === "POST") {
       if (!authed) return res.status(401).json({ ok: false, error: "Unauthorized" });
+      if (body?.action === "outside_trade" || body?.action === "outside_trade_delete") {
+        if (!isoOk(body.date)) return res.status(400).json({ ok: false, error: "date must be YYYY-MM-DD" });
+        const got = await store.get(keys.outside(body.date));
+        const list = Array.isArray(got) ? got : [];
+        if (body.action === "outside_trade_delete") {
+          const next = list.filter((x) => x.id !== String(body.id || ""));
+          await store.set(keys.outside(body.date), next, SC_TTL_SEC);
+          return res.status(200).json({ ok: true, removed: list.length - next.length, trades: next });
+        }
+        const n = normaliseOutsideTrade(body.trade);
+        if (!n.ok) return res.status(400).json({ ok: false, error: n.error });
+        const next = [...list.filter((x) => x.id !== n.trade.id), n.trade].slice(-20);
+        await store.set(keys.outside(body.date), next, SC_TTL_SEC);
+        return res.status(200).json({ ok: true, logged: n.trade, trades: next });
+      }
       if (body?.action !== "backfill" || !body.day || !isoOk(body.day.date) || body.day.backfilled !== true) {
         return res.status(400).json({ ok: false, error: "expected { action: 'backfill', day: <document with backfilled: true> }" });
       }
@@ -141,7 +160,11 @@ export function createScorecardHandler(overrides = {}) {
       }
       // Exit-rule shadow: every position of the day replayed under rules A–E (measurement only).
       const exitRules = evaluateDayExitRules(view);
-      return res.status(200).json({ ok: true, authenticated: authed, ...light, exitRules, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
+      let outside = [];
+      try { outside = (await store.get(keys.outside(date))) || []; } catch (e) { outside = []; }
+      let overrides = null;
+      try { overrides = evaluateDayOverrides(authed ? doc : view, Array.isArray(outside) ? outside : [], { authed }); } catch (e) { overrides = null; }
+      return res.status(200).json({ ok: true, authenticated: authed, ...light, exitRules, overrides, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
     }
 
     // ── rolling aggregate ──
@@ -159,6 +182,12 @@ export function createScorecardHandler(overrides = {}) {
     const agg = aggregate(docs, { minSample: getScorecardConfig().minSample, includeTrades: authed });
     agg.days = n;
     agg.exitRules = aggregateExitRules(docs); // shadow: rules A–E replayed on every position
+    try {
+      const outs = await store.mget(docs.map((d) => keys.outside(d.date)));
+      agg.overrides = aggregateOverrides(docs.map((d, i) => evaluateDayOverrides(d, Array.isArray(outs?.[i]) ? outs[i] : [], { authed })));
+    } catch (e) {
+      agg.overrides = null;
+    }
     agg.datesWithData = docs.map((d) => ({ date: d.date, backfilled: Boolean(d.backfilled), coveragePct: d.dataQuality?.coveragePct ?? null }));
     if (csv) {
       res.setHeader("Content-Type", "text/csv");

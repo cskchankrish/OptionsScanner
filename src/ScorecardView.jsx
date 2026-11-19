@@ -8,6 +8,7 @@ import { isSessionLiveNow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 import { ExitRulesPanel } from "./ExitRulesPanel.jsx";
+import { OverrideCostPanel } from "./OverrideCostPanel.jsx";
 import { CarryCheckPanel } from "./CarryCheckPanel.jsx";
 
 const VARIANT_LABEL = { BEAR_TRAP_BASE: "Bear trap — current rule", BEAR_TRAP_STRICT: "Bear trap — tighter (shadow)", BULL_TRAP_BASE: "Bull trap — current rule", BULL_TRAP_STRICT: "Bull trap — tighter (shadow)" };
@@ -190,6 +191,8 @@ export function ScorecardView({ t, isDark }) {
           </tbody>
         </table>
       </div>
+
+      <OverrideCostPanel t={t} rolling={agg?.overrides} day={day?.overrides} />
 
       <ExitRulesPanel t={t} rolling={agg?.exitRules} dayRows={day?.exitRules} />
 

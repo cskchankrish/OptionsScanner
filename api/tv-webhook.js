@@ -2510,7 +2510,7 @@ export default async function handler(req, res) {
       }
       // Scorecard (measurement only): Algo-owned trade exit with the Algo's rupee result.
       if (algoOwned) {
-        await scRecord(redis, buildTradeEvent({ kind: "FLOW", tradeId: exitTrade.id, exitGrade: payload.grade, direction: exitTrade.direction, entry: exitTrade.entryPrice, exitPrice: fillPrice, pnlInr: algoPnl?.reported ? algoPnl.pnlInr : null, pnlKnown: algoPnl ? algoPnl.pnlKnown : null, accountsCount: algoPnl?.accounts?.length ?? null, nowMs: Date.now() }));
+        await scRecord(redis, buildTradeEvent({ kind: "FLOW", tradeId: exitTrade.id, exitGrade: payload.grade, direction: exitTrade.direction, entry: exitTrade.entryPrice, exitPrice: fillPrice, pnlInr: algoPnl?.reported ? algoPnl.pnlInr : null, pnlKnown: algoPnl ? algoPnl.pnlKnown : null, accountsCount: algoPnl?.accounts?.length ?? null, qty: algoPnl?.qty ?? null, closeReason: sync?.reason ?? null, nowMs: Date.now() }));
       }
       await sendTelegramExitAlert(exitRecord);
       await runExitWatchdog();
