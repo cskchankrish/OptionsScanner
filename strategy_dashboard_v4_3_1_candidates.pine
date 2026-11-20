@@ -1154,6 +1154,10 @@ bool hasBullTrap  = showTrapLbl and bullTrapSig
 bool hasBearTrap  = showTrapLbl and bearTrapSig
 bool hasBearSyn   = showTrapLbl and synergyBearTrigger
 bool hasBullSyn   = showTrapLbl and synergyBullTrigger
+// Clean higher-timeframe charts: the stand-alone BEAR TRAP and BEAR SYNERGY labels draw only below
+// 125m (15m, 5m, 1h ...). Hidden on 125m, Daily, Weekly and Monthly. Confluence labels are unchanged
+// and still appear on every timeframe. Labels only: signals, alerts and webhooks are not affected.
+bool lowTfLbl     = timeframe.in_seconds(timeframe.period) < 125 * 60
 
 int bearCount = (hasSwTop ? 1 : 0) + (hasBullTrap ? 1 : 0) + (hasBearSyn ? 1 : 0)
 int bullCount = (hasSwBot ? 1 : 0) + (hasBearTrap ? 1 : 0) + (hasBullSyn ? 1 : 0)
@@ -1174,7 +1178,7 @@ if bearCount > 0
              color=color.new(#b71c1c, 0), textcolor=color.white, size=effLblSize)
     else
         int bearIdx = 0
-        if hasBearSyn
+        if hasBearSyn and lowTfLbl
             float yPos = combineMultiLabels ? high : (high + (0.4 + 0.8 * bearIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
                  "⚡ BEAR SYNERGY (STBT)\nFut Short + Call Blitz\nSL: " + str.tostring(math.round(synbEffSL)) + " [Cap/R: " + str.tostring(math.round(synbRiskPts)) + "pt]",
@@ -1222,7 +1226,7 @@ if bullCount > 0
                  yloc=combineMultiLabels ? yloc.belowbar : yloc.price, style=label.style_label_up,
                  color=color.new(#2e7d32, 0), textcolor=color.white, size=effLblSize)
             bullIdx += 1
-        if hasBearTrap
+        if hasBearTrap and lowTfLbl
             float yPos = combineMultiLabels ? low : (low - (0.4 + 0.8 * bullIdx) * nz(atr14, close * 0.005))
             label.new(bar_index, yPos,
                  "🟢 BEAR TRAP · BUY (" + timeframe.period + ")\nSL: " + str.tostring(math.round(btrpEffSL)) + " [Cap/R: " + str.tostring(math.round(btrpRiskPts)) + "pt]\n" + bearTrapTag,

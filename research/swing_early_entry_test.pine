@@ -1,0 +1,405 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  Swing Early-Entry Test (honest intrabar) — research script, not for alerts
+//
+//  Question: can we enter INSIDE the forming 125m candle (before it closes) and
+//  keep the day low/high as the stop, capturing big moves earlier — honestly?
+//
+//  How it stays honest: the 125m candle is rebuilt from 5m bars on the chart.
+//  At every 5m close the swing engine (same rules as v4.3.1's
+//  f_structuralSwingEngine) is evaluated on the 125m candle AS IT STANDS
+//  NOW, as if it closed now. Nothing from later in the candle is visible.
+//  The engine's memory (setups, cooldowns, state) only advances when a
+//  125m candle really closes.
+//  Every early signal is traded, including the ones whose candle later fails to
+//  confirm — exactly what a live trader would face.
+//
+//  RUN ON: NSE:NIFTY, 5-minute chart (125 = 25 x 5m, so 125m candles rebuild exactly).
+//  Entry mode "Confirmed" fires only at the real 125m close: use it as the sanity
+//  check (18-Nov top 13:25, 19-Nov bottom 11:20 must match the live alerts).
+// ═══════════════════════════════════════════════════════════════════════════
+strategy("Swing Early-Entry Test", shorttitle="Swing Early BT", overlay=true, initial_capital=1000000,
+     default_qty_type=strategy.fixed, default_qty_value=1, slippage=40, commission_value=0, pyramiding=0,
+     max_bars_back=500)
+
+entryMode  = input.string("Early: forming 125m candle", "Entry mode", options=["Early: forming 125m candle", "Confirmed: 125m close only"])
+minMinutes = input.int(15, "Early: earliest check (minutes into the 125m candle)", minval=5, maxval=125, step=5)
+stopMode   = input.string("Day low / day high", "Initial stop", options=["Day low / day high", "Swing level ± buffer x 125m ATR"])
+stopBufPts = input.float(0.0, "Day-low/high stop: extra buffer (pts)", step=1.0)
+slAtrBuf   = input.float(0.35, "Swing-level stop: buffer (x 125m ATR)", step=0.05)
+abandonOn  = input.bool(false, "Exit at the 125m close if the swing did NOT confirm")
+reverseOn  = input.bool(true,  "Reverse on an opposite signal")
+longOn     = input.bool(true,  "Longs")
+shortOn    = input.bool(true,  "Shorts")
+exTag5     = input.bool(false, "Skip Tag 5 (plain base breakout)")
+exTag7     = input.bool(false, "Skip Tag 7 (flag continuation / trend pullback)")
+fromDate   = input.time(timestamp("2025-11-21T00:00:00"), "Trade from")
+
+// engine constants = v4.3.1 defaults (125m lookback 9, pivots 3/1, break bars 3, stretch 1.0,
+// wave 1.25, strict base ON, naked base breakout allowed, flag inversion ON, volume climax 1.35)
+LB      = 9
+BRK     = 3
+STRETCH = 1.0
+WAVE    = 1.25
+VOLM    = 1.35
+HIST    = 60
+
+type St
+    float e5        = na
+    float e13       = na
+    float e34       = na
+    float atr       = na
+    float rUp       = na
+    float rDn       = na
+    float pc        = na
+    int   n         = 0
+    float refLoP    = na
+    float refLoRsi  = na
+    int   refLoBar  = na
+    float refHiP    = na
+    float refHiRsi  = na
+    int   refHiBar  = na
+    int   botSetupBar = -999
+    float botSetupLo  = na
+    int   botSetupTag = 5
+    int   botSetupSc  = 3
+    int   topSetupBar = -999
+    float topSetupHi  = na
+    int   topSetupTag = 5
+    int   topSetupSc  = 3
+    int   bullFlagBar = -999
+    float bullFlagLo  = na
+    int   bearFlagBar = -999
+    float bearFlagHi  = na
+    int   sState      = 0
+    bool  contUsed    = false
+    float actBot      = na
+    float actTop      = na
+    int   lastSigBar  = -999
+    int   sTag        = 5
+    int   sScore      = 3
+
+// completed 125m candles (oldest first)
+var array<float> hA = array.new_float()
+var array<float> lA = array.new_float()
+var array<float> vA = array.new_float()
+var array<float> rA = array.new_float()
+
+f_maxLast(array<float> a, int k) =>
+    int sz = array.size(a)
+    float m = na
+    if k > 0 and sz > 0
+        for i = math.max(0, sz - k) to sz - 1
+            float x = array.get(a, i)
+            m := na(m) ? x : math.max(m, x)
+    m
+
+f_minLast(array<float> a, int k) =>
+    int sz = array.size(a)
+    float m = na
+    if k > 0 and sz > 0
+        for i = math.max(0, sz - k) to sz - 1
+            float x = array.get(a, i)
+            m := na(m) ? x : math.min(m, x)
+    m
+
+f_avgWith(array<float> a, int k, float cur) =>
+    int sz = array.size(a)
+    float s = cur
+    int cnt = 1
+    if k > 0 and sz > 0
+        for i = math.max(0, sz - k) to sz - 1
+            s += array.get(a, i)
+            cnt += 1
+    cnt >= 20 ? s / cnt : na
+
+f_push(array<float> a, float x) =>
+    array.push(a, x)
+    if array.size(a) > HIST
+        array.shift(a)
+
+// One 125m candle through the swing engine. s0 = engine memory after the last CLOSED candle.
+// Returns the memory as it would be if this candle closed now, plus fire flags.
+f_eval(St s0, float o, float h, float l, float c, float v) =>
+    St s = s0.copy()
+    int bi = s0.n
+    float e5  = na(s0.e5)  ? c : s0.e5  + (2.0 / 6.0)  * (c - s0.e5)
+    float e13 = na(s0.e13) ? c : s0.e13 + (2.0 / 14.0) * (c - s0.e13)
+    float e34 = na(s0.e34) ? c : s0.e34 + (2.0 / 35.0) * (c - s0.e34)
+    float tr  = na(s0.pc) ? h - l : math.max(h - l, math.abs(h - s0.pc), math.abs(l - s0.pc))
+    float atr = na(s0.atr) ? tr : s0.atr + (tr - s0.atr) / 14.0
+    float chg = na(s0.pc) ? 0.0 : c - s0.pc
+    float rUp = na(s0.rUp) ? math.max(chg, 0.0) : s0.rUp + (math.max(chg, 0.0) - s0.rUp) / 14.0
+    float rDn = na(s0.rDn) ? math.max(-chg, 0.0) : s0.rDn + (math.max(-chg, 0.0) - s0.rDn) / 14.0
+    float rsi = rDn == 0.0 ? 100.0 : rUp == 0.0 ? 0.0 : 100.0 - 100.0 / (1.0 + rUp / rDn)
+    s.e5  := e5
+    s.e13 := e13
+    s.e34 := e34
+    s.atr := atr
+    s.rUp := rUp
+    s.rDn := rDn
+    int sz = array.size(hA)
+    float prevLo = f_minLast(lA, LB)
+    float prevHi = f_maxLast(hA, LB)
+    float lo4 = math.min(l, nz(f_minLast(lA, 3), l))
+    float hi4 = math.max(h, nz(f_maxLast(hA, 3), h))
+    bool sfpBot = not na(prevLo) and l < prevLo and c > prevLo
+    bool sfpTop = not na(prevHi) and h > prevHi and c < prevHi
+    bool pivTop = sz >= 4 and array.get(hA, sz - 1) > array.get(hA, sz - 2) and array.get(hA, sz - 1) > array.get(hA, sz - 3) and array.get(hA, sz - 1) > array.get(hA, sz - 4) and array.get(hA, sz - 1) > h
+    bool pivBot = sz >= 4 and array.get(lA, sz - 1) < array.get(lA, sz - 2) and array.get(lA, sz - 1) < array.get(lA, sz - 3) and array.get(lA, sz - 1) < array.get(lA, sz - 4) and array.get(lA, sz - 1) < l
+    float waveDrop  = math.max(h, nz(f_maxLast(hA, LB - 1), h)) - lo4
+    float waveRally = hi4 - math.min(l, nz(f_minLast(lA, LB - 1), l))
+    bool dipToEma5 = math.min(l, nz(f_minLast(lA, 2), l)) <= e5
+    bool popToEma5 = math.max(h, nz(f_maxLast(hA, 2), h)) >= e5
+    bool baseBot = waveDrop  >= WAVE * atr and dipToEma5 and c > e5
+    bool baseTop = waveRally >= WAVE * atr and popToEma5 and c < e5
+    float lPrev = sz > 0 ? array.get(lA, sz - 1) : l
+    float hPrev = sz > 0 ? array.get(hA, sz - 1) : h
+    float candLo = (sfpBot or baseBot) ? math.min(l, lo4) : math.min(lPrev, lo4)
+    float candHi = (sfpTop or baseTop) ? math.max(h, hi4) : math.max(hPrev, hi4)
+    bool stretchBot = (e34 - candLo) >= STRETCH * atr or waveDrop  >= WAVE * atr
+    bool stretchTop = (candHi - e34) >= STRETCH * atr or waveRally >= WAVE * atr
+    bool divBot = not na(s0.refLoBar) and (bi - s0.refLoBar <= 36) and (bi > s0.refLoBar + 1) and (candLo <= s0.refLoP + 0.5 * atr) and (rsi > s0.refLoRsi + 1.5)
+    bool divTop = not na(s0.refHiBar) and (bi - s0.refHiBar <= 36) and (bi > s0.refHiBar + 1) and (candHi >= s0.refHiP - 0.5 * atr) and (rsi < s0.refHiRsi - 1.5)
+    if pivBot or l <= nz(prevLo, l)
+        s.refLoP   := candLo
+        s.refLoRsi := rsi
+        s.refLoBar := bi
+    if pivTop or h >= nz(prevHi, h)
+        s.refHiP   := candHi
+        s.refHiRsi := rsi
+        s.refHiBar := bi
+    float minRsi4 = math.min(rsi, nz(f_minLast(rA, 3), rsi))
+    float maxRsi4 = math.max(rsi, nz(f_maxLast(rA, 3), rsi))
+    bool rsiBotOk = divBot or (minRsi4 <= 42.0 and rsi > minRsi4 + 1.5)
+    bool rsiTopOk = divTop or (maxRsi4 >= 58.0 and rsi < maxRsi4 - 1.5)
+    float vSma = f_avgWith(vA, 19, v)
+    bool volClimax = not na(v) and v > 0 and not na(vSma) and vSma > 0 and v >= VOLM * vSma
+    bool validBaseBot = baseBot and (divBot or volClimax or (pivBot and c > e34))
+    bool validBaseTop = baseTop and (divTop or volClimax or (pivTop and c < e34))
+    bool validPivBot  = pivBot and (divBot or volClimax or minRsi4 <= 34.0 or c > e34)
+    bool validPivTop  = pivTop and (divTop or volClimax or maxRsi4 >= 66.0 or c < e34)
+    if (sfpBot or validPivBot or validBaseBot) and stretchBot and (rsiBotOk or sfpBot or volClimax)
+        s.botSetupLo  := candLo
+        s.botSetupBar := bi
+        s.botSetupTag := (sfpBot and divBot) ? 1 : sfpBot ? 2 : (baseBot and divBot) ? 3 : divBot ? 4 : (baseBot ? 5 : 6)
+        s.botSetupSc  := 2 + (divBot ? 1 : 0) + (sfpBot ? 1 : 0) + (pivBot ? 1 : 0) + (volClimax ? 1 : 0)
+    if (sfpTop or validPivTop or validBaseTop) and stretchTop and (rsiTopOk or sfpTop or volClimax)
+        s.topSetupHi  := candHi
+        s.topSetupBar := bi
+        s.topSetupTag := (sfpTop and divTop) ? 1 : sfpTop ? 2 : (baseTop and divTop) ? 3 : divTop ? 4 : (baseTop ? 5 : 6)
+        s.topSetupSc  := 2 + (divTop ? 1 : 0) + (sfpTop ? 1 : 0) + (pivTop ? 1 : 0) + (volClimax ? 1 : 0)
+    bool bearTrend = e13 < e34 and c <= e34 + 0.25 * atr
+    bool bullTrend = e13 > e34 and c >= e34 - 0.25 * atr
+    if bearTrend and baseBot and not divBot and not sfpBot
+        s.bearFlagBar := bi
+        s.bearFlagHi  := hi4
+    if bullTrend and baseTop and not divTop and not sfpTop
+        s.bullFlagBar := bi
+        s.bullFlagLo  := lo4
+    if bi - s.botSetupBar <= 4 and not na(s.botSetupLo) and l < s.botSetupLo - 0.15 * atr
+        s.botSetupBar := -999
+        s.botSetupLo  := na
+    if bi - s.topSetupBar <= 4 and not na(s.topSetupHi) and h > s.topSetupHi + 0.15 * atr
+        s.topSetupBar := -999
+        s.topSetupHi  := na
+    float structHi = f_maxLast(hA, BRK)
+    float structLo = f_minLast(lA, BRK)
+    float flagHi2  = f_maxLast(hA, 2)
+    float flagLo2  = f_minLast(lA, 2)
+    bool gateUp = c > e5 and c > e13
+    bool gateDn = c < e5 and c < e13
+    bool revUp  = bi - s.botSetupBar <= 4 and not na(s.botSetupLo) and gateUp and not na(structHi) and c > structHi and c > o
+    bool revDn  = bi - s.topSetupBar <= 4 and not na(s.topSetupHi) and gateDn and not na(structLo) and c < structLo and c < o
+    bool contUp = bi - s.bullFlagBar <= 4 and not na(s.bullFlagLo) and gateUp and c > e34 and not na(flagHi2) and c > flagHi2 and c > o
+    bool contDn = bi - s.bearFlagBar <= 4 and not na(s.bearFlagHi) and gateDn and c < e34 and not na(flagLo2) and c < flagLo2 and c < o
+    bool fireBot = false
+    bool fireTop = false
+    if s.sState == -1 and not na(s.actBot) and c < s.actBot - 0.25 * atr
+        s.sState   := 0
+        s.actBot   := na
+        s.contUsed := false
+    if s.sState == 1 and not na(s.actTop) and c > s.actTop + 0.25 * atr
+        s.sState   := 0
+        s.actTop   := na
+        s.contUsed := false
+    bool canBot = s.sState != -1 or (not s.contUsed and bi - s.lastSigBar >= 9)
+    bool canTop = s.sState != 1  or (not s.contUsed and bi - s.lastSigBar >= 9)
+    if (revUp or contUp) and canBot
+        fireBot       := true
+        s.actBot      := revUp ? s.botSetupLo : s.bullFlagLo
+        s.actTop      := na
+        s.contUsed    := s.sState == -1
+        s.sState      := -1
+        s.lastSigBar  := bi
+        s.sTag        := revUp ? s.botSetupTag : 7
+        s.sScore      := revUp ? math.min(5, s.botSetupSc + 1) : 4
+        s.botSetupBar := -999
+        s.bullFlagBar := -999
+    if (revDn or contDn) and canTop
+        fireTop       := true
+        s.actTop      := revDn ? s.topSetupHi : s.bearFlagHi
+        s.actBot      := na
+        s.contUsed    := s.sState == 1
+        s.sState      := 1
+        s.lastSigBar  := bi
+        s.sTag        := revDn ? s.topSetupTag : 7
+        s.sScore      := revDn ? math.min(5, s.topSetupSc + 1) : 4
+        s.topSetupBar := -999
+        s.bearFlagBar := -999
+    s.pc := c
+    s.n  := bi + 1
+    [s, fireBot, fireTop, rsi]
+
+// ── Rebuild the 125m candle from 5m bars (session 09:15-15:30 = 3 x 125m) ──
+var St st       = St.new()
+var St lastHypo = St.new()
+var float lastRsi = na
+var bool  pend    = false
+var int   curBucket = -1
+var int   bucketStart = na
+var float bo = na
+var float bh = na
+var float bl = na
+var float bv = na
+
+int barMins = int(timeframe.in_seconds() / 60)
+int sessMin = hour * 60 + minute - (9 * 60 + 15)
+bool inSess = sessMin >= 0 and sessMin < 375
+int bucket  = inSess ? int(sessMin / 125) : -1
+bool newDay = ta.change(time("D")) != 0
+bool startNew = inSess and (newDay or bucket != curBucket)
+
+if startNew and pend
+    // the previous candle ended without a regular close bar (short session): commit it as it stood
+    st := lastHypo
+    f_push(hA, bh)
+    f_push(lA, bl)
+    f_push(vA, bv)
+    f_push(rA, lastRsi)
+    pend := false
+
+if startNew
+    curBucket   := bucket
+    bucketStart := time
+    bo := open
+    bh := high
+    bl := low
+    bv := nz(volume)
+else if inSess
+    bh := math.max(bh, high)
+    bl := math.min(bl, low)
+    bv += nz(volume)
+
+int  minsInto     = inSess ? (sessMin % 125) + barMins : 0
+bool lastInBucket = inSess and (minsInto >= 125 or sessMin + barMins >= 375)
+
+bool  fb   = false
+bool  ft   = false
+St    hypo = st
+if inSess
+    [s1, f1, f2, r1] = f_eval(st, bo, bh, bl, close, bv)
+    hypo     := s1
+    fb       := f1
+    ft       := f2
+    lastHypo := s1
+    lastRsi  := r1
+    pend     := true
+
+// ── Signals ──
+bool early  = entryMode == "Early: forming 125m candle"
+bool warm   = st.n >= 40
+bool canChk = early ? minsInto >= minMinutes : lastInBucket
+var int firedLKey = na
+var int firedSKey = na
+bool sigL = inSess and warm and canChk and fb and (na(firedLKey) or firedLKey != bucketStart)
+bool sigS = inSess and warm and canChk and ft and (na(firedSKey) or firedSKey != bucketStart)
+if sigL
+    firedLKey := bucketStart
+if sigS
+    firedSKey := bucketStart
+int  sigTag = hypo.sTag
+bool tagOk  = not (exTag5 and sigTag == 5) and not (exTag7 and sigTag == 7)
+
+// ── Day low / high so far (known at this bar's close) ──
+var float dayLow  = na
+var float dayHigh = na
+if newDay
+    dayLow  := low
+    dayHigh := high
+else
+    dayLow  := math.min(nz(dayLow, low), low)
+    dayHigh := math.max(nz(dayHigh, high), high)
+
+// ── Trades ──
+var float stopL = na
+var float stopS = na
+var int   entKeyL = na
+var int   entKeyS = na
+var int   nEarlyL = 0
+var int   nEarlyS = 0
+var int   nFailL  = 0
+var int   nFailS  = 0
+bool isLong  = strategy.position_size > 0
+bool isShort = strategy.position_size < 0
+bool live    = time >= fromDate and barstate.isconfirmed
+
+if live and sigL
+    if isShort and not (reverseOn and longOn and tagOk)
+        strategy.close("S", comment="OPP_SIGNAL")
+    if longOn and tagOk and not isLong and (not isShort or reverseOn)
+        float sl = stopMode == "Day low / day high" ? dayLow - stopBufPts : nz(hypo.actBot, dayLow) - slAtrBuf * nz(hypo.atr, 0.0)
+        if sl < close
+            stopL   := sl
+            entKeyL := bucketStart
+            nEarlyL += 1
+            strategy.entry("L", strategy.long, comment="L_T" + str.tostring(sigTag) + "_m" + str.tostring(minsInto))
+if live and sigS
+    if isLong and not (reverseOn and shortOn and tagOk)
+        strategy.close("L", comment="OPP_SIGNAL")
+    if shortOn and tagOk and not isShort and (not isLong or reverseOn)
+        float sl = stopMode == "Day low / day high" ? dayHigh + stopBufPts : nz(hypo.actTop, dayHigh) + slAtrBuf * nz(hypo.atr, 0.0)
+        if sl > close
+            stopS   := sl
+            entKeyS := bucketStart
+            nEarlyS += 1
+            strategy.entry("S", strategy.short, comment="S_T" + str.tostring(sigTag) + "_m" + str.tostring(minsInto))
+
+// At the real 125m close: did the swing behind an early entry actually confirm?
+if live and lastInBucket
+    if strategy.position_size > 0 and not na(entKeyL) and entKeyL == bucketStart and not fb
+        nFailL += 1
+        if abandonOn
+            strategy.close("L", comment="NOT_CONFIRMED")
+    if strategy.position_size < 0 and not na(entKeyS) and entKeyS == bucketStart and not ft
+        nFailS += 1
+        if abandonOn
+            strategy.close("S", comment="NOT_CONFIRMED")
+
+strategy.exit("XL", from_entry="L", stop=stopL, comment_loss="STOP")
+strategy.exit("XS", from_entry="S", stop=stopS, comment_loss="STOP")
+
+// Commit the engine memory only when the 125m candle really closes
+if inSess and lastInBucket
+    st := hypo
+    f_push(hA, bh)
+    f_push(lA, bl)
+    f_push(vA, bv)
+    f_push(rA, lastRsi)
+    pend := false
+
+plot(strategy.position_size > 0 ? stopL : strategy.position_size < 0 ? stopS : na, "Stop", color=color.red, style=plot.style_linebr)
+plotshape(sigL, "Swing bottom signal", shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(sigS, "Swing top signal",    shape.triangledown, location.abovebar, color.new(color.red, 0),   size=size.tiny)
+plot(fb ? 1 : 0, "dbg fireBot (forming candle)", display=display.data_window)
+plot(ft ? 1 : 0, "dbg fireTop (forming candle)", display=display.data_window)
+plot(st.n, "dbg closed 125m candles", display=display.data_window)
+
+var table tb = table.new(position.bottom_right, 2, 5, bgcolor=color.new(color.black, 20))
+if barstate.islast
+    table.cell(tb, 0, 0, "Early longs / not confirmed",  text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 1, 0, str.tostring(nEarlyL) + " / " + str.tostring(nFailL), text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 0, 1, "Early shorts / not confirmed", text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 1, 1, str.tostring(nEarlyS) + " / " + str.tostring(nFailS), text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 0, 2, "Mode", text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 1, 2, entryMode, text_color=color.white, text_size=size.tiny)
