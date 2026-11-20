@@ -1,0 +1,63 @@
+name: Daily data archive
+
+# Copies every finished NIFTY session from the OptionsScanner API into this PRIVATE repo
+# (days/YYYY-MM/YYYY-MM-DD/ and latest/). Redis keeps the raw minute timeline only 14 days and the
+# scorecard 180 days; this archive keeps everything for as long as the repo exists.
+#
+# GitHub's scheduler delays or drops scheduled runs, so the job runs three times each weekday evening
+# plus Saturday morning, and every run back-fills any session from the last 12 days that is not
+# complete yet. One successful run inside 14 days loses nothing.
+#
+# Requires the repository secret ARCHIVE_SECRET (same value as the Vercel env var TV_WEBHOOK_SECRET).
+# It is sent only as the x-webhook-secret header.
+
+on:
+  schedule:
+    - cron: "23 10,12,15 * * 1-5" # 15:53, 17:53, 20:53 IST, Mon-Fri
+    - cron: "41 3 * * 6"          # 09:11 IST Saturday catch-up
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Archive one date only (YYYY-MM-DD), e.g. a Muhurat session; empty = last 12 days"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the export script (public OptionsScanner repo)
+        uses: actions/checkout@v4
+        with:
+          repository: cskchankrish/OptionsScanner
+          path: .scanner
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Export
+        env:
+          ARCHIVE_SECRET: ${{ secrets.ARCHIVE_SECRET }}
+          ONLY_DATE: ${{ github.event.inputs.date }}
+        run: |
+          if [ -z "$ARCHIVE_SECRET" ]; then echo "::error::Repository secret ARCHIVE_SECRET is not set"; exit 1; fi
+          if [ -n "$ONLY_DATE" ]; then
+            node .scanner/scripts/archive-export.mjs --out . --date "$ONLY_DATE"
+          else
+            node .scanner/scripts/archive-export.mjs --out . --days 12
+          fi
+      - name: Commit
+        run: |
+          rm -rf .scanner
+          git config user.name "archive-bot"
+          git config user.email "archive-bot@users.noreply.github.com"
+          git add -A days latest index.json
+          if git diff --cached --quiet; then echo "Nothing new."; exit 0; fi
+          git commit -m "archive: $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M') IST"
+          git push

@@ -4,6 +4,7 @@
  *                      session is over and nothing finalised it at 15:38). A date with no session
  *                      (closed weekend day, or no ticks and no events) returns 200 { noSession: true }
  *                      and is never written or sent to Telegram.
+ *   ?date=…&timeline=1 (authenticated) the raw per-minute timeline (Redis keeps it 14 days)
  *   ?days=30           rolling aggregate per section (1–180), Wilson 95% intervals, "too few to judge"
  *   &format=csv        CSV of either
  *   POST {action:"outside_trade", date, trade:{direction, entryTime, exitTime?, pnlInr, instrument?, note?}}
@@ -102,6 +103,13 @@ export function createScorecardHandler(overrides = {}) {
     if (req.query?.date !== undefined) {
       const date = String(req.query.date);
       if (!isoOk(date)) return res.status(400).json({ ok: false, error: "date must be YYYY-MM-DD" });
+      // Authenticated: the raw per-minute timeline (kept 14 days in Redis) for the cloud archive.
+      if (req.query?.timeline === "1") {
+        if (!authed) return res.status(401).json({ ok: false, error: "Unauthorized" });
+        let timeline = [];
+        try { timeline = (await deps.getTimeline(date)) || []; } catch (e) { timeline = []; }
+        return res.status(200).json({ ok: true, date, points: timeline.length, timeline });
+      }
       // No session on this date (closed weekend day, or nothing was ever recorded): a clear,
       // non-persisted answer instead of a fabricated 0% day; nothing written, no Telegram.
       const noSession = (reason) => {
