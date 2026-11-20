@@ -236,12 +236,18 @@ function getWebhookDeps() {
 // Fail safe: without a confirmed waitUntil the handler never acks early (an order dispatch must
 // never run in an instance that may be frozen once the response is sent).
 
-/** TV_ACK_DEADLINE_MS: default 2000, clamped to 500..2800; "0" disables the early ack. */
+/**
+ * TV_ACK_DEADLINE_MS: default 800, clamped to 500..2800; "0" disables the early ack.
+ * 800 (was 2000, 2026-11-20): the deadline is counted from handler start, so a cold-start boot and
+ * the network leg come on top of it; at 2000 alerts after an idle gap still exceeded TradingView's
+ * ~3s (10:00, 11:15, 13:25 on 20-Nov). TradingView ignores the response body, so acknowledging
+ * sooner loses nothing; the pipeline runs unchanged under waitUntil.
+ */
 export function getTvAckDeadlineMs(env = process.env) {
   const raw = env.TV_ACK_DEADLINE_MS;
-  if (raw === undefined || raw === null || String(raw).trim() === "") return 2000;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 800;
   const v = Number(raw);
-  if (!Number.isFinite(v)) return 2000;
+  if (!Number.isFinite(v)) return 800;
   if (v === 0) return 0;
   return Math.min(2800, Math.max(500, v));
 }
@@ -284,15 +290,22 @@ export async function resolveVercelWaitUntil() {
  * pipeline promise is registered with waitUntil, then 200 ACCEPTED_PROCESSING is sent; the
  * pipeline's own later write is swallowed (logged). Otherwise this is exactly `run(res)`.
  */
-export async function runWithAckDeadline({ res, run, requestStartMs, deadlineMs, getWaitUntil, buildAck = () => ({}) }) {
-  if (!(deadlineMs > 0) || typeof getWaitUntil !== "function") return run(res);
+export async function runWithAckDeadline({ res, run, requestStartMs, deadlineMs, getWaitUntil, buildAck = () => ({}), ackState = {} }) {
+  // ackState (diagnostics, persisted with the verdict): how TradingView was answered.
+  ackState.deadlineMs = deadlineMs;
+  if (!(deadlineMs > 0) || typeof getWaitUntil !== "function") { ackState.mode = "DEADLINE_OFF"; return run(res); }
   let waitUntil = null;
   try {
     waitUntil = await getWaitUntil();
   } catch (e) {
     waitUntil = null;
   }
-  if (typeof waitUntil !== "function") return run(res);
+  ackState.waitUntil = typeof waitUntil === "function";
+  if (typeof waitUntil !== "function") {
+    console.warn("[tv-webhook] no request-bound waitUntil: TradingView is answered only when the pipeline ends");
+    ackState.mode = "NO_WAITUNTIL";
+    return run(res);
+  }
 
   let acked = false;
   let responded = false;
@@ -309,6 +322,8 @@ export async function runWithAckDeadline({ res, run, requestStartMs, deadlineMs,
           return guarded;
         }
         responded = true;
+        ackState.mode = "DIRECT";
+        ackState.elapsedMs = Date.now() - requestStartMs;
         res.status(code);
         return res[method](body);
       };
@@ -336,6 +351,8 @@ export async function runWithAckDeadline({ res, run, requestStartMs, deadlineMs,
       }
       acked = true;
       const elapsedMs = Date.now() - requestStartMs;
+      ackState.mode = "EARLY";
+      ackState.elapsedMs = elapsedMs;
       let info = {};
       try { info = buildAck() || {}; } catch (e) { info = {}; }
       console.log(`[tv-webhook] early ack ACCEPTED_PROCESSING after ${elapsedMs}ms (grade=${info.grade ?? "?"}${info.tradeId ? `, tradeId=${info.tradeId}` : ""}); pipeline continues in background`);
@@ -2003,6 +2020,9 @@ export async function notifyCandidateVerdict({ redis, record, payload, istDate, 
   return out;
 }
 
+// First request served by this function instance (a cold start) — recorded with each verdict.
+let instanceServedRequest = false;
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -2013,6 +2033,8 @@ export default async function handler(req, res) {
   }
 
   const requestStartMs = Date.now();
+  const coldStart = !instanceServedRequest;
+  instanceServedRequest = true;
   const istDate = getIstDateString();
   const redis = getRedisClient();
 
@@ -2521,6 +2543,7 @@ export default async function handler(req, res) {
     // through `res` handed in here, which is the real response unless the TradingView ack deadline
     // applies (see runWithAckDeadline): then a response written after an early ack is swallowed.
     const ackInfo = { grade: payload.grade ?? null, tradeId: null };
+    const ackState = {};
     const runPipeline = async (res) => {
       try {
         // 2. Fetch Latest Real-Time 22-Strike Option Chain Snapshot from Upstash Redis.
@@ -2714,6 +2737,8 @@ export default async function handler(req, res) {
         }
 
         // 5. Persist Fused Signal to Upstash Redis (Daily List + Master Archive)
+        // Diagnostics: how TradingView was answered (mode NOT_YET = still inside the ack deadline).
+        fusedVerdict.tvAck = { mode: ackState.mode || "NOT_YET", elapsedMs: ackState.elapsedMs ?? null, deadlineMs: ackState.deadlineMs ?? null, waitUntil: ackState.waitUntil ?? null, coldStart, persistedAfterMs: Date.now() - requestStartMs };
         const signalKey = `nifty:tv:signals:${istDate}`;
         const archiveKey = "nifty:tv:signals:master_archive";
         if (redis) {
@@ -2781,6 +2806,7 @@ export default async function handler(req, res) {
       deadlineMs: getTvAckDeadlineMs(),
       getWaitUntil: getWebhookDeps().getWaitUntil,
       buildAck: () => ({ grade: ackInfo.grade, tradeId: ackInfo.tradeId }),
+      ackState,
     });
   } catch (err) {
     console.error("[tv-webhook] Error processing TradingView alert:", err);

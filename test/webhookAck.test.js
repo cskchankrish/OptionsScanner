@@ -182,10 +182,10 @@ async function capture(fn) {
 
 // ── Config ──
 
-test("TV_ACK_DEADLINE_MS: default 2000, clamped 500..2800, 0 disables", () => {
-  assert.equal(webhook.getTvAckDeadlineMs({}), 2000);
-  assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "" }), 2000);
-  assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "abc" }), 2000);
+test("TV_ACK_DEADLINE_MS: default 800, clamped 500..2800, 0 disables", () => {
+  assert.equal(webhook.getTvAckDeadlineMs({}), 800);
+  assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "" }), 800);
+  assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "abc" }), 800);
   assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "0" }), 0);
   assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "100" }), 500);
   assert.equal(webhook.getTvAckDeadlineMs({ TV_ACK_DEADLINE_MS: "1500" }), 1500);
@@ -410,4 +410,29 @@ test("runWithAckDeadline: a raw rejection after the ack is logged and swallowed;
     /early failure/,
   );
   assert.equal(res.writes, 0, "no ack for a pipeline that failed before the deadline");
+});
+
+test("ack diagnostics: EARLY / DIRECT / NO_WAITUNTIL are recorded in ackState", async () => {
+  const mkRes = () => ({ code: null, body: null, headersSent: false, writableEnded: false, setHeader() { return this; }, status(c) { this.code = c; return this; }, json(b) { this.body = b; this.writableEnded = true; return this; } });
+  const registered = [];
+  const getWaitUntil = async () => (p) => registered.push(p);
+
+  const early = {};
+  const r1 = mkRes();
+  await webhook.runWithAckDeadline({ res: r1, requestStartMs: Date.now(), deadlineMs: 30, getWaitUntil, ackState: early,
+    run: async (res) => { await sleep(120); return res.status(200).json({ decision: "LATE" }); } });
+  assert.equal(early.mode, "EARLY");
+  assert.ok(early.elapsedMs >= 25 && early.elapsedMs < 120, String(early.elapsedMs));
+  assert.equal(early.waitUntil, true);
+  assert.equal(r1.body.status, "ACCEPTED_PROCESSING");
+  await Promise.all(registered);
+
+  const direct = {};
+  await webhook.runWithAckDeadline({ res: mkRes(), requestStartMs: Date.now(), deadlineMs: 500, getWaitUntil, ackState: direct, run: async (res) => res.status(200).json({ ok: true }) });
+  assert.equal(direct.mode, "DIRECT");
+
+  const none = {};
+  await webhook.runWithAckDeadline({ res: mkRes(), requestStartMs: Date.now(), deadlineMs: 500, getWaitUntil: async () => null, ackState: none, run: async (res) => res.status(200).json({ ok: true }) });
+  assert.equal(none.mode, "NO_WAITUNTIL");
+  assert.equal(none.waitUntil, false);
 });
