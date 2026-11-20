@@ -122,3 +122,18 @@ test("isSessionLiveNow: ordinary weekend closed; Muhurat 2026-11-08 live 14:00-1
   assert.equal(isSessionLiveNow(ist(muhurat, "16:00")), true);
   assert.equal(isSessionLiveNow(ist(muhurat, "16:01")), false);
 });
+
+// Regression (20-Nov-2026): useAutoRefresh never refreshes on mount — its first scheduled run is one
+// interval later — so a component that relies on it alone shows "Loading…" until then (the Weekly
+// Outlook card waited up to 5 minutes). Every component using the hook must load once itself.
+test("every component using useAutoRefresh does its own first load (refreshNow on mount)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const dir = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "src");
+  const users = fs.readdirSync(dir).filter((f) => f.endsWith(".jsx")).filter((f) => /useAutoRefresh\(/.test(fs.readFileSync(path.join(dir, f), "utf8")));
+  assert.ok(users.includes("WeeklyOutlookCard.jsx"));
+  for (const f of users) {
+    const src = fs.readFileSync(path.join(dir, f), "utf8");
+    assert.match(src, /\.refreshNow\(/, `${f} uses useAutoRefresh but never calls refreshNow for its first load`);
+  }
+});

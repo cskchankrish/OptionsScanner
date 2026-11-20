@@ -4,7 +4,7 @@
  * src/weeklyOutlook.js, docs/weekly-outlook.md). Renders with zero days, partial days only, or a
  * failed fetch.
  */
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 
 const REGIME_STYLE = {
@@ -94,7 +94,14 @@ export function WeeklyOutlookCard({ t, isDark, isMobile }) {
       return { ok: false, error: e?.message || String(e) };
     }
   }, []);
-  useAutoRefresh({ refresh, intervalSec: 300, enabled: true, finalRefreshDelayMs: null });
+  const auto = useAutoRefresh({ refresh, intervalSec: 300, enabled: true, finalRefreshDelayMs: null });
+  // The hook never refreshes on mount (its first scheduled run is one interval later), so load once
+  // here, through the hook so its schedule starts from this load. Without this the card sat on
+  // "Loading…" for up to 5 minutes (until a tab switch or focus happened to trigger a refresh).
+  useEffect(() => {
+    auto.refreshNow().then((r) => { if (r?.skipped) refresh(); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const o = data?.outlook || null;
   const st = REGIME_STYLE[o?.regime] || REGIME_STYLE.INSUFFICIENT_DATA;
