@@ -23,6 +23,9 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 export const RAW_TIMELINE_DAYS = 14;
+// First scorecard day. Never read earlier dates: GET /api/scorecard?date=… lazily FINALISES a day that
+// has a timeline but no scorecard document (writing it and sending its daily Telegram).
+export const ARCHIVE_SINCE = "2026-11-11";
 const IST_MS = 5.5 * 3600e3;
 const READY_MINS = 15 * 60 + 50; // today's session is archived only after 15:50 IST (finalised at 15:38)
 
@@ -33,12 +36,13 @@ const shift = (iso, n) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86400e3)
 const ageDays = (iso, nowMs) => Math.round((Date.parse(`${istDate(nowMs)}T00:00:00Z`) - Date.parse(`${iso}T00:00:00Z`)) / 86400e3);
 
 /** Weekday dates to consider, newest first; today only once the session has been finalised. */
-export function exportDates({ nowMs, days = 12 }) {
+export function exportDates({ nowMs, days = 12, since = ARCHIVE_SINCE }) {
   const today = istDate(nowMs);
   const out = [];
   for (let i = 0; i < days; i++) {
     const d = shift(today, -i);
     if (i === 0 && istMins(nowMs) < READY_MINS) continue;
+    if (d < since) break;
     if (dow(d) === 0 || dow(d) === 6) continue; // a Muhurat weekend session is archived with --date
     out.push(d);
   }
@@ -108,6 +112,7 @@ export async function runExport({ out, base, secret, nowMs = Date.now(), days = 
   const swing = await get("/api/swing?days=60");
   const swingDays = Array.isArray(swing?.days) ? swing.days : [];
   const results = {};
+  if (only && only < ARCHIVE_SINCE) throw new Error(`--date before ${ARCHIVE_SINCE} (the first scorecard day) is refused`);
   for (const date of only ? [only] : exportDates({ nowMs, days })) {
     results[date] = await exportDay({ out, date, get, nowMs, swingDays });
     log(`${date}: ${results[date]}`);

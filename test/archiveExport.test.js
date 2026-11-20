@@ -18,6 +18,7 @@ test("dates: weekends skipped; today only after 15:50 IST", () => {
   assert.deepEqual(exportDates({ nowMs: at("2026-11-20", 12, 0), days: 5 }), ["2026-11-19", "2026-11-18", "2026-11-17", "2026-11-16"]);
   assert.deepEqual(exportDates({ nowMs: at("2026-11-20", 16, 0), days: 5 }), ["2026-11-20", "2026-11-19", "2026-11-18", "2026-11-17", "2026-11-16"]);
   assert.deepEqual(exportDates({ nowMs: at("2026-11-23", 9, 0), days: 4 }), ["2026-11-20"], "Monday morning: Friday, weekend skipped");
+  assert.deepEqual(exportDates({ nowMs: at("2026-11-20", 12, 0), days: 12 }).at(-1), "2026-11-11", "never before the first scorecard day (a read would finalise it)");
 });
 
 function fakeApi({ finalised = true, noSession = false, points = 3, authed = true } = {}) {
