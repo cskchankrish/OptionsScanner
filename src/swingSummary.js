@@ -20,7 +20,8 @@ import { getSetupConfig } from "./outlookSetups.js";
 
 export const SWING_SUMMARY_VERSION = 1;
 export const SWING_CAPTURE_END_MINS = 940; // 15:40 IST, last F&O minute
-export const SWING_PARTIAL_COVERAGE_PCT = 50; // a captured day below this tick coverage is partial
+export const SWING_PARTIAL_COVERAGE_PCT = 50;
+export const FUT_CLOSE_MINS = 930; // 15:30 IST: futures close = last tick at or before it // a captured day below this tick coverage is partial
 // With at least this many live ticks (isLiveTick !== false), OHLC/OI use live ticks only, so
 // gap-bridging (interpolated) ticks synced back by a browser cannot set a high or low.
 export const SWING_MIN_LIVE_TICKS = 30;
@@ -279,7 +280,9 @@ function ohlcFromTicks(ticks, notes) {
       open: r2(Number(src[0].futPrice)),
       high: r2(Math.max(...src.map((p) => Number(p.futPrice)))),
       low: r2(Math.min(...src.map((p) => Number(p.futPrice)))),
-      close: r2(Number(futAll[futAll.length - 1].futPrice)),
+      // last tick up to 15:30 IST (audit 21-Nov-2026: the 15:31–15:40 ticks drifted up to 22 pts
+      // from the session close, e.g. 16-Nov 25312.4 at 15:37 vs 25290.9 at 15:30)
+      close: r2(Number((futAll.filter((p) => Number(p.minutes) <= FUT_CLOSE_MINS).at(-1) || futAll[futAll.length - 1]).futPrice)),
       oiOpen,
       oiClose,
       oiChangePct: oiOpen > 0 && oiClose > 0 ? r2(((oiClose - oiOpen) / oiOpen) * 100) : null,

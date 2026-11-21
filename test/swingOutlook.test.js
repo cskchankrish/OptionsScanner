@@ -172,7 +172,7 @@ test("buildDailySummary: OHLC from real ticks; synthetic and frozen ticks exclud
   assert.equal(s.fut.open, 25050);
   assert.equal(s.fut.high, 25230);
   assert.equal(s.fut.low, 24920);
-  assert.equal(s.fut.close, 25120);
+  assert.equal(s.fut.close, 25110, "last tick at or before 15:30 (the 15:36 tick is after the close)");
   assert.equal(s.fut.oiOpen, 200000);
   assert.equal(s.fut.oiClose, 204000);
   assert.equal(s.fut.oiChangePct, 2);
@@ -281,7 +281,7 @@ test("summaryFromScorecardDoc: partial OHLC from the series, frozen minutes skip
   assert.deepEqual(s.spot, { open: 25300, high: 25400, low: 25300, close: 25350 });
   assert.equal(s.fut.open, 25320);
   assert.equal(s.fut.high, 25420);
-  assert.equal(s.fut.close, 25370);
+  assert.equal(s.fut.close, 25390, "last tick at or before 15:30");
   assert.equal(s.fut.oiOpen, 211000);
   assert.equal(s.fut.oiClose, 214000);
   assert.deepEqual(s.chains, { near: null, nextWeekly: null, monthly: null });

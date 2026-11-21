@@ -36,6 +36,7 @@ const num = (v, d) => {
 
 export function getOutlookConfig(env = process.env) {
   const e = env || {};
+  setExchangeHolidays(e.SWING_EXCHANGE_HOLIDAYS || []);
   return {
     minDaysForRegime: Math.round(num(e.SWING_MIN_DAYS_FOR_REGIME, 3)),
     priceMinDays: Math.round(num(e.SWING_PRICE_MIN_DAYS, 5)),
@@ -44,6 +45,7 @@ export function getOutlookConfig(env = process.env) {
     futuresLookbackDays: Math.round(num(e.SWING_FUTURES_LOOKBACK_DAYS, 5)),
     futPriceDeadbandPct: num(e.SWING_FUT_PRICE_DEADBAND_PCT, PRICE_DEADBAND_PCT),
     futOiDeadbandPct: num(e.SWING_FUT_OI_DEADBAND_PCT, OI_DEADBAND_PCT),
+    futRollBasisPct: num(e.SWING_FUT_ROLL_BASIS_PCT, 0.35),
     pcrSupportive: num(e.SWING_PCR_SUPPORTIVE, 1.2),
     pcrResistive: num(e.SWING_PCR_RESISTIVE, 0.8),
     volMinDays: Math.round(num(e.SWING_VOL_MIN_DAYS, 3)),
@@ -93,9 +95,26 @@ const shift = (iso, days) => new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86
 const mondayOf = (iso) => shift(iso, -((dowOf(iso) + 6) % 7));
 
 /**
- * Trading sessions strictly after fromIso up to and including toIso (weekdays and Muhurat dates;
- * exchange holidays are not modelled, see src/marketCalendar.js), and the closed calendar days in
- * between. null when either date is unusable or toIso is more than 400 days away.
+ * NSE trading holidays that fall on weekdays, used ONLY to count sessions to an expiry (the live
+ * session logic in src/marketCalendar.js is unchanged). Audit 21-Nov-2026: Tue 24-Nov-2026 (Guru
+ * Nanak Jayanti; the weekly expiry moved to Mon 23-Nov) was counted as a session, so 7 sessions
+ * were shown to 01-Dec instead of 6. Defaults are dates NSE closes every year or whose expiry
+ * shift confirms them; add more with SWING_EXCHANGE_HOLIDAYS (comma-separated YYYY-MM-DD).
+ */
+export const DEFAULT_EXCHANGE_HOLIDAYS = Object.freeze(["2026-11-24", "2026-12-25", "2027-01-26"]);
+let exchangeHolidays = new Set(DEFAULT_EXCHANGE_HOLIDAYS);
+/** Replaces the holiday list (defaults + the given dates). Returns the list in use. */
+export function setExchangeHolidays(extra = []) {
+  const ok = (Array.isArray(extra) ? extra : String(extra || "").split(",")).map((x) => String(x).trim()).filter((x) => /^\d{4}-\d{2}-\d{2}$/.test(x));
+  exchangeHolidays = new Set([...DEFAULT_EXCHANGE_HOLIDAYS, ...ok]);
+  return [...exchangeHolidays].sort();
+}
+const isSessionDate = (iso) => !exchangeHolidays.has(iso) && getSessionKindForDate(iso) !== "CLOSED";
+
+/**
+ * Trading sessions strictly after fromIso up to and including toIso (weekdays and Muhurat dates,
+ * minus the exchange holidays above), and the closed calendar days in between. null when either
+ * date is unusable or toIso is more than 400 days away.
  */
 export function sessionsBetween(fromIso, toIso) {
   const re = /^\d{4}-\d{2}-\d{2}$/;
@@ -104,7 +123,7 @@ export function sessionsBetween(fromIso, toIso) {
   if (!Number.isFinite(span) || span > 400) return null;
   if (span <= 0) return { sessions: 0, closedDays: 0, calendarDays: Math.max(0, span) };
   let sessions = 0;
-  for (let i = 1; i <= span; i++) if (getSessionKindForDate(shift(fromIso, i)) !== "CLOSED") sessions += 1;
+  for (let i = 1; i <= span; i++) if (isSessionDate(shift(fromIso, i))) sessions += 1;
   return { sessions, closedDays: span - sessions, calendarDays: span };
 }
 
@@ -211,7 +230,20 @@ function futuresGroup(ds, cfg) {
   const win = bars.slice(-cfg.futuresLookbackDays);
   const a = win[0];
   const b = win[win.length - 1];
-  const pricePct = ((Number(b.fut.close) - Number(a.fut.close)) / Number(a.fut.close)) * 100;
+  // Contract roll inside the window (audit 21-Nov-2026: the November contract expires 23-Nov; the
+  // December one trades ~0.6% higher, a fake rise big enough to flip the quadrant). Detected by a
+  // change of the recorded contract expiry, or — when the expiry is not recorded — by a jump of the
+  // futures basis (fut − spot) of at least SWING_FUT_ROLL_BASIS_PCT (0.35% of spot). On a roll the
+  // price leg uses the SPOT change; open interest is near + next month combined, so roll-safe.
+  const basisPct = (d) => (Number(d.spot?.close) > 0 ? ((Number(d.fut.close) - Number(d.spot.close)) / Number(d.spot.close)) * 100 : null);
+  const expiryRolled = Boolean(a.fut.expiry && b.fut.expiry && a.fut.expiry !== b.fut.expiry);
+  const ba = basisPct(a), bb = basisPct(b);
+  const basisJump = !(a.fut.expiry && b.fut.expiry) && ba !== null && bb !== null && Math.abs(bb - ba) >= cfg.futRollBasisPct;
+  const rolled = expiryRolled || basisJump;
+  const spotOk = Number(a.spot?.close) > 0 && Number(b.spot?.close) > 0;
+  const pricePct = rolled && spotOk
+    ? ((Number(b.spot.close) - Number(a.spot.close)) / Number(a.spot.close)) * 100
+    : ((Number(b.fut.close) - Number(a.fut.close)) / Number(a.fut.close)) * 100;
   const oiPct = ((Number(b.fut.oiClose) - Number(a.fut.oiClose)) / Number(a.fut.oiClose)) * 100;
   let quadrant = "NEUTRAL";
   let score = 0;
@@ -221,12 +253,13 @@ function futuresGroup(ds, cfg) {
   else if (pricePct > 0 && oiPct < 0) { quadrant = "SHORT_COVERING"; score = 1; }
   else { quadrant = "LONG_UNWINDING"; score = -1; }
   const label = { NEUTRAL: "no clear build-up (inside the deadbands)", LONG_BUILDUP: "long build-up", SHORT_BUILDUP: "short build-up", SHORT_COVERING: "short covering", LONG_UNWINDING: "long unwinding" }[quadrant];
-  g.reasons.push(`From ${a.date} to ${b.date} (${plural(win.length, "session")}) futures moved ${pct(pricePct)} with open interest ${pct(oiPct)}: ${label}.`);
-  const rolled = a.fut.expiry && b.fut.expiry && a.fut.expiry !== b.fut.expiry;
-  if (rolled) g.reasons.push(`The futures contract changed (${a.fut.expiry} → ${b.fut.expiry}); the price change spans two contracts.`);
+  g.reasons.push(`From the ${a.date} close to the ${b.date} close (${plural(win.length, "session")} recorded) ${rolled && spotOk ? "price (spot, contract rolled)" : "futures"} moved ${pct(pricePct)} with open interest ${pct(oiPct)}: ${label}.`);
+  if (rolled) g.reasons.push(expiryRolled
+    ? `The futures contract changed (${a.fut.expiry} → ${b.fut.expiry}); ${spotOk ? "the price change is measured on spot" : "no spot close to measure on, so the price change spans two contracts"}.`
+    : `The futures basis jumped ${ba.toFixed(2)}% → ${bb.toFixed(2)}% of spot (a contract roll); the price change is measured on spot.`);
   g.available = true;
   g.score = score;
-  g.inputs = { bars: bars.length, from: a.date, to: b.date, sessions: win.length, closeFrom: a.fut.close, closeTo: b.fut.close, oiFrom: a.fut.oiClose, oiTo: b.fut.oiClose, pricePct: r2(pricePct), oiPct: r2(oiPct), priceDeadbandPct: cfg.futPriceDeadbandPct, oiDeadbandPct: cfg.futOiDeadbandPct, quadrant, contractRolled: Boolean(rolled) };
+  g.inputs = { bars: bars.length, from: a.date, to: b.date, sessions: win.length, closeFrom: a.fut.close, closeTo: b.fut.close, oiFrom: a.fut.oiClose, oiTo: b.fut.oiClose, pricePct: r2(pricePct), oiPct: r2(oiPct), priceDeadbandPct: cfg.futPriceDeadbandPct, oiDeadbandPct: cfg.futOiDeadbandPct, quadrant, contractRolled: Boolean(rolled), rollDetectedBy: expiryRolled ? "expiry" : basisJump ? "basis" : null, priceLeg: rolled && spotOk ? "spot" : "futures", basisPctFrom: ba === null ? null : r2(ba), basisPctTo: bb === null ? null : r2(bb) };
   return g;
 }
 
@@ -445,13 +478,24 @@ function buildLadder({ side, close, prevDay, swing, profile, nearWall, expectedR
     const nearer = side === "above" ? Math.min(profile.poc, profile.vwap) : Math.max(profile.poc, profile.vwap);
     const pickV = before2(far) ? far : before2(nearer) ? nearer : null;
     if (pickV !== null) {
+      // only the level actually used is a component (audit 21-Nov-2026: the POC 25225, beyond step 2,
+      // was listed inside the warning at 25403); the other is named as skipped
+      const used = comps.filter((c) => Number(c.value) === Number(pickV));
+      const skipped = comps.filter((c) => Number(c.value) !== Number(pickV));
+      const usedComps = used.length ? used : comps;
+      // only when the FAR level was skipped is it "beyond" the next step; when the far level is the
+      // warning, the nearer one simply sits between the close and it (review 21-Nov-2026)
+      const skipTxt = used.length && skipped.length && Number(far) !== Number(nearer) && Number(pickV) === Number(nearer)
+        ? `; ${skipped.map(fmtC).join(", ")} lies beyond step ${s2pre?.key === "FLIPPED" ? 3 : 2}`
+        : "";
       warning = {
         key: "WARNING",
         value: r2(pickV),
         zone: { low: r2(Math.min(profile.poc, profile.vwap)), high: r2(Math.max(profile.poc, profile.vwap)) },
-        components: comps,
+        components: usedComps,
+        skipped: skipTxt ? skipped : [],
         status: "NOT_REACHED",
-        basis: `a daily close ${side} the volume centre ${f0(pickV)} (${comps.map(fmtC).join(", ")})`,
+        basis: `a daily close ${side} the volume centre ${f0(pickV)} (${usedComps.map(fmtC).join(", ")}${skipTxt})`,
       };
       // A zone that straddles step 2 would be breached (far edge) only after step 2: clip it to the level.
       if (s2pre) warning.zone = { low: r2(pickV), high: r2(pickV) };

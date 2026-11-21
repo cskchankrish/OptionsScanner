@@ -143,6 +143,7 @@ function SetupsBlock({ setups, tally, t, isMobile, isDark }) {
             {" · "}T1 <strong style={{ fontFamily: "monospace" }}>{n0l(s.target?.value)}</strong>{s.target ? <span style={{ color: t.textMuted }}> ({s.target.note})</span> : null}
             {s.target2 ? <> · T2 <strong style={{ fontFamily: "monospace" }}>{n0l(s.target2.value)}</strong> <span style={{ color: t.textMuted }}>({s.target2.note})</span></> : null}
             {" · "}reward:risk <strong style={{ color: s.rrOk ? "#16a34a" : "#d97706" }}>{s.rr ?? "—"}</strong>
+            {Number.isFinite(Number(s.rewardPts)) && Number.isFinite(Number(s.riskPts)) ? <span style={{ color: t.textMuted }}> ({n0l(s.rewardPts)} pts reward / {n0l(s.riskPts)} pts risk from {s.status === "IN_ZONE" ? "the close" : "the zone edge"} {n0l(s.entrySpot)})</span> : null}
           </div>
         )}
         {s.zoneComponents?.length > 0 && (
@@ -275,6 +276,7 @@ export function WeeklyOutlookCard({ t, isDark, isMobile }) {
         <span><strong>As of:</strong> {o.asOf || "—"} · {o.daysUsed} session{o.daysUsed === 1 ? "" : "s"} used{o.partialDays?.length ? ` (${o.partialDays.length} partial)` : ""}</span>
         <span>
           <strong>Past outlooks:</strong> {tally.hits}/{tally.n} hit{tally.pending ? `, ${tally.pending} pending` : ""}
+          {(() => { const r = (data.pastOutlooks || []).filter((p) => p.recomputed).length; return r ? ` · ${r} older snapshot${r === 1 ? "" : "s"} recomputed with the current rules` : ""; })()}
           {regimeTally.length ? ` · ${regimeTally.join(" · ")}` : ""}
         </span>
       </div>

@@ -122,7 +122,30 @@ Found by checking the 20-Nov-2026 card against TradingView and India VIX:
 | Volume reference | only inside the warning step | always kept (`levels.ladder.volumeReference`): "5-session volume point of control … · 5-session volume-weighted average …", the value area and the close's distance from the VWAP |
 | Spot high / low | minute ticks only: they miss intra-minute extremes (20-Nov low recorded 25368 = the open; NSE low 25345.2; 19-Nov 25120.45 vs 25104.8) | the capture also reads NSE's index list (`/api/allIndices`, NIFTY 50 open / high / low, `SWING_INDEX_QUOTE`, 2.5 s timeout) and uses it when it agrees with the ticks (high ≥ tick high − 1, low ≤ tick low + 1, open and last inside its own range, last within 0.5% of the tick close; the capture leaves 1.5 s for its writes, `SWING_QUOTE_WRITE_RESERVE_MS`); otherwise the ticks stay and a note says why. `spot.source` and `spot.ticks` record which was used |
 
-Summaries recorded before this change keep their tick-based highs and lows.
+Summaries recorded before this change keep their tick-based highs and lows, except where corrected by
+`scripts/fix-swing-day-spot.mjs` (16–20 Nov 2026 stored; 11–13 Nov 2026 derived days stored from the
+scorecard with the NSE daily bar; `spot.source: "manual-nse-correction"`, originals in `spot.ticks`).
+
+## End-to-end audit of 21-Nov-2026
+
+An independent recompute of every number against NSE daily bars, TradingView option closes and the
+archived minute series (5 slices, 150+ checks, each mismatch adversarially verified). Confirmed and fixed:
+
+| What | Before | Now |
+|---|---|---|
+| Sessions to expiry | exchange holidays not modelled: 7 sessions + 4 closed days to 01-Dec | weekday NSE holidays (`DEFAULT_EXCHANGE_HOLIDAYS` 24-Nov-2026, 25-Dec-2026, 26-Jan-2027, plus `SWING_EXCHANGE_HOLIDAYS`) are closed days for session counting only (the live session logic is unchanged): 6 + 5, T 7.25 |
+| Futures contract roll | only a note; the price change spanned two contracts (December trades ~0.6% above an expiring November) | a roll is detected by a change of the recorded contract expiry or, when not recorded, a basis (fut − spot) jump ≥ 0.35% of spot (`SWING_FUT_ROLL_BASIS_PCT`); the price leg then uses the spot change. OI is near + next month combined, so roll-safe |
+| Futures close | the last captured tick (up to 15:40: drifted up to 22 pts) | the last tick at or before 15:30 IST |
+| Past outlooks | v1 snapshots scored as stored (20-Nov: TREND_UP into a one-session chain, tick lows) | snapshots with an older `v` are recomputed with the current rules from the recorded days up to their own date (no later data); `recomputed: true` and the stored regime / headline are kept in `stored` |
+| Ladder warning text | listed both POC and VWAP although only one was the level | lists the level used; a skipped one is named as lying beyond the next step |
+| Setup stop text | the half-straddle fallback had no number | states the level; the card also prints reward and risk in points and the entry they are measured from |
+
+Checked and correct: price group, weekly pivot, previous day / week levels, expected range (spot ±
+straddle; the 01-Dec straddle 516.15 vs TradingView closes 514.60), options group, score, regime,
+confidence, headline, ladder steps, tolerance, 5-session volume profile (VWAP within 0.5 pt of a
+recompute from the raw series), setups and the tally. Known limits: the straddle and walls are a
+15:35–15:40 snapshot, not NSE's closing prices; futures highs / lows remain minute-snapshot extremes
+(not used by the outlook); `fut.oiChangePct` is open-to-close within the day (not used by the outlook).
 
 **Load time.** The card used to mount only after `/api/nifty-oi` returned (it sits inside the EOD
 section, and the page shows a loading screen until the live chain arrives), and only then started

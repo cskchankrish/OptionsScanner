@@ -11,7 +11,9 @@ const SCFG = getSetupConfig({});
 // ── trading sessions to expiry ─────────────────────────────────────────────────────────────────
 test("sessionsBetween counts weekday sessions after the recorded day, and the closed days", () => {
   assert.deepEqual(sessionsBetween("2026-11-20", "2026-11-23"), { sessions: 1, closedDays: 2, calendarDays: 3 }, "Fri → Mon");
-  assert.deepEqual(sessionsBetween("2026-11-20", "2026-12-01"), { sessions: 7, closedDays: 4, calendarDays: 11 });
+  // Tue 24-Nov-2026 is an NSE holiday (Guru Nanak Jayanti; that week's expiry moved to Mon 23-Nov)
+  assert.deepEqual(sessionsBetween("2026-11-20", "2026-12-01"), { sessions: 6, closedDays: 5, calendarDays: 11 });
+  assert.deepEqual(sessionsBetween("2026-12-24", "2026-12-28"), { sessions: 1, closedDays: 3, calendarDays: 4 }, "25-Dec closed");
   assert.deepEqual(sessionsBetween("2026-11-23", "2026-11-23"), { sessions: 0, closedDays: 0, calendarDays: 0 });
   assert.equal(sessionsBetween("bad", "2026-11-23"), null);
   assert.equal(sessionsBetween("2026-11-20", "2028-01-01"), null, "more than 400 days");
@@ -22,7 +24,7 @@ test("20-Nov-2026 case: the Monday 23-Nov weekly (1 session left) is not the wee
   const next = { expiry: "01-Dec-2026", dte: 11, spot: 25800.6, straddle: 516.15, callWall: 26000, putWall: 25000 };
   const h = chooseHorizon({ date: "2026-11-20", chains: { near, nextWeekly: next } }, CFG);
   assert.equal(h.expiry, "01-Dec-2026");
-  assert.equal(h.sessionsLeft, 7);
+  assert.equal(h.sessionsLeft, 6);
   assert.match(h.basis, /1 trading session left/);
 });
 
@@ -38,13 +40,15 @@ function volDays({ ranges, straddle, expiry, lastDate = "2026-11-20" }) {
 }
 
 test("volatility v2: implied range a session ≈ 2 × straddle / √(sessions + 0.25 × closed days)", () => {
-  // the real 20-Nov inputs on the 1-Dec weekly: 516 over 7 sessions + 4 closed days → ~365 vs 289 realised
-  const o = computeWeeklyOutlook({ days: volDays({ ranges: [156.5, 221.75, 237.75, 393.85, 436.35], straddle: 516.15, expiry: "01-Dec-2026" }), config: CFG });
+  // the real 20-Nov inputs on the 1-Dec weekly (NSE ranges 16–20 Nov): 516 over 6 sessions + 5 closed
+  // days (24-Nov holiday) → T 7.25, implied ~383 vs 304 realised → NORMAL (ratio 1.26 < 1.3)
+  const o = computeWeeklyOutlook({ days: volDays({ ranges: [165.5, 234.05, 249, 409.5, 463.6], straddle: 516.15, expiry: "01-Dec-2026" }), config: CFG });
   const v = o.groups.volatility;
-  assert.equal(v.inputs.sessionsLeft, 7);
-  assert.equal(v.inputs.closedDaysLeft, 4);
-  assert.equal(v.inputs.timeUnits, 8);
-  assert.ok(Math.abs(v.inputs.impliedRangePerSession - (2 * 516.15) / Math.sqrt(8)) < 0.01);
+  assert.equal(v.inputs.sessionsLeft, 6);
+  assert.equal(v.inputs.closedDaysLeft, 5);
+  assert.equal(v.inputs.timeUnits, 7.25);
+  assert.ok(Math.abs(v.inputs.impliedRangePerSession - (2 * 516.15) / Math.sqrt(7.25)) < 0.01);
+  assert.ok(Math.abs(v.inputs.realisedAvgRange - 304.33) < 0.01);
   assert.equal(v.state, "NORMAL", "v1 called this EXPANDING (it compared 136 with 289)");
   // rich premium: same straddle, quiet market
   assert.equal(computeWeeklyOutlook({ days: volDays({ ranges: [150, 150, 150, 150, 150], straddle: 516.15, expiry: "01-Dec-2026" }), config: CFG }).groups.volatility.state, "COMPRESSED");
@@ -349,4 +353,84 @@ test("ladder step 3 without a swing: the nearer of the near-money wall and the r
   // wall missing → the range edge, as before
   const l2 = computeInvalidationLadder({ ds, last: ds[4], chain: { ...near, nearCallWall: null }, regime: "RANGE" });
   assert.equal(l2.ladders.find((x) => x.side === "above").steps.find((s) => s.key === "FLIPPED").value, 26316.75);
+});
+
+test("futures group: a contract roll inside the window measures the price leg on spot (basis jump or expiry change)", () => {
+  const mkd = (date, spot, fut, oi, expiry) => ({ date, spot: { open: spot, high: spot + 50, low: spot - 50, close: spot }, fut: { close: fut, oiClose: oi, ...(expiry ? { expiry } : {}) } });
+  // flat spot; the November contract (−30 discount on expiry day) is replaced by December (+160)
+  const days = [mkd("2026-11-19", 25500, 25520, 2.0e5), mkd("2026-11-20", 25500, 25470, 2.0e5), mkd("2026-11-23", 25510, 25480, 2.02e5), mkd("2026-11-25", 25520, 25680, 2.04e5), mkd("2026-11-26", 25520, 25690, 2.06e5)];
+  const o = computeWeeklyOutlook({ days, config: CFG });
+  const f = o.groups.futures.inputs;
+  assert.equal(f.contractRolled, true);
+  assert.equal(f.rollDetectedBy, "basis");
+  assert.equal(f.priceLeg, "spot");
+  assert.ok(Math.abs(f.pricePct - ((25520 - 25500) / 25500) * 100) < 0.01, "spot change, not the fake +0.67% futures change");
+  assert.match(o.groups.futures.reasons.join(" "), /contract roll/);
+  // recorded expiries that differ → rolled by expiry
+  const d2 = days.map((d, i) => ({ ...d, fut: { ...d.fut, expiry: i < 3 ? "23-Nov-2026" : "29-Dec-2026" } }));
+  assert.equal(computeWeeklyOutlook({ days: d2, config: CFG }).groups.futures.inputs.rollDetectedBy, "expiry");
+  // same contract, normal basis drift → not a roll
+  const d3 = days.map((d) => ({ ...d, fut: { ...d.fut, close: d.spot.close + 20 } }));
+  assert.equal(computeWeeklyOutlook({ days: d3, config: CFG }).groups.futures.inputs.contractRolled, false);
+});
+
+test("ladder warning lists only the level used; the skipped volume level is named as beyond step 2", () => {
+  const ds = nov20({ low20: 25345.2, nearPut: null });
+  const l = computeInvalidationLadder({ ds, last: ds[4], chain: ds[4].chains.near, regime: "TREND_UP" });
+  const w = l.ladders[0].steps[0];
+  assert.equal(w.key, "WARNING");
+  assert.deepEqual(w.components.map((c) => c.type), ["VWAP"]);
+  assert.match(w.basis, /point of control 25225 lies beyond step 2/);
+  // far level used (POC 25225 below VWAP 25300, step 2 at 25100): no "beyond" text for the nearer VWAP
+  const ds2 = nov20({ low20: 25100, nearPut: null });
+  ds2[4].volProfile = { bin: 25, bins: { 25225: 5e6, 25350: 3e6 }, vol: 8e6, pv: 25300 * 8e6 };
+  const w2 = computeInvalidationLadder({ ds: ds2, last: ds2[4], chain: ds2[4].chains.near, regime: "TREND_UP" }).ladders[0].steps[0];
+  assert.equal(w2.value, 25225);
+  assert.doesNotMatch(w2.basis, /beyond/);
+});
+
+test("holiday list: env additions apply per config read and do not carry over", () => {
+  getOutlookConfig({ SWING_EXCHANGE_HOLIDAYS: "2026-11-30" });
+  assert.equal(sessionsBetween("2026-11-27", "2026-12-01").sessions, 1, "30-Nov added");
+  getOutlookConfig({});
+  assert.equal(sessionsBetween("2026-11-27", "2026-12-01").sessions, 2, "back to the defaults");
+});
+
+test("setup stop: the half-straddle fallback states its level", () => {
+  const s = computeSetups(setupInputs({ close: 25810 }));
+  assert.equal(s.put.zone.low, 26000);
+  assert.match(s.put.stop.basis, /^a daily close above 26,118 \(half a straddle past the zone/);
+});
+
+test("GET /api/swing: a snapshot from an older outlook version is recomputed with the current rules from days up to its own date", async () => {
+  const d = (date, close, extra = {}) => ({ date, source: "capture", spot: { open: close, high: close + 40, low: close - 40, close }, fut: { open: close, high: close, low: close, close: close + 10, oiOpen: 2e5, oiClose: 2e5 }, chains: {}, ...extra });
+  const store = new Map([
+    ["nifty:swing:day:2026-11-19", d("2026-11-19", 25500)],
+    ["nifty:swing:day:2026-11-20", d("2026-11-20", 25800)],
+    ["nifty:swing:day:2026-11-23", d("2026-11-23", 25900)],
+    ["nifty:swing:outlook:2026-11-20", { v: 1, regime: "TREND_UP", confidence: "MEDIUM", asOf: "2026-11-20", headline: "old v1", reference: { spotClose: 25800 } }],
+  ]);
+  const handler = createSwingHandler({ now: () => Date.parse("2026-11-23T16:00:00+05:30"), mget: async (ks) => ks.map((k) => store.get(k) ?? null), env: () => ({}) });
+  let body = null;
+  const res = { setHeader() {}, status() { return this; }, json(b) { body = b; return this; }, end() { return this; } };
+  // ?days=4 covers only 20–23 Nov, but the recompute still sees the 19-Nov lead-in day
+  await handler({ method: "GET", query: { days: "4" } }, res);
+  assert.deepEqual(body.days.map((x) => x.date), ["2026-11-20", "2026-11-23"], "the lead-in day is not returned");
+  const p4 = body.pastOutlooks.find((x) => x.date === "2026-11-20");
+  assert.equal(p4.recomputed, true);
+  await handler({ method: "GET", query: { days: "5" } }, res);
+  const p = body.pastOutlooks.find((x) => x.date === "2026-11-20");
+  assert.equal(p.headline, p4.headline, "same recompute whatever the window");
+  assert.equal(p.recomputed, true);
+  assert.equal(p.stored.regime, "TREND_UP");
+  assert.equal(p.stored.headline, "old v1");
+  assert.notEqual(p.headline, "old v1");
+  assert.equal(p.reference.spotClose, 25800, "computed from days up to 20-Nov only");
+  // a current-version snapshot is used as stored
+  store.set("nifty:swing:outlook:2026-11-20", { v: 2, regime: "RANGE", confidence: "LOW", asOf: "2026-11-20", headline: "v2 stored", reference: { spotClose: 25800 } });
+  await handler({ method: "GET", query: { days: "5" } }, res);
+  const q = body.pastOutlooks.find((x) => x.date === "2026-11-20");
+  assert.equal(q.recomputed, false);
+  assert.equal(q.headline, "v2 stored");
+  assert.equal(body.days.find((x) => x.date === "2026-11-20").fut.expiry, null, "fut.expiry is exposed (null when not recorded)");
 });

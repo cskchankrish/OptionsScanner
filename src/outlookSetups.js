@@ -162,7 +162,7 @@ function oneSide({ type, regime, close, chain, setupChain, levels, ladder, cfg, 
   const stop = stopCands[0]
     ? { value: r2(stopCands[0].value), basis: `a daily close ${call ? "below" : "above"} ${f0(stopCands[0].value)} (${stopCands[0].note})` }
     : straddle
-      ? { value: r2(call ? zone.low - 0.5 * straddle : zone.high + 0.5 * straddle), basis: `a daily close ${call ? "below" : "above"} half a straddle past the zone (no recorded structure beyond it)` }
+      ? { value: r2(call ? zone.low - 0.5 * straddle : zone.high + 0.5 * straddle), basis: `a daily close ${call ? "below" : "above"} ${f0(call ? zone.low - 0.5 * straddle : zone.high + 0.5 * straddle)} (half a straddle past the zone; no recorded structure beyond it)` }
       : null;
   // targets
   const opp = call ? chain.nearCallWall : chain.nearPutWall;
