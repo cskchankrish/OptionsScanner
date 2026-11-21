@@ -101,11 +101,15 @@ test("bullish mirror and range (both sides); no recorded swing → the expected-
   assert.ok(dn.steps.every((s) => s.value < 25227.95));
   const rng = computeInvalidationLadder({ ds, last, chain, regime: "RANGE" });
   assert.deepEqual(rng.ladders.map((l) => l.side), ["above", "below"]);
-  // only two sessions: no confirmed swing → FLIPPED falls back to the expected range
+  // only two sessions: no confirmed swing → FLIPPED falls back to the NEARER of the near-money call
+  // wall (25500) and the expected-range high (25555); without the wall, the range edge
   const two = ds.slice(3);
   const l2 = computeInvalidationLadder({ ds: two, last: two[1], chain, regime: "TREND_DOWN" });
   const f = l2.ladders[0].steps.find((s) => s.key === "FLIPPED");
-  assert.ok(f.components.some((c) => c.type === "EXPECTED_RANGE"));
+  assert.equal(f.components[0].type, "NEAR_CALL_WALL");
+  assert.equal(f.value, 25500);
+  const l3 = computeInvalidationLadder({ ds: two, last: two[1], chain: { ...chain, nearCallWall: null }, regime: "TREND_DOWN" });
+  assert.ok(l3.ladders[0].steps.find((s) => s.key === "FLIPPED").components.some((c) => c.type === "EXPECTED_RANGE"));
   assert.equal(computeInvalidationLadder({ ds, last, chain, regime: "INSUFFICIENT_DATA" }), null);
 });
 

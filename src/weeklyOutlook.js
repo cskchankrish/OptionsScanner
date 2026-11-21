@@ -404,13 +404,24 @@ function buildLadder({ side, close, prevDay, swing, profile, nearWall, expectedR
   const past2 = (v) => beyond(v) && (!s2 || (side === "above" ? Number(v) > s2.zone.high + tol : Number(v) < s2.zone.low - tol));
   const sw = side === "above" ? swing.hi : swing.lo;
   let comps3 = null;
-  if (sw && past2(sw.value)) comps3 = [{ type: side === "above" ? "SWING_HIGH" : "SWING_LOW", value: sw.value, note: `last swing ${side === "above" ? "high" : "low"} (${sw.date})` }];
-  else if (expectedRange && past2(side === "above" ? expectedRange.high : expectedRange.low)) {
-    const v = side === "above" ? expectedRange.high : expectedRange.low;
-    comps3 = [{ type: "EXPECTED_RANGE", value: v, note: `expected-range ${side === "above" ? "high" : "low"} (no recorded swing beyond step 2)` }];
+  if (sw && past2(sw.value)) {
+    comps3 = [{ type: side === "above" ? "SWING_HIGH" : "SWING_LOW", value: sw.value, note: `last swing ${side === "above" ? "high" : "low"} (${sw.date})` }];
+    if (nearWall && past2(nearWall.strike)) comps3.push(wallComp());
+  } else {
+    // No recorded swing beyond step 2: the NEARER of the near-money OI wall and the expected-range
+    // edge, merged with the other when close (owner 2026-11-21: on 20-Nov the 26000 call wall sat
+    // between step 2 at 25804 and the range edge at 26317 and appeared in neither step).
+    const alt = [];
+    if (nearWall && past2(nearWall.strike)) alt.push(wallComp());
+    const ev = expectedRange ? (side === "above" ? expectedRange.high : expectedRange.low) : null;
+    if (ev !== null && past2(ev)) alt.push({ type: "EXPECTED_RANGE", value: ev, note: `expected-range ${side === "above" ? "high" : "low"}` });
+    alt.sort((a, b) => Math.abs(a.value - close) - Math.abs(b.value - close));
+    if (alt.length) {
+      alt[0] = { ...alt[0], note: `${alt[0].note} (no recorded swing beyond step 2)` };
+      comps3 = alt;
+    }
   }
   if (comps3) {
-    if (nearWall && past2(nearWall.strike)) comps3.push(wallComp());
     const z = zoneOf(comps3, side, tol);
     steps.push({ key: "FLIPPED", ...z, status: "NOT_REACHED", basis: `a daily close ${side} ${f0(z.value)} (${z.components.map(fmtC).join(", ")})` });
   }

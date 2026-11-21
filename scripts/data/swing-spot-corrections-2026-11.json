@@ -1,0 +1,56 @@
+[
+  {
+    "date": "2026-11-16",
+    "field": "high",
+    "expect": 25329.4,
+    "value": 25337.6
+  },
+  {
+    "date": "2026-11-16",
+    "field": "low",
+    "expect": 25172.9,
+    "value": 25172.1
+  },
+  {
+    "date": "2026-11-17",
+    "field": "high",
+    "expect": 25499.05,
+    "value": 25501.35
+  },
+  {
+    "date": "2026-11-17",
+    "field": "low",
+    "expect": 25277.3,
+    "value": 25267.3
+  },
+  {
+    "date": "2026-11-18",
+    "field": "high",
+    "expect": 25383.35,
+    "value": 25390.8
+  },
+  {
+    "date": "2026-11-18",
+    "field": "low",
+    "expect": 25145.6,
+    "value": 25141.8
+  },
+  {
+    "date": "2026-11-19",
+    "field": "low",
+    "expect": 25120.45,
+    "value": 25104.8
+  },
+  {
+    "date": "2026-11-20",
+    "field": "high",
+    "expect": 25804.35,
+    "value": 25808.8
+  },
+  {
+    "date": "2026-11-20",
+    "field": "low",
+    "expect": 25368,
+    "value": 25345.2
+  }
+]

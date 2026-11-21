@@ -335,3 +335,18 @@ test("GET /api/swing: v2 snapshots carry setups and measured setup outcomes; the
   assert.equal(body.tally.setups.call.target, 1);
   assert.ok(body.outlook.setups, "the live outlook carries setups");
 });
+
+test("ladder step 3 without a swing: the nearer of the near-money wall and the range edge (20-Nov: 26000, not 26317)", () => {
+  const ds = nov20({ nearPut: null });
+  const near = { ...ds[4].chains.near, straddle: 516.15, expectedRange: { low: 25284.45, high: 26316.75 }, nearCallWall: { strike: 26000, oi: 72677 } };
+  ds[4] = { ...ds[4], chains: { near } };
+  const l = computeInvalidationLadder({ ds, last: ds[4], chain: near, regime: "RANGE" });
+  const up = l.ladders.find((x) => x.side === "above");
+  const flip = up.steps.find((s) => s.key === "FLIPPED");
+  assert.equal(flip.value, 26000);
+  assert.equal(flip.components[0].type, "NEAR_CALL_WALL");
+  assert.match(flip.basis, /no recorded swing beyond step 2/);
+  // wall missing → the range edge, as before
+  const l2 = computeInvalidationLadder({ ds, last: ds[4], chain: { ...near, nearCallWall: null }, regime: "RANGE" });
+  assert.equal(l2.ladders.find((x) => x.side === "above").steps.find((s) => s.key === "FLIPPED").value, 26316.75);
+});
