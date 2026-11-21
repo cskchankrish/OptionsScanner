@@ -13,6 +13,7 @@ import { computeWeeklyOutlook, evaluateOutlookOutcome, getOutlookConfig, REGIMES
 import { istOf, keys as scKeys } from "../src/scorecard.js";
 import { profileFromSeries } from "../src/volumeProfile.js";
 import { getSessionKindForDate } from "../src/marketCalendar.js";
+import { evaluateSetupOutcome, tallySetups, getSetupConfig } from "../src/outlookSetups.js";
 
 export const SWING_API_DEFAULT_DAYS = 30;
 export const SWING_API_MAX_DAYS = 120;
@@ -40,7 +41,7 @@ export function compactDay(d) {
     coveragePct: d.coveragePct ?? null,
     spot: d.spot || null,
     fut: d.fut ? { open: d.fut.open, high: d.fut.high, low: d.fut.low, close: d.fut.close, oiClose: d.fut.oiClose, oiChangePct: d.fut.oiChangePct } : null,
-    chains: { near: compactChain(d.chains?.near), nextWeekly: compactChain(d.chains?.nextWeekly), monthly: compactChain(d.chains?.monthly) },
+    chains: { near: compactChain(d.chains?.near), nextWeekly: compactChain(d.chains?.nextWeekly), monthly: compactChain(d.chains?.monthly), setup: compactChain(d.chains?.setup) },
     notes: Array.isArray(d.notes) ? d.notes : [],
   };
 }
@@ -92,6 +93,8 @@ export function createSwingHandler(overrides = {}) {
         } catch (e) { /* ladder works without volume levels */ }
       }
       const outlook = computeWeeklyOutlook({ days, config: getOutlookConfig(env) });
+      const setupCfg = getSetupConfig(env);
+      const outcomeOf = (o, date, k) => evaluateSetupOutcome({ setup: o.setups?.[k], asOf: o.asOf || date, laterDays: days, cfg: setupCfg });
       const pastOutlooks = outlooks.map(({ date, outlook: o }) => ({
         date,
         regime: o.regime,
@@ -101,6 +104,9 @@ export function createSwingHandler(overrides = {}) {
         expectedRange: o.expectedRange ?? null,
         horizon: o.horizon ?? null,
         outcome: evaluateOutlookOutcome({ outlook: { ...o, asOf: o.asOf || date }, laterDays: days }),
+        // v2 snapshots carry option setups (src/outlookSetups.js); older ones have none.
+        setups: o.setups ? { call: o.setups.call || null, put: o.setups.put || null, setupExpiry: o.setups.setupExpiry || null } : null,
+        setupOutcomes: o.setups ? { call: outcomeOf(o, date, "call"), put: outcomeOf(o, date, "put") } : null,
       }));
       return res.status(200).json({
         ok: true,
@@ -112,7 +118,7 @@ export function createSwingHandler(overrides = {}) {
         outlook,
         days: days.map(compactDay),
         pastOutlooks,
-        tally: tallyOutcomes(pastOutlooks),
+        tally: { ...tallyOutcomes(pastOutlooks), setups: tallySetups(pastOutlooks) },
         rules: { hit: OUTLOOK_HIT_RULES, horizon: OUTLOOK_HORIZON_RULE },
       });
     } catch (e) {

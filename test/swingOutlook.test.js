@@ -89,7 +89,9 @@ function downtrendDays() {
 function rangeDays() {
   const closes = [25000, 25020, 24990, 25010, 24995, 25005];
   return SIX.map((d, i) => day(d, {
-    close: closes[i], high: closes[i] + 60, low: closes[i] - 60, oi: 200000,
+    // ±115 → a 230-pt range a session, in line with a 300 straddle over 6 sessions + 2 closed days
+    // (implied ≈ 2 × 300 / √6.5 ≈ 235): NORMAL volatility (v2 formula).
+    close: closes[i], high: closes[i] + 115, low: closes[i] - 115, oi: 200000,
     near: i === SIX.length - 1 ? chain({ spot: 25005, straddle: 300, putWall: 24700, callWall: 25300, pcr: 1.0 }) : null,
   }));
 }
@@ -415,18 +417,24 @@ test("outlook: confidence caps by available directional groups; partial last day
   assert.ok(o3.notes.some((n) => /partial/.test(n)));
 });
 
-test("outlook: outlook-expiry choice by days left on the near weekly", () => {
+test("outlook: outlook-expiry choice by trading sessions left on the near weekly", () => {
   const nearC = chain({ expiry: "17-Nov-2026", spot: 25000, dte: 5, putWall: 24800, callWall: 25200 });
   const nextC = chain({ expiry: "24-Nov-2026", spot: 25000, dte: 12, straddle: 400, putWall: 24500, callWall: 25500 });
-  const mk = (near, next) => ({ date: "2026-11-12", chains: { near, nextWeekly: next, monthly: null } });
-  assert.equal(chooseHorizon(mk(nearC, nextC), CFG).expiry, "17-Nov-2026");
-  assert.equal(chooseHorizon(mk({ ...nearC, dte: 2 }, nextC), CFG).expiry, "24-Nov-2026");
-  assert.equal(chooseHorizon(mk({ ...nearC, dte: 3 }, nextC), CFG).expiry, "17-Nov-2026");
-  const fb = chooseHorizon(mk({ ...nearC, dte: 1 }, null), CFG);
-  assert.equal(fb.expiry, "17-Nov-2026");
+  const mk = (near, next, date = "2026-11-12") => ({ date, chains: { near, nextWeekly: next, monthly: null } });
+  // Thu 12-Nov → Tue 17-Nov: 13, 16, 17 = 3 sessions (≥ 2)
+  const h = chooseHorizon(mk(nearC, nextC), CFG);
+  assert.equal(h.expiry, "17-Nov-2026");
+  assert.equal(h.sessionsLeft, 3);
+  assert.equal(h.closedDaysLeft, 2);
+  // Fri 13-Nov → Mon 16-Nov: 3 calendar days but 1 session → the next weekly (the 20-Nov-2026 case)
+  assert.equal(chooseHorizon(mk({ ...nearC, expiry: "16-Nov-2026", dte: 3 }, nextC, "2026-11-13"), CFG).expiry, "24-Nov-2026");
+  // Thu 12-Nov → Mon 16-Nov: 2 sessions → near
+  assert.equal(chooseHorizon(mk({ ...nearC, expiry: "16-Nov-2026", dte: 4 }, nextC), CFG).expiry, "16-Nov-2026");
+  const fb = chooseHorizon(mk({ ...nearC, expiry: "13-Nov-2026", dte: 1 }, null), CFG);
+  assert.equal(fb.expiry, "13-Nov-2026");
   assert.equal(fb.fallback, true);
   assert.match(fb.basis, /next weekly chain was not captured/);
-  const o = computeWeeklyOutlook({ days: [{ ...day("2026-11-12", { close: 25000 }), chains: { near: { ...nearC, dte: 1 }, nextWeekly: null, monthly: null } }], config: CFG });
+  const o = computeWeeklyOutlook({ days: [{ ...day("2026-11-12", { close: 25000 }), chains: { near: { ...nearC, expiry: "13-Nov-2026", dte: 1 }, nextWeekly: null, monthly: null } }], config: CFG });
   assert.ok(o.notes.some((n) => /not captured/.test(n)));
   assert.equal(chooseHorizon(mk(null, null), CFG).expiry, null);
 });
@@ -609,8 +617,10 @@ const G = (o = {}) => shouldCaptureSwing({ cfg: SWCFG, sessionKind: "WEEKDAY", i
 test("swing config defaults and env overrides", () => {
   assert.deepEqual(
     { ...SWCFG },
-    { enabled: true, captureStartMins: 920, captureEndMins: 940, captureEverySec: 300, retentionDays: 400, fetchTimeoutMs: 3500, minBudgetMs: 4500, maxCaptureMs: 5000, lookbackDays: 21, minLiveTicks: 30 },
+    { enabled: true, captureStartMins: 920, captureEndMins: 940, captureEverySec: 300, retentionDays: 400, fetchTimeoutMs: 3500, minBudgetMs: 4500, maxCaptureMs: 5000, lookbackDays: 21, minLiveTicks: 30, setupChainEnabled: true, setupMinDte: 45, indexQuoteEnabled: true, indexQuoteTimeoutMs: 2500 },
   );
+  assert.equal(getSwingConfig({ SWING_SETUP_CHAIN: "false" }).setupChainEnabled, false);
+  assert.equal(getSwingConfig({ SWING_SETUP_MIN_DTE: "30" }).setupMinDte, 30);
   assert.equal(getSwingConfig({ SWING_MIN_LIVE_TICKS: "10" }).minLiveTicks, 10);
   assert.equal(getSwingConfig({ SWING_MAX_CAPTURE_MS: "3000" }).maxCaptureMs, 3000);
   const c = getSwingConfig({ SWING_ENABLED: "false", SWING_CAPTURE_START: "15:30", SWING_CAPTURE_EVERY_SEC: "60", SWING_RETENTION_DAYS: "x" });
@@ -770,6 +780,7 @@ function makeRefreshFetch() {
       return json({ records: { underlyingValue: 25000, timestamp: "11-Nov-2026 15:25:00", data }, filtered: { data } });
     }
     if (u.includes("liveEquity-derivatives")) return json({ data: [] });
+    if (u.includes("/api/allIndices")) return json({ data: [{ index: "NIFTY 50", open: 1, high: 999999, low: 1, last: 1 }] }); // nonsense: must be rejected
     return json({ result: null });
   };
   return { fn, swingWrites, nseUrls };
@@ -816,7 +827,16 @@ test("non-interference: payload identical with the capture on and off; capture w
   // On 11-Nov the monthly expiry is 24-Nov (the next weekly): reused, not fetched twice.
   assert.deepEqual(day11.chains.monthly, day11.chains.nextWeekly);
   const v3Calls = (u) => u.filter((x) => x.includes("option-chain-v3"));
-  assert.equal(v3Calls(on.f.nseUrls).length, v3Calls(off.f.nseUrls).length + 1);
+  // +1 next weekly, +1 setup chain (first monthly with ≥ 45 days on 11-Nov: 29-Dec-2026)
+  assert.equal(v3Calls(on.f.nseUrls).length, v3Calls(off.f.nseUrls).length + 2);
+  assert.equal(day11.chains.setup.expiry, "29-Dec-2026");
+  assert.ok(Array.isArray(day11.chains.setup.strikes) && day11.chains.setup.strikes.length > 0, "setup chain keeps a strike list");
+  assert.equal(day11.chains.near.strikes, undefined, "other chains carry no strike list");
+  // the index quote is fetched, and a quote that disagrees with the ticks is rejected (ticks kept)
+  assert.equal(on.f.nseUrls.filter((x) => x.includes("/api/allIndices")).length, 1);
+  assert.equal(off.f.nseUrls.filter((x) => x.includes("/api/allIndices")).length, 0);
+  assert.notEqual(day11.spot.source, "nse-index-quote");
+  assert.ok(day11.notes.some((n) => /disagrees with the ticks/.test(n)));
   assert.ok(on.f.swingWrites["nifty:swing:outlook:2026-11-11"]);
   assert.deepEqual(Object.keys(on.f.swingWrites).sort(), ["nifty:swing:capture_lock", "nifty:swing:day:2026-11-11", "nifty:swing:outlook:2026-11-11"]);
 });

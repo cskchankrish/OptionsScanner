@@ -68,11 +68,13 @@ Every threshold is a default you can override; every raw input is kept in `group
 | Price | 5 daily bars (`SWING_PRICE_MIN_DAYS`) | close vs 5-day mean of closes (±0.3%, `SWING_PRICE_MEAN_BAND_PCT`): +1/−1; higher highs and higher lows over the last 3 sessions +1, lower lows and lower highs −1; close in the top / bottom third of the 5-day high–low range +1/−1 | sum, clamped to −2..+2 |
 | Futures | 3 sessions with futures close and OI (`SWING_FUTURES_MIN_DAYS`), uses up to the last 5 (`SWING_FUTURES_LOOKBACK_DAYS`) | net futures close change and net OI change across the window, with the day-quadrant deadbands 0.08% price / 0.25% OI (`SWING_FUT_PRICE_DEADBAND_PCT`, `SWING_FUT_OI_DEADBAND_PCT`) | long build-up +2, short build-up −2, short covering +1, long unwinding −1, inside a deadband 0 |
 | Options | the outlook-expiry chain on the last session | position: above the call wall +1, below the put wall −1, lower third between the walls (near put support) +1, upper third (near call resistance) −1; PCR ≥ 1.2 +1 (`SWING_PCR_SUPPORTIVE`), ≤ 0.8 −1 (`SWING_PCR_RESISTIVE`); wall migration vs the previous session's chain of the same expiry: walls moving up +1, down −1 | sum, clamped to −2..+2 |
-| Volatility (not directional) | the straddle and 3 daily ranges (`SWING_VOL_MIN_DAYS`), uses up to 5 (`SWING_VOL_LOOKBACK_DAYS`) | implied per day = straddle / √max(dte, 1) vs the average daily spot range | `COMPRESSED` if implied ≥ 1.3 × realised, `EXPANDING` if realised ≥ 1.3 × implied (`SWING_VOL_RATIO`), else `NORMAL` |
+| Volatility (not directional) | the straddle and 3 daily ranges (`SWING_VOL_MIN_DAYS`), uses up to 5 (`SWING_VOL_LOOKBACK_DAYS`) | implied high–low range a session = 2 × straddle / √T (`SWING_VOL_RANGE_FACTOR`), T = trading sessions left + 0.25 × closed days left (`SWING_CLOSED_DAY_VAR_WEIGHT`), vs the average daily spot range. `COMPRESSED` = premium rich, `EXPANDING` = premium cheap | `COMPRESSED` if implied ≥ 1.3 × realised, `EXPANDING` if realised ≥ 1.3 × implied (`SWING_VOL_RATIO`), else `NORMAL` |
 
-**Outlook expiry.** The near weekly if it has ≥ 3 days left (`SWING_MIN_NEAR_DTE`), otherwise the
-next weekly. If that chain was not captured, the first captured of near / next weekly / monthly is
-used and the outlook says so.
+**Outlook expiry.** The near weekly if it has at least 2 trading sessions left after the recorded
+session (`SWING_MIN_NEAR_SESSIONS`; weekdays and Muhurat dates, exchange holidays not modelled),
+otherwise the next weekly. When sessions cannot be counted the old rule applies (≥ 3 calendar days,
+`SWING_MIN_NEAR_DTE`). If that chain was not captured, the first captured of near / next weekly /
+monthly is used and the outlook says so.
 
 ## Regimes
 
@@ -107,6 +109,58 @@ partial.
 - Invalidation: trend up / break risk up → a daily close below the put wall (or the expected-range
   low without a wall); trend down / break risk down → a close above the call wall; range → a daily
   close outside the expected range.
+
+## Corrections of 21-Nov-2026 (outlook v2)
+
+Found by checking the 20-Nov-2026 card against TradingView and India VIX:
+
+| What | v1 | v2 |
+|---|---|---|
+| Outlook expiry | calendar days: Friday 20-Nov → Monday 23-Nov counted as 3 days (≥ 3), so a one-session chain set the "weekly" view (its PCR 1.65 was expiry-week positioning) | trading sessions: 1 session < 2, so the 1-Dec weekly is used. On the same data the regime reads RANGE (+2) instead of TREND_UP (+4): the 1-Dec chain has PCR 0.87 and its put wall moved down 25500 → 25000 |
+| Volatility | straddle / √calendar days (136) vs the daily high–low range (289): EXPANDING. Two errors: weekend days counted as full days, and a straddle (≈ 0.8 σ) compared with a range (≈ 1.6 σ) | 2 × straddle / √T with T in sessions: NORMAL on the 1-Dec chain (365 vs 289), consistent with India VIX 17.3 |
+| Ladder warning | could sit beyond step 2 (20-Nov: warning 25225 below the 25368 invalidation) | built after step 2 and kept only when it lies between the close and step 2 (by half a tolerance): the farther of POC / VWAP, else the nearer, else the near-money OI wall, else no warning step with a note (`warningNote`) |
+| Volume reference | only inside the warning step | always kept (`levels.ladder.volumeReference`): "5-session volume point of control … · 5-session volume-weighted average …", the value area and the close's distance from the VWAP |
+| Spot high / low | minute ticks only: they miss intra-minute extremes (20-Nov low recorded 25368 = the open; NSE low 25345.2; 19-Nov 25120.45 vs 25104.8) | the capture also reads NSE's index list (`/api/allIndices`, NIFTY 50 open / high / low, `SWING_INDEX_QUOTE`, 2.5 s timeout) and uses it when it agrees with the ticks (high ≥ tick high − 1, low ≤ tick low + 1, open and last inside its own range, last within 0.5% of the tick close; the capture leaves 1.5 s for its writes, `SWING_QUOTE_WRITE_RESERVE_MS`); otherwise the ticks stay and a note says why. `spot.source` and `spot.ticks` record which was used |
+
+Summaries recorded before this change keep their tick-based highs and lows.
+
+**Load time.** The card used to mount only after `/api/nifty-oi` returned (it sits inside the EOD
+section, and the page shows a loading screen until the live chain arrives), and only then started
+its own request. `primeWeeklyOutlook()` now starts `/api/swing` when the page opens, the loading
+screen shows the card, and the last result is kept for re-mounts.
+
+## Option setups (shadow, added 21-Nov-2026)
+
+Owner idea: longer-dated OTM calls near put-wall support, puts near call-wall resistance. Code:
+`src/outlookSetups.js`; tests: `test/outlookSetups.test.js`. Shadow only: no orders, no Telegram,
+not advice.
+
+**Setup chain.** Each capture also fetches the first monthly expiry (the last listed expiry of its
+month) with at least 45 days left (`SWING_SETUP_MIN_DTE`; late November → January), in the same
+parallel batch as the other chains, and keeps a compact strike list within spot ± 12% (price, IV
+and OI per side, at most 90 strikes) at `chains.setup`. `SWING_SETUP_CHAIN=false` switches it off.
+
+**Rule, each side** (calls shown; puts mirror):
+
+| Part | Definition |
+|---|---|
+| Zone | the near-money put OI wall of the outlook expiry, merged with recorded levels within the ladder tolerance (previous day / week lows, swing low, POC, VWAP, value-area low). No near-money wall → no zone (`NO_DATA`): a previous-day extreme alone is not support |
+| Stop | a daily close below the next recorded structure more than one tolerance below the zone (swing, previous week / day, volume levels, whole-chain put wall); half a straddle below the zone when none |
+| T1 / T2 | T1 = the near-money call wall; without one, the nearer of the whole-chain call wall and the expected-range high. T2 = the setup chain's own call wall when farther |
+| Regime | calls blocked in TREND_DOWN / BREAK_RISK_DOWN, puts in TREND_UP / BREAK_RISK_UP, both without a regime |
+| Trigger | allowed, close inside the zone (up to one tolerance above it), reward:risk to T1 ≥ 1.5 (`SWING_SETUP_MIN_RR`) |
+| Option | the setup expiry's OTM strike nearest |delta| 0.375 within 0.25–0.50 (Black–Scholes on the strike's own IV, ATM IV when missing, r = 6.5%). Estimated premiums at the zone, at T1 and at the stop after 10 days (`SWING_SETUP_HOLD_DAYS`), and the option's own reward:risk |
+| Premium | the volatility state: COMPRESSED is shown as "premium is expensive to buy" |
+
+The option's reward:risk is usually far below the index's: on simulated 20-Nov inputs a 4.4 : 1
+index setup was about 1.25 : 1 on a 0.37-delta January call after 10 days of decay.
+
+**Measurement.** A triggered setup is counted when a later day's high reaches T1 (TARGET) or a
+daily close passes the stop (STOP; both on one day counts as STOP), within 15 sessions
+(`SWING_SETUP_HORIZON_SESSIONS`), else EXPIRED. The option result uses the premium recorded in the
+setup chain on the exit day for the same expiry and strike. Consecutive days of the same setup
+(same expiry, strike and zone) count once. `GET /api/swing` returns `setups` and `setupOutcomes`
+per stored outlook and `tally.setups`; judge after 20–30 triggered setups per side.
 
 ## Measuring past outlooks
 

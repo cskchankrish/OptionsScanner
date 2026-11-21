@@ -2918,6 +2918,16 @@ async function captureSwingSummary(ctx, opts = {}) {
         const j = await r.json();
         return { rows: j.filtered?.data || j.records?.data || [], spot: Number(j.records?.underlyingValue) || null };
       },
+      // Official NIFTY 50 open/high/low (parsed and checked against the ticks in src/swingSummary.js).
+      fetchIndexQuote: async (timeoutMs) => {
+        // Leave SWING_QUOTE_WRITE_RESERVE_MS (default 1500) for the day / outlook writes after it.
+        const reserve = Number(process.env.SWING_QUOTE_WRITE_RESERVE_MS) > 0 ? Number(process.env.SWING_QUOTE_WRITE_RESERVE_MS) : 1500;
+        const left = deadlineMs !== null ? deadlineMs - Date.now() - 300 - reserve : timeoutMs;
+        if (left < 300) throw new Error("not enough time left in this refresh");
+        const r = await fetch("https://www.nseindia.com/api/allIndices", { headers: ctx.sessionHeaders, signal: AbortSignal.timeout(Math.min(timeoutMs, left)) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      },
     },
   });
   let timer = null;
@@ -3718,6 +3728,7 @@ async function refreshLiveSnapshotCore({
         nearExpiry,
         nextExpiry,
         monthlyExpiry,
+        expiryDates: Array.isArray(expiryDates) ? [...expiryDates] : [],
         isExpiryDay,
         spot,
         nearRows: records,

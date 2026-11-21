@@ -11,8 +11,12 @@
  */
 import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "./smartMoneyFusion.js";
 import { combineProfiles } from "./volumeProfile.js";
+import { getSessionKindForDate } from "./marketCalendar.js";
+import { computeSetups, getSetupConfig } from "./outlookSetups.js";
 
-export const OUTLOOK_VERSION = 1;
+// v2 (2026-11-21): days to expiry counted in trading sessions, volatility compares like with like,
+// ladder steps always ordered, volume reference kept, shadow option setups.
+export const OUTLOOK_VERSION = 2;
 export const REGIMES = ["TREND_UP", "TREND_DOWN", "RANGE", "BREAK_RISK_UP", "BREAK_RISK_DOWN", "INSUFFICIENT_DATA"];
 
 export const OUTLOOK_HIT_RULES = {
@@ -48,7 +52,16 @@ export function getOutlookConfig(env = process.env) {
     trendScore: num(e.SWING_TREND_SCORE, 3),
     highConfidenceScore: num(e.SWING_HIGH_CONFIDENCE_SCORE, 5),
     breakProximityStraddleFrac: num(e.SWING_BREAK_PROXIMITY_FRAC, 0.25),
-    minNearDte: num(e.SWING_MIN_NEAR_DTE, 3),
+    minNearDte: num(e.SWING_MIN_NEAR_DTE, 3), // used only when trading sessions cannot be counted
+    // The near weekly is the outlook expiry only with at least this many trading sessions left after
+    // the recorded session (Friday → Monday expiry is 1 session even though it is 3 calendar days).
+    minNearSessions: Math.round(num(e.SWING_MIN_NEAR_SESSIONS, 2)),
+    // Variance weight of a closed (weekend) calendar day relative to a session, for the straddle's time.
+    closedDayVarWeight: num(e.SWING_CLOSED_DAY_VAR_WEIGHT, 0.25),
+    // ATM straddle ≈ 0.8 σ√T and a session's expected high–low range ≈ 1.6 σ, so the implied range per
+    // session ≈ 2 × straddle / √T. (v1 compared straddle/√calendar-days with the range: ~3× too low.)
+    volRangeFactor: num(e.SWING_VOL_RANGE_FACTOR, 2),
+    setup: getSetupConfig(e),
     pivotMinSessions: Math.round(num(e.SWING_PIVOT_MIN_SESSIONS, 4)),
   };
 }
@@ -79,6 +92,28 @@ const dowOf = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay();
 const shift = (iso, days) => new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
 const mondayOf = (iso) => shift(iso, -((dowOf(iso) + 6) % 7));
 
+/**
+ * Trading sessions strictly after fromIso up to and including toIso (weekdays and Muhurat dates;
+ * exchange holidays are not modelled, see src/marketCalendar.js), and the closed calendar days in
+ * between. null when either date is unusable or toIso is more than 400 days away.
+ */
+export function sessionsBetween(fromIso, toIso) {
+  const re = /^\d{4}-\d{2}-\d{2}$/;
+  if (!re.test(String(fromIso || "")) || !re.test(String(toIso || ""))) return null;
+  const span = Math.round((Date.parse(`${toIso}T00:00:00Z`) - Date.parse(`${fromIso}T00:00:00Z`)) / 86400000);
+  if (!Number.isFinite(span) || span > 400) return null;
+  if (span <= 0) return { sessions: 0, closedDays: 0, calendarDays: Math.max(0, span) };
+  let sessions = 0;
+  for (let i = 1; i <= span; i++) if (getSessionKindForDate(shift(fromIso, i)) !== "CLOSED") sessions += 1;
+  return { sessions, closedDays: span - sessions, calendarDays: span };
+}
+
+/** Sessions left to a chain's expiry after the recorded session asOf (null when not countable). */
+function sessionsLeft(asOf, expiry) {
+  const iso = expiryToIso(expiry);
+  return iso && asOf ? sessionsBetween(asOf, iso) : null;
+}
+
 const hasSpotBar = (d) => d?.spot && isFin(d.spot.close) && isFin(d.spot.high) && isFin(d.spot.low) && Number(d.spot.close) > 0;
 const hasFutBar = (d) => d?.fut && Number(d.fut.close) > 0 && Number(d.fut.oiClose) > 0;
 
@@ -99,25 +134,29 @@ export function chooseHorizon(last, cfg) {
   const okChain = (c) => c && Number(c.straddle) > 0;
   let want = "nextWeekly";
   let why = "";
-  if (okChain(near) && isFin(near.dte) && Number(near.dte) >= cfg.minNearDte) {
+  const nearLeft = okChain(near) ? sessionsLeft(last?.date, near.expiry) : null;
+  if (okChain(near) && nearLeft && nearLeft.sessions >= cfg.minNearSessions) {
     want = "near";
-    why = `near weekly has ${plural(Number(near.dte), "day")} left (≥ ${cfg.minNearDte})`;
+    why = `near weekly has ${plural(nearLeft.sessions, "trading session")} left (≥ ${cfg.minNearSessions})`;
+  } else if (okChain(near) && nearLeft) {
+    why = `near weekly has ${plural(nearLeft.sessions, "trading session")} left (< ${cfg.minNearSessions}), so the next weekly is used`;
+  } else if (okChain(near) && isFin(near.dte) && Number(near.dte) >= cfg.minNearDte) {
+    want = "near";
+    why = `near weekly has ${plural(Number(near.dte), "day")} left (≥ ${cfg.minNearDte}; sessions not countable)`;
   } else if (okChain(near)) {
     why = `near weekly has ${plural(Number(near.dte) || 0, "day")} left (< ${cfg.minNearDte}), so the next weekly is used`;
   } else {
     why = "near weekly chain not captured, so the next weekly is used";
   }
-  if (okChain(chains[want])) {
-    const c = chains[want];
-    return { key: want, chain: c, expiry: c.expiry || null, dte: isFin(c.dte) ? Number(c.dte) : null, basis: `${CHAIN_LABEL[want]} ${c.expiry || "?"}: ${why}`, fallback: false };
-  }
+  const out = (k, c, basis, fallback) => {
+    const left = sessionsLeft(last?.date, c.expiry);
+    return { key: k, chain: c, expiry: c.expiry || null, dte: isFin(c.dte) ? Number(c.dte) : null, sessionsLeft: left ? left.sessions : null, closedDaysLeft: left ? left.closedDays : null, basis, fallback };
+  };
+  if (okChain(chains[want])) return out(want, chains[want], `${CHAIN_LABEL[want]} ${chains[want].expiry || "?"}: ${why}`, false);
   for (const k of ["near", "nextWeekly", "monthly"]) {
-    if (okChain(chains[k])) {
-      const c = chains[k];
-      return { key: k, chain: c, expiry: c.expiry || null, dte: isFin(c.dte) ? Number(c.dte) : null, basis: `${CHAIN_LABEL[want]} chain was not captured on ${last?.date}; using the ${CHAIN_LABEL[k]} ${c.expiry || "?"} instead`, fallback: true };
-    }
+    if (okChain(chains[k])) return out(k, chains[k], `${CHAIN_LABEL[want]} chain was not captured on ${last?.date}; using the ${CHAIN_LABEL[k]} ${chains[k].expiry || "?"} instead`, true);
   }
-  return { key: null, chain: null, expiry: null, dte: null, basis: last ? `no option chain recorded on ${last.date}` : "no sessions recorded", fallback: false };
+  return { key: null, chain: null, expiry: null, dte: null, sessionsLeft: null, closedDaysLeft: null, basis: last ? `no option chain recorded on ${last.date}` : "no sessions recorded", fallback: false };
 }
 
 function priceGroup(ds, cfg) {
@@ -271,15 +310,20 @@ function volatilityGroup(ds, horizon, cfg) {
   const ranges = win.map((d) => Number(d.spot.high) - Number(d.spot.low));
   const realised = mean(ranges);
   const dte = isFin(horizon.dte) ? Number(horizon.dte) : 1;
-  const impliedPerDay = straddle / Math.sqrt(Math.max(dte, 1));
+  // Time in session units: sessions left + a small weight for closed days (weekends carry little
+  // variance). Falls back to calendar days when sessions cannot be counted.
+  const counted = isFin(horizon.sessionsLeft);
+  const tUnits = counted ? Math.max(1, Number(horizon.sessionsLeft) + cfg.closedDayVarWeight * Number(horizon.closedDaysLeft || 0)) : Math.max(dte, 1);
+  const impliedRange = (cfg.volRangeFactor * straddle) / Math.sqrt(tUnits);
   let state = "NORMAL";
-  if (impliedPerDay >= cfg.volRatio * realised) state = "COMPRESSED";
-  else if (realised >= cfg.volRatio * impliedPerDay) state = "EXPANDING";
-  const txt = { COMPRESSED: "realised moves are small against what options price in", EXPANDING: "realised moves are larger than options price in", NORMAL: "realised and implied moves are in line" }[state];
-  g.reasons.push(`Straddle ${f0(straddle)} over ${plural(Math.max(dte, 1), "day")} implies ~${f0(impliedPerDay)} pts a day; the last ${plural(win.length, "session")} averaged a ${f0(realised)}-pt range: ${txt}.`);
+  if (impliedRange >= cfg.volRatio * realised) state = "COMPRESSED";
+  else if (realised >= cfg.volRatio * impliedRange) state = "EXPANDING";
+  const txt = { COMPRESSED: "options price bigger moves than the market is making (premium is rich)", EXPANDING: "the market is moving more than options price in (premium is cheap)", NORMAL: "realised and implied moves are in line" }[state];
+  const tTxt = counted ? `${plural(Number(horizon.sessionsLeft), "session")}${horizon.closedDaysLeft ? ` + ${plural(Number(horizon.closedDaysLeft), "closed day")}` : ""}` : plural(Math.max(dte, 1), "calendar day");
+  g.reasons.push(`Straddle ${f0(straddle)} over ${tTxt} implies a ~${f0(impliedRange)}-pt high–low range a session; the last ${plural(win.length, "session")} averaged ${f0(realised)}: ${txt}.`);
   g.available = true;
   g.state = state;
-  g.inputs = { straddle, dte, impliedPerDay: r2(impliedPerDay), realisedAvgRange: r2(realised), ranges: ranges.map(r2), dates: win.map((d) => d.date), ratio: cfg.volRatio };
+  g.inputs = { straddle, dte, sessionsLeft: counted ? Number(horizon.sessionsLeft) : null, closedDaysLeft: counted ? Number(horizon.closedDaysLeft || 0) : null, timeUnits: r2(tUnits), rangeFactor: cfg.volRangeFactor, impliedRangePerSession: r2(impliedRange), realisedAvgRange: r2(realised), realisedToImplied: impliedRange > 0 ? r2(realised / impliedRange) : null, ranges: ranges.map(r2), dates: win.map((d) => d.date), ratio: cfg.volRatio };
   return g;
 }
 
@@ -345,23 +389,7 @@ function buildLadder({ side, close, prevDay, swing, profile, nearWall, expectedR
   const beyond = (v) => isFin(v) && (side === "above" ? Number(v) > close : Number(v) < close);
   const fmtC = (c) => `${c.note} ${f0(c.value)}`;
   const wallComp = () => ({ type: side === "above" ? "NEAR_CALL_WALL" : "NEAR_PUT_WALL", value: Number(nearWall.strike), note: `largest near-money ${side === "above" ? "call" : "put"} OI (${Math.round(nearWall.oi / 1000)}k)` });
-  // 1 WARNING: the volume centre, on the view's wrong side
-  if (profile) {
-    const centre = side === "above" ? Math.max(profile.poc, profile.vwap) : Math.min(profile.poc, profile.vwap);
-    const comps = [
-      { type: "POC", value: profile.poc, note: `${profile.sessions}-session volume point of control` },
-      { type: "VWAP", value: profile.vwap, note: `${profile.sessions}-session volume-weighted average` },
-    ];
-    steps.push({
-      key: "WARNING",
-      value: r2(centre),
-      zone: { low: r2(Math.min(profile.poc, profile.vwap)), high: r2(Math.max(profile.poc, profile.vwap)) },
-      components: comps,
-      status: beyond(centre) ? "NOT_REACHED" : "ALREADY_BEYOND",
-      basis: `a daily close ${side} the volume centre ${f0(centre)} (${comps.map(fmtC).join(", ")})`,
-    });
-  }
-  // 2 INVALIDATED: previous day's extreme, merged with the value-area edge and the near-money wall
+  // 2 INVALIDATED (built first: the warning must sit between the close and step 2): previous day's extreme, merged with the value-area edge and the near-money wall
   const pdx = side === "above" ? prevDay.high : prevDay.low;
   if (beyond(pdx)) {
     const comps = [{ type: side === "above" ? "PREV_DAY_HIGH" : "PREV_DAY_LOW", value: Number(pdx), note: `${prevDay.date} ${side === "above" ? "high" : "low"}` }];
@@ -386,8 +414,49 @@ function buildLadder({ side, close, prevDay, swing, profile, nearWall, expectedR
     const z = zoneOf(comps3, side, tol);
     steps.push({ key: "FLIPPED", ...z, status: "NOT_REACHED", basis: `a daily close ${side} ${f0(z.value)} (${z.components.map(fmtC).join(", ")})` });
   }
+  // 1 WARNING: the volume centre on the view's wrong side, but only where it comes BEFORE step 2
+  // (v1 could place it beyond step 2: 25225 below 25368 on 20-Nov-2026, a warning after the view
+  // was already wrong). Preference: the original centre (the farther of POC / VWAP), then the
+  // nearer of the two, then the near-money OI wall. None in between → no warning step; the volume
+  // levels stay visible as the ladder's volume reference.
+  // Bound: the nearest later step — step 2, or step 3 when there is no step 2 (review 21-Nov: a close
+  // at the session low builds no step 2, and the warning landed beyond the swing-low flip).
+  const s2pre = steps.find((x) => x.key === "INVALIDATED") || steps.find((x) => x.key === "FLIPPED");
+  const before2 = (v) => beyond(v) && (!s2pre || (side === "above" ? Number(v) < s2pre.zone.low - tol / 2 : Number(v) > s2pre.zone.high + tol / 2));
+  let warning = null;
+  let warningNote = null;
+  if (profile) {
+    const comps = [
+      { type: "POC", value: profile.poc, note: `${profile.sessions}-session volume point of control` },
+      { type: "VWAP", value: profile.vwap, note: `${profile.sessions}-session volume-weighted average` },
+    ];
+    const far = side === "above" ? Math.max(profile.poc, profile.vwap) : Math.min(profile.poc, profile.vwap);
+    const nearer = side === "above" ? Math.min(profile.poc, profile.vwap) : Math.max(profile.poc, profile.vwap);
+    const pickV = before2(far) ? far : before2(nearer) ? nearer : null;
+    if (pickV !== null) {
+      warning = {
+        key: "WARNING",
+        value: r2(pickV),
+        zone: { low: r2(Math.min(profile.poc, profile.vwap)), high: r2(Math.max(profile.poc, profile.vwap)) },
+        components: comps,
+        status: "NOT_REACHED",
+        basis: `a daily close ${side} the volume centre ${f0(pickV)} (${comps.map(fmtC).join(", ")})`,
+      };
+      // A zone that straddles step 2 would be breached (far edge) only after step 2: clip it to the level.
+      if (s2pre) warning.zone = { low: r2(pickV), high: r2(pickV) };
+    } else if (!beyond(far) && !beyond(nearer)) {
+      warningNote = `the close is already ${side === "above" ? "above" : "below"} the volume centre`;
+    } else {
+      warningNote = `the volume centre lies beyond step ${s2pre?.key === "FLIPPED" ? 3 : 2}`;
+    }
+  }
+  if (!warning && nearWall && before2(nearWall.strike)) {
+    warning = { key: "WARNING", value: Number(nearWall.strike), zone: { low: Number(nearWall.strike), high: Number(nearWall.strike) }, components: [wallComp()], status: "NOT_REACHED", basis: `a daily close ${side} ${f0(nearWall.strike)} (${wallComp().note})` };
+    if (warningNote) warningNote += "; the near-money OI wall is used instead";
+  }
+  if (warning) steps.unshift(warning);
   for (const st of steps) st.distance = r2(Math.abs(st.value - close));
-  return { side, steps };
+  return { side, steps, warningNote };
 }
 
 /** The ladder(s) for a regime: one side for a trend / break view, both sides for a range. Never throws. */
@@ -411,9 +480,20 @@ export function computeInvalidationLadder({ ds, last, chain, regime }) {
       nearCallWall: chain?.nearCallWall || null, nearPutWall: chain?.nearPutWall || null,
       nearWallsRecorded: Boolean(chain && ("nearCallWall" in chain || "nearPutWall" in chain)),
     };
-    if (regime === "TREND_DOWN" || regime === "BREAK_RISK_DOWN") return { view: "BEARISH", ladders: [up()], inputs };
-    if (regime === "TREND_UP" || regime === "BREAK_RISK_UP") return { view: "BULLISH", ladders: [dn()], inputs };
-    if (regime === "RANGE") return { view: "RANGE", ladders: [up(), dn()], inputs };
+    // Volume reference (owner 2026-11-21: keep the POC / VWAP commentary visible even when the volume
+    // centre is not a ladder step).
+    const fmtIn = (v) => Math.round(Number(v)).toLocaleString("en-IN");
+    const volumeReference = profile
+      ? {
+          poc: profile.poc, vwap: profile.vwap, vah: profile.vah, val: profile.val, sessions: profile.sessions,
+          text: `${profile.sessions}-session volume point of control ${fmtIn(profile.poc)} · ${profile.sessions}-session volume-weighted average ${fmtIn(profile.vwap)}`,
+          valueArea: `value area ${fmtIn(profile.val)}–${fmtIn(profile.vah)}`,
+          closeVsVwap: r2(close - profile.vwap),
+        }
+      : null;
+    if (regime === "TREND_DOWN" || regime === "BREAK_RISK_DOWN") return { view: "BEARISH", ladders: [up()], inputs, volumeReference };
+    if (regime === "TREND_UP" || regime === "BREAK_RISK_UP") return { view: "BULLISH", ladders: [dn()], inputs, volumeReference };
+    if (regime === "RANGE") return { view: "RANGE", ladders: [up(), dn()], inputs, volumeReference };
     return null;
   } catch (e) {
     return null;
@@ -540,6 +620,7 @@ export function computeWeeklyOutlook({ days = [], config = null } = {}) {
       ladder,
     };
 
+    const setups = computeSetups({ regime, last, chain, setupChain: last?.chains?.setup || null, levels, volatility, ds, cfg: cfg.setup });
     const exp = horizon.expiry || "the next expiry";
     const rangeTxt = expectedRange ? `${f0(expectedRange.low)}–${f0(expectedRange.high)}` : null;
     const sc = `${score > 0 ? "+" : ""}${score}`;
@@ -563,7 +644,8 @@ export function computeWeeklyOutlook({ days = [], config = null } = {}) {
       shadow: true,
       asOf: last?.date ?? null,
       reference,
-      horizon: { expiry: horizon.expiry, dte: horizon.dte, basis: horizon.basis, chain: horizon.key },
+      horizon: { expiry: horizon.expiry, dte: horizon.dte, sessionsLeft: horizon.sessionsLeft ?? null, closedDaysLeft: horizon.closedDaysLeft ?? null, basis: horizon.basis, chain: horizon.key },
+      setups,
       expectedRange,
       levels,
       groups: {

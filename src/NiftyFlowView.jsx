@@ -22,7 +22,7 @@ import { isSpotFrozenAt } from "./flowCalc.js";
 import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 import { EodVerdictCard } from "./EodVerdictCard.jsx";
-import { WeeklyOutlookCard } from "./WeeklyOutlookCard.jsx";
+import { WeeklyOutlookCard, primeWeeklyOutlook } from "./WeeklyOutlookCard.jsx";
 import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { tvSignalTone } from "./tvSignalTone.js";
@@ -1487,6 +1487,8 @@ function mergeTimelineArrays(localArr = [], serverArr = []) {
 
 export function NiftyFlowView({ t, isDark }) {
   const { isMobile, isTablet, isDesktop } = useResponsive();
+  // Start the Weekly Outlook request with the page, in parallel with /api/nifty-oi (it needs none of it).
+  useEffect(() => { try { primeWeeklyOutlook(); } catch (e) {} }, []);
   const [mobileView, setMobileView] = useState("chart"); // "chart", "argon", "both"
   const [oiData, setOiData] = useState(() => globalOiCache);
   const [argonData, setArgonData] = useState(() => globalArgonCache);
@@ -1847,6 +1849,10 @@ export function NiftyFlowView({ t, isDark }) {
       <div style={{ padding: "40px 14px", textAlign: "center", color: t.textMuted }}>
         <div style={{ fontSize: 28, marginBottom: 12 }}>⚡</div>
         <div style={{ fontSize: 14, fontWeight: 700 }}>Connecting to Nifty Option Chain & Weekly Prediction…</div>
+        {/* The Weekly Outlook does not depend on the live chain: show it while the chain loads. */}
+        <div style={{ maxWidth: 900, margin: "20px auto 0", textAlign: "left" }}>
+          <WeeklyOutlookCard t={t} isDark={isDark} isMobile={isMobile} />
+        </div>
       </div>
     );
   }

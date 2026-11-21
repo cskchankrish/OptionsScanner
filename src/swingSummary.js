@@ -16,6 +16,7 @@ import { profileFromTicks, profileFromSeries } from "./volumeProfile.js";
 const hhmmOf = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 import { keys as scKeys, isSessionDayDoc } from "./scorecard.js";
 import { computeWeeklyOutlook, getOutlookConfig, expiryToIso } from "./weeklyOutlook.js";
+import { getSetupConfig } from "./outlookSetups.js";
 
 export const SWING_SUMMARY_VERSION = 1;
 export const SWING_CAPTURE_END_MINS = 940; // 15:40 IST, last F&O minute
@@ -58,6 +59,14 @@ export function getSwingConfig(env = process.env) {
     maxCaptureMs: Math.round(posNum(e.SWING_MAX_CAPTURE_MS, 5000)),
     lookbackDays: Math.round(posNum(e.SWING_OUTLOOK_LOOKBACK_DAYS, 21)),
     minLiveTicks: Math.round(posNum(e.SWING_MIN_LIVE_TICKS, SWING_MIN_LIVE_TICKS)),
+    // Setup chain (about 2 months out, e.g. the January monthly in late November): first monthly
+    // expiry with at least this many calendar days left. SWING_SETUP_CHAIN=false switches it off.
+    setupChainEnabled: String(e.SWING_SETUP_CHAIN ?? "true").trim().toLowerCase() !== "false",
+    setupMinDte: getSetupConfig(e).minDte,
+    // Official NIFTY 50 open/high/low from the NSE index quote (minute ticks miss intra-minute
+    // extremes: the 20-Nov-2026 low was recorded as 25368 = the open, NSE's low was 25345.2).
+    indexQuoteEnabled: String(e.SWING_INDEX_QUOTE ?? "true").trim().toLowerCase() !== "false",
+    indexQuoteTimeoutMs: Math.round(posNum(e.SWING_INDEX_QUOTE_TIMEOUT_MS, 2500)),
   };
 }
 
@@ -81,7 +90,10 @@ export function dteFromExpiry(expiry, nowMs = Date.now()) {
  * Summary of one NSE option chain. rows: [{ strikePrice, CE: {...}, PE: {...} }].
  * Returns null (never throws) when there is no usable ATM pair.
  */
-export function summariseChain({ rows, spot, expiry = null, nowMs = Date.now(), dte = null } = {}) {
+export const SETUP_STRIKE_BAND_PCT = 12; // strikes kept within spot ± 12% for the setup chain
+export const SETUP_STRIKE_MAX = 90;
+
+export function summariseChain({ rows, spot, expiry = null, nowMs = Date.now(), dte = null, withStrikes = false } = {}) {
   try {
     const s = Number(spot);
     if (!Array.isArray(rows) || !rows.length || !(s > 0)) return null;
@@ -138,12 +150,83 @@ export function summariseChain({ rows, spot, expiry = null, nowMs = Date.now(), 
       pcr: totCallOI > 0 ? r2(totPutOI / totCallOI) : null,
       dte: d,
       strikeCount: clean.length,
+      ...(withStrikes ? { strikes: compactStrikes(clean, s) } : {}),
       partial: notes.length > 0,
       notes,
     };
   } catch (e) {
     return null;
   }
+}
+
+/** Compact per-strike prices / IV / OI near spot (setup chain only): [{ k, ce, pe, ceIv, peIv, ceOi, peOi }]. */
+function compactStrikes(clean, s) {
+  const band = (SETUP_STRIKE_BAND_PCT / 100) * s;
+  return clean
+    .filter((r) => Math.abs(r.strike - s) <= band && (r.ceLtp > 0 || r.peLtp > 0))
+    .sort((a, b) => Math.abs(a.strike - s) - Math.abs(b.strike - s))
+    .slice(0, SETUP_STRIKE_MAX)
+    .sort((a, b) => a.strike - b.strike)
+    .map((r) => ({ k: r.strike, ce: r.ceLtp || null, pe: r.peLtp || null, ceIv: r.ceIv, peIv: r.peIv, ceOi: r.ceOi || null, peOi: r.peOi || null }));
+}
+
+/**
+ * The setup expiry: the first MONTHLY expiry (the last listed expiry of its calendar month) with at
+ * least minDte days left. expiryDates: NSE's "24-Nov-2026" strings. null when none qualifies.
+ */
+export function chooseSetupExpiry(expiryDates, dteOf, minDte = 45) {
+  try {
+    const list = (Array.isArray(expiryDates) ? expiryDates : []).map((e) => ({ e, iso: expiryToIso(e) })).filter((x) => x.iso).sort((a, b) => (a.iso < b.iso ? -1 : 1));
+    const lastOfMonth = new Map();
+    for (const x of list) lastOfMonth.set(x.iso.slice(0, 7), x);
+    for (const x of [...lastOfMonth.values()].sort((a, b) => (a.iso < b.iso ? -1 : 1))) {
+      const d = Number(dteOf(x.e));
+      if (Number.isFinite(d) && d >= minDte) return x.e;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * NIFTY 50 open/high/low/last from NSE's index list (GET /api/allIndices: { data: [{ index:
+ * "NIFTY 50", open, high, low, last, ... }] }). Tolerant of key spelling; null when not found.
+ */
+export function parseIndexQuote(json) {
+  try {
+    const rows = Array.isArray(json?.data) ? json.data : [];
+    const row = rows.find((r) => String(r?.index || r?.indexSymbol || "").trim().toUpperCase() === "NIFTY 50");
+    if (!row) return null;
+    const n = (...ks) => { for (const k of ks) { const v = Number(String(row[k] ?? "").replace(/,/g, "")); if (Number.isFinite(v) && v > 0) return v; } return null; };
+    const q = { open: n("open", "openPrice"), high: n("high", "dayHigh", "highPrice"), low: n("low", "dayLow", "lowPrice"), last: n("last", "lastPrice", "close") };
+    return q.high && q.low && q.high >= q.low ? q : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Applies the official index open/high/low to the tick-derived spot bar when it agrees with the
+ * ticks: high ≥ tick high − 1, low ≤ tick low + 1, open and last inside the quote's own range, and
+ * last within 0.5% of the tick close. Otherwise keeps the ticks and says why. Pure.
+ */
+export function reconcileSpotWithQuote(spot, quote, notes) {
+  if (!spot) return spot;
+  if (!quote) return spot;
+  // No cap on the range vs the tick range: on a sparse-tick day (cold start, poller gaps) the real
+  // range is much wider than the ticks', which is the case the quote exists for (review 21-Nov).
+  const inside = (v) => !v || (v >= quote.low - 1 && v <= quote.high + 1);
+  const ok = quote.high >= spot.high - 1 && quote.low <= spot.low + 1
+    && inside(quote.open) && inside(quote.last)
+    && (!quote.last || Math.abs(quote.last - spot.close) / spot.close <= 0.005);
+  if (!ok) {
+    notes.push(`NSE index quote (H ${quote.high} L ${quote.low} last ${quote.last}) disagrees with the ticks (H ${spot.high} L ${spot.low} C ${spot.close}); ticks kept`);
+    return spot;
+  }
+  const out = { open: quote.open ? r2(quote.open) : spot.open, high: r2(quote.high), low: r2(quote.low), close: spot.close, source: "nse-index-quote", ticks: { open: spot.open, high: spot.high, low: spot.low } };
+  if (out.high !== spot.high || out.low !== spot.low) notes.push(`spot high/low from the NSE index quote (${out.high}/${out.low}; ticks ${spot.high}/${spot.low})`);
+  return out;
 }
 
 const validTicks = (timeline) =>
@@ -213,7 +296,7 @@ function ohlcFromTicks(ticks, notes) {
  * or null). nearIntraday (optional) carries the near-expiry floor/roof/writing at capture time;
  * without it the last tick's values are used.
  */
-export function buildDailySummary({ date, timeline = [], futuresMetrics = null, near = null, nextWeekly = null, monthly = null, nearIntraday = null, dataQuality = null, nowMs = Date.now(), notes: extraNotes = [], minLiveTicks = SWING_MIN_LIVE_TICKS } = {}) {
+export function buildDailySummary({ date, timeline = [], futuresMetrics = null, near = null, nextWeekly = null, monthly = null, setup = null, indexQuote = null, nearIntraday = null, dataQuality = null, nowMs = Date.now(), notes: extraNotes = [], minLiveTicks = SWING_MIN_LIVE_TICKS } = {}) {
   const notes = [];
   try {
     const ticks = validTicks(timeline);
@@ -224,7 +307,9 @@ export function buildDailySummary({ date, timeline = [], futuresMetrics = null, 
     const nonLiveExcluded = useLive ? ticks.length - live.length : 0;
     if (useLive && nonLiveExcluded > 0) notes.push(`${nonLiveExcluded} non-live (gap-bridging) tick(s) excluded from OHLC/OI`);
     if (!useLive && ticks.length) notes.push(`only ${live.length} live tick(s) (< ${minLive}); OHLC/OI from all ${ticks.length} non-synthetic ticks, including non-live ones`);
-    const { spot, fut } = ohlcFromTicks(ohlcTicks, notes);
+    const tickOhlc = ohlcFromTicks(ohlcTicks, notes);
+    const fut = tickOhlc.fut;
+    const spot = reconcileSpotWithQuote(tickOhlc.spot, indexQuote, notes);
     if (fut && futuresMetrics && !futuresMetrics.isStale && futuresMetrics.expiryDate) fut.expiry = futuresMetrics.expiryDate;
     if (!fut && futuresMetrics && !futuresMetrics.isStale && Number(futuresMetrics.lastPrice) > 0) {
       notes.push("futures close from the live quote only (no futures ticks)");
@@ -257,7 +342,7 @@ export function buildDailySummary({ date, timeline = [], futuresMetrics = null, 
       liveOnly: useLive,
       spot,
       fut,
-      chains: { near: near || null, nextWeekly: nextWeekly || null, monthly: monthly || null },
+      chains: { near: near || null, nextWeekly: nextWeekly || null, monthly: monthly || null, setup: setup || null },
       nearIntraday: nearIntradayOut,
       volProfile: profileFromTicks(ohlcTicks), // volume at price (src/volumeProfile.js)
       coveragePct,
@@ -445,15 +530,30 @@ export async function runSwingCapture({ cfg, ctx, deps, fetchExtras = true, env 
       hasPrefetchedNext: Array.isArray(ctx.prefetchedNextRows) && ctx.prefetchedNextRows.length > 0,
       fetchExtras,
     });
-    const fetchOne = async (expiry) => {
+    const fetchOne = async (expiry, withStrikes = false) => {
       const r = await deps.fetchChain(expiry, cfg.fetchTimeoutMs);
-      return summariseChain({ rows: r?.rows, spot: Number(r?.spot) > 0 ? r.spot : ctx.spot, expiry, nowMs: now(), dte: dteOf(expiry) });
+      return summariseChain({ rows: r?.rows, spot: Number(r?.spot) > 0 ? r.spot : ctx.spot, expiry, nowMs: now(), dte: dteOf(expiry), withStrikes });
     };
+    // Setup chain: the first monthly with ≥ setupMinDte days (fetched in the same parallel batch).
+    const setupExpiry = cfg.setupChainEnabled === false ? null : chooseSetupExpiry(ctx.expiryDates, dteOf, cfg.setupMinDte ?? 45);
+    plan.setup = !setupExpiry
+      ? { expiry: null, action: "skip", note: cfg.setupChainEnabled === false ? null : "setup chain: no monthly expiry about 2 months out in the expiry list" }
+      : !fetchExtras ? { expiry: setupExpiry, action: "skip", note: "setup chain skipped: not enough time left in this refresh" }
+      : { expiry: setupExpiry, action: "fetch", note: null };
     const jobs = {};
     if (plan.nextWeekly.action === "fetch") jobs.nextWeekly = fetchOne(plan.nextWeekly.expiry);
     if (plan.monthly.action === "fetch") jobs.monthly = fetchOne(plan.monthly.expiry);
+    if (plan.setup.action === "fetch") jobs.setup = fetchOne(plan.setup.expiry, true);
+    // Official index OHLC: light, fetched whenever the capture runs (also without extra chains).
+    const quoteJob = cfg.indexQuoteEnabled !== false && typeof deps.fetchIndexQuote === "function"
+      ? Promise.race([
+          Promise.resolve().then(() => deps.fetchIndexQuote(cfg.indexQuoteTimeoutMs ?? 2500)).then((j) => parseIndexQuote(j)),
+          // hard cap: the quote may never hold the writes back (the dep also leaves a write reserve)
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), (cfg.indexQuoteTimeoutMs ?? 2500) + 200)),
+        ]).catch((e) => { notes.push(`NSE index quote failed: ${e?.message || e}; spot high/low from ticks`); return null; })
+      : Promise.resolve(null);
     const names = Object.keys(jobs);
-    const settled = await Promise.allSettled(names.map((n) => jobs[n]));
+    const [settled, indexQuote] = await Promise.all([Promise.allSettled(names.map((n) => jobs[n])), quoteJob]);
     const got = {};
     names.forEach((n, i) => {
       const s = settled[i];
@@ -468,7 +568,8 @@ export async function runSwingCapture({ cfg, ctx, deps, fetchExtras = true, env 
     let monthly = got.monthly || null;
     if (plan.monthly.action === "same-as-near") monthly = near;
     if (plan.monthly.action === "same-as-next") monthly = nextWeekly;
-    for (const k of ["nextWeekly", "monthly"]) if (plan[k].note) notes.push(plan[k].note);
+    for (const k of ["nextWeekly", "monthly", "setup"]) if (plan[k]?.note) notes.push(plan[k].note);
+    const setup = got.setup || null;
 
     const summary = buildDailySummary({
       date: ctx.date,
@@ -477,6 +578,8 @@ export async function runSwingCapture({ cfg, ctx, deps, fetchExtras = true, env 
       near,
       nextWeekly,
       monthly,
+      setup,
+      indexQuote,
       nearIntraday: ctx.nearIntraday,
       dataQuality: ctx.dataQuality,
       nowMs: now(),
