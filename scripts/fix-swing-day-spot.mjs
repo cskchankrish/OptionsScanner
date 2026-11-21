@@ -21,8 +21,19 @@
  *   node scripts/fix-swing-day-spot.mjs --date 2026-11-20 --field low --expect 25368 --value 25345.2 [--apply]
  * Usage, a list (JSON array of { date, field, expect, value }):
  *   node scripts/fix-swing-day-spot.mjs --batch scripts/data/swing-spot-corrections-2026-11.json [--apply]
+ *
+ * Days with NO stored summary (11–13 Nov 2026, recorded before the capture existed) are derived on
+ * every read from the scorecard day (src/swingSummary.js summaryFromScorecardDoc), so there is
+ * nothing to patch. For those, the script derives the summary exactly as the app does, checks the
+ * derived values against "expect", applies the NSE values and STORES it (SET NX: never overwrites
+ * an existing summary; TTL = 400 days from the session date). The app then reads the stored copy.
+ * Fields: open, high, low.
  */
 import fs from "fs";
+import { summaryFromScorecardDoc, swingKeys } from "../src/swingSummary.js";
+import { keys as scKeys, isSessionDayDoc } from "../src/scorecard.js";
+
+const RETENTION_DAYS = 400; // SWING_RETENTION_DAYS default
 
 const args = process.argv.slice(2);
 const opt = (name) => {
@@ -52,7 +63,7 @@ if (opt("batch")) {
 }
 for (const c of changes) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(c.date || ""))) fail(`bad date ${JSON.stringify(c.date)} (YYYY-MM-DD)`);
-  if (!["low", "high"].includes(c.field)) fail(`${c.date}: field must be low or high`);
+  if (!["low", "high", "open"].includes(c.field)) fail(`${c.date}: field must be open, high or low`);
   if (!Number.isFinite(Number(c.expect)) || !Number.isFinite(Number(c.value)) || !(Number(c.value) > 0)) fail(`${c.date} ${c.field}: expect and value must be numbers`);
 }
 
@@ -75,34 +86,51 @@ const today = new Date().toISOString().slice(0, 10);
 // 1. read and check everything first
 const plans = [];
 for (const [date, cs] of byDate) {
-  const key = `nifty:swing:day:${date}`;
+  const key = swingKeys.day(date);
   const raw = await cmd(["GET", key]);
-  if (!raw) fail(`${key} not found (days before 16-Nov-2026 are derived on read from the scorecard and have no stored summary)`);
   let doc;
-  try {
-    doc = typeof raw === "string" ? JSON.parse(raw) : raw;
-  } catch (e) {
-    fail(`${key} is not JSON`);
+  let derived = false;
+  if (!raw) {
+    // no stored summary: derive it from the scorecard day, as GET /api/swing does
+    const scRaw = await cmd(["GET", scKeys.day(date)]);
+    if (!scRaw) fail(`${key} not found and no scorecard day ${scKeys.day(date)} to derive it from`);
+    let sc;
+    try {
+      sc = typeof scRaw === "string" ? JSON.parse(scRaw) : scRaw;
+    } catch (e) {
+      fail(`${scKeys.day(date)} is not JSON`);
+    }
+    if (!isSessionDayDoc(sc)) fail(`${scKeys.day(date)} is not a session day`);
+    doc = summaryFromScorecardDoc(sc);
+    if (!doc) fail(`${date}: the scorecard day yields no summary`);
+    derived = true;
+  } else {
+    try {
+      doc = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (e) {
+      fail(`${key} is not JSON`);
+    }
   }
   if (!doc || doc.date !== date || !doc.spot) fail(`${key} has no spot bar for ${date}`);
   const spot = { ...doc.spot };
   const notes = [];
   for (const c of cs) {
     const old = Number(doc.spot[c.field]);
-    if (Math.abs(old - Number(c.expect)) > 0.001) fail(`${date}: stored spot.${c.field} is ${old}, not the expected ${c.expect}; NOTHING was written`);
+    if (Math.abs(old - Number(c.expect)) > 0.001) fail(`${date}: ${derived ? "derived" : "stored"} spot.${c.field} is ${old}, not the expected ${c.expect}; NOTHING was written`);
     spot[c.field] = Number(c.value);
-    notes.push(`spot.${c.field} corrected ${old} → ${c.value} from the NSE daily bar (manual, ${today}); minute snapshots missed the extreme`);
+    notes.push(`spot.${c.field} corrected ${old} → ${c.value} from the NSE daily bar (manual, ${today}); ${derived ? "the scorecard series held minute snapshots and gap-bridging (interpolated) ticks" : "minute snapshots missed the extreme"}`);
   }
   if (spot.low > spot.high) fail(`${date}: low ${spot.low} would be above high ${spot.high}`);
   if (spot.low > Math.min(spot.open, spot.close)) fail(`${date}: low ${spot.low} would be above the open/close`);
   if (spot.high < Math.max(spot.open, spot.close)) fail(`${date}: high ${spot.high} would be below the open/close`);
   spot.ticks = doc.spot.ticks || { open: doc.spot.open, high: doc.spot.high, low: doc.spot.low };
   spot.source = "manual-nse-correction";
-  plans.push({ key, date, before: doc.spot, updated: { ...doc, spot, notes: [...(Array.isArray(doc.notes) ? doc.notes : []), ...notes] } });
+  if (derived) notes.push(`stored on ${today} from the scorecard-derived summary so the NSE correction persists (was derived on read)`);
+  plans.push({ key, date, derived, before: doc.spot, updated: { ...doc, spot, notes: [...(Array.isArray(doc.notes) ? doc.notes : []), ...notes] } });
 }
 
 for (const p of plans) {
-  console.log(p.key);
+  console.log(`${p.key}${p.derived ? " (no stored summary: will be created from the scorecard-derived one)" : ""}`);
   console.log(`  before: O ${p.before.open} H ${p.before.high} L ${p.before.low} C ${p.before.close}`);
   console.log(`  after:  O ${p.updated.spot.open} H ${p.updated.spot.high} L ${p.updated.spot.low} C ${p.updated.spot.close}`);
 }
@@ -113,10 +141,18 @@ if (!apply) {
 
 // 2. write
 for (const p of plans) {
-  const ttl = Number(await cmd(["TTL", p.key]));
-  const setArgs = ttl > 0 ? ["SET", p.key, JSON.stringify(p.updated), "EX", String(ttl)] : ["SET", p.key, JSON.stringify(p.updated)];
+  let ttl;
+  let setArgs;
+  if (p.derived) {
+    const ageDays = Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${p.date}T00:00:00Z`)) / 86400000);
+    ttl = Math.max(86400, (RETENTION_DAYS - ageDays) * 86400);
+    setArgs = ["SET", p.key, JSON.stringify(p.updated), "NX", "EX", String(ttl)];
+  } else {
+    ttl = Number(await cmd(["TTL", p.key]));
+    setArgs = ttl > 0 ? ["SET", p.key, JSON.stringify(p.updated), "EX", String(ttl)] : ["SET", p.key, JSON.stringify(p.updated)];
+  }
   const res = await cmd(setArgs);
-  if (res !== "OK") fail(`${p.key}: SET returned ${res}`);
+  if (res !== "OK") fail(`${p.key}: SET returned ${res}${p.derived ? " (a stored summary appeared meanwhile; nothing overwritten)" : ""}`);
   const check = JSON.parse(await cmd(["GET", p.key]));
   console.log(`WRITTEN ${p.key}: H ${check.spot.high} L ${check.spot.low} (TTL kept: ${ttl > 0 ? `${Math.round(ttl / 86400)} days` : "none"})`);
 }

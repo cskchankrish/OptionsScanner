@@ -46,6 +46,19 @@ test("a finished session: scorecard, raw timeline, signals and swing saved, gzip
   assert.equal(m.complete, true);
   assert.ok(api.calls.filter(([p]) => p.startsWith("/api/scorecard")).every(([, auth]) => auth), "scorecard reads authenticated");
   assert.equal(await exportDay({ out, date: "2026-11-19", get: api.get, nowMs: at("2026-11-20", 16, 0) }), "already complete");
+  // a later correction of the swing summary (21-Nov-2026: NSE daily high/low) refreshes swing.json only
+  const calls = api.calls.length;
+  const same = [{ date: "2026-11-19", spot: { close: 25514.3 } }];
+  assert.equal(await exportDay({ out, date: "2026-11-19", get: api.get, nowMs: at("2026-11-21", 16, 0), swingDays: same }), "already complete");
+  const fixed = [{ date: "2026-11-19", spot: { low: 25104.8, close: 25514.3, source: "manual-nse-correction" } }];
+  assert.equal(await exportDay({ out, date: "2026-11-19", get: api.get, nowMs: at("2026-11-21", 16, 0), swingDays: fixed }), "already complete; swing summary updated");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "swing.json"))).spot.low, 25104.8);
+  const m2 = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json")));
+  assert.equal(m2.complete, true);
+  assert.ok(m2.swingUpdatedAt);
+  assert.equal(m2.fetchedAt, m.fetchedAt, "the rest of the manifest is unchanged");
+  assert.equal(api.calls.length, calls, "no API re-reads for a complete day");
+  assert.equal(await exportDay({ out, date: "2026-11-19", get: api.get, nowMs: at("2026-11-21", 17, 0), swingDays: fixed }), "already complete");
 });
 
 test("not finalised → nothing written; secret rejected → nothing written; no session → marker", async () => {

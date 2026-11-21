@@ -59,7 +59,19 @@ const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, "utf8
 export async function exportDay({ out, date, get, nowMs, swingDays = [] }) {
   const dir = dayDir(out, date);
   const prev = readJson(path.join(dir, "manifest.json"));
-  if (prev?.complete) return "already complete";
+  if (prev?.complete) {
+    // A swing summary can be corrected after the day was archived (21-Nov-2026: spot highs/lows
+    // replaced by the NSE daily bar). Refresh swing.json whenever the source differs; the archive's
+    // git history keeps the earlier version. Nothing else of a complete day is re-read.
+    const swingNow = prev.noSession ? null : swingDays.find((d) => d?.date === date);
+    const file = path.join(dir, "swing.json");
+    if (swingNow && JSON.stringify(readJson(file)) !== JSON.stringify(swingNow)) {
+      writeJson(file, swingNow);
+      writeJson(path.join(dir, "manifest.json"), { ...prev, swing: true, swingUpdatedAt: new Date(nowMs).toISOString() });
+      return "already complete; swing summary updated";
+    }
+    return "already complete";
+  }
   const sc = await get(`/api/scorecard?date=${date}&series=1`, { auth: true });
   if (!sc?.ok) return `scorecard unavailable (${sc?.error || "no response"})`;
   if (sc.noSession) {
