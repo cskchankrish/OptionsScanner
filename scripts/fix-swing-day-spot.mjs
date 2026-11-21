@@ -27,7 +27,8 @@
  * nothing to patch. For those, the script derives the summary exactly as the app does, checks the
  * derived values against "expect", applies the NSE values and STORES it (SET NX: never overwrites
  * an existing summary; TTL = 400 days from the session date). The app then reads the stored copy.
- * Fields: open, high, low.
+ * Fields: open, high, low (spot) and fut.close (the futures close: NSE's official closing price, the
+ * volume-weighted average of the last 30 minutes; the previous value is kept in fut.last).
  */
 import fs from "fs";
 import { summaryFromScorecardDoc, swingKeys } from "../src/swingSummary.js";
@@ -63,7 +64,7 @@ if (opt("batch")) {
 }
 for (const c of changes) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(c.date || ""))) fail(`bad date ${JSON.stringify(c.date)} (YYYY-MM-DD)`);
-  if (!["low", "high", "open"].includes(c.field)) fail(`${c.date}: field must be open, high or low`);
+  if (!["low", "high", "open", "fut.close"].includes(c.field)) fail(`${c.date}: field must be open, high, low or fut.close`);
   if (!Number.isFinite(Number(c.expect)) || !Number.isFinite(Number(c.value)) || !(Number(c.value) > 0)) fail(`${c.date} ${c.field}: expect and value must be numbers`);
 }
 
@@ -114,7 +115,19 @@ for (const [date, cs] of byDate) {
   if (!doc || doc.date !== date || !doc.spot) fail(`${key} has no spot bar for ${date}`);
   const spot = { ...doc.spot };
   const notes = [];
-  for (const c of cs) {
+  const futCs = cs.filter((c) => c.field === "fut.close");
+  let fut = doc.fut ? { ...doc.fut } : null;
+  for (const c of futCs) {
+    if (!fut) fail(`${date}: no futures bar to correct; NOTHING was written`);
+    const old = Number(fut.close);
+    if (Math.abs(old - Number(c.expect)) > 0.001) fail(`${date}: ${derived ? "derived" : "stored"} fut.close is ${old}, not the expected ${c.expect}; NOTHING was written`);
+    const v = Number(c.value);
+    if (Number(fut.low) > 0 && Number(fut.high) > 0 && (v < Number(fut.low) - 60 || v > Number(fut.high) + 60)) fail(`${date}: fut.close ${v} is far outside the day's futures range ${fut.low}–${fut.high}; NOTHING was written`);
+    fut = { ...fut, close: v, last: fut.last ?? old, closeBasis: "nse-official-close", source: "manual-nse-correction" };
+    notes.push(`fut.close corrected ${old} → ${v} to NSE's official futures close (volume-weighted last 30 minutes; manual, ${today}); the previous value was the last captured trade (kept in fut.last)`);
+  }
+  const spotCs = cs.filter((c) => c.field !== "fut.close");
+  for (const c of spotCs) {
     const old = Number(doc.spot[c.field]);
     if (Math.abs(old - Number(c.expect)) > 0.001) fail(`${date}: ${derived ? "derived" : "stored"} spot.${c.field} is ${old}, not the expected ${c.expect}; NOTHING was written`);
     spot[c.field] = Number(c.value);
@@ -123,14 +136,17 @@ for (const [date, cs] of byDate) {
   if (spot.low > spot.high) fail(`${date}: low ${spot.low} would be above high ${spot.high}`);
   if (spot.low > Math.min(spot.open, spot.close)) fail(`${date}: low ${spot.low} would be above the open/close`);
   if (spot.high < Math.max(spot.open, spot.close)) fail(`${date}: high ${spot.high} would be below the open/close`);
-  spot.ticks = doc.spot.ticks || { open: doc.spot.open, high: doc.spot.high, low: doc.spot.low };
-  spot.source = "manual-nse-correction";
+  if (spotCs.length) {
+    spot.ticks = doc.spot.ticks || { open: doc.spot.open, high: doc.spot.high, low: doc.spot.low };
+    spot.source = "manual-nse-correction";
+  }
   if (derived) notes.push(`stored on ${today} from the scorecard-derived summary so the NSE correction persists (was derived on read)`);
-  plans.push({ key, date, derived, before: doc.spot, updated: { ...doc, spot, notes: [...(Array.isArray(doc.notes) ? doc.notes : []), ...notes] } });
+  plans.push({ key, date, derived, before: doc.spot, beforeFut: doc.fut || null, updated: { ...doc, spot: spotCs.length ? spot : doc.spot, ...(futCs.length ? { fut } : {}), notes: [...(Array.isArray(doc.notes) ? doc.notes : []), ...notes] } });
 }
 
 for (const p of plans) {
   console.log(`${p.key}${p.derived ? " (no stored summary: will be created from the scorecard-derived one)" : ""}`);
+  if (p.updated.fut !== p.beforeFut) console.log(`  futures close: ${p.beforeFut?.close} → ${p.updated.fut?.close}`);
   console.log(`  before: O ${p.before.open} H ${p.before.high} L ${p.before.low} C ${p.before.close}`);
   console.log(`  after:  O ${p.updated.spot.open} H ${p.updated.spot.high} L ${p.updated.spot.low} C ${p.updated.spot.close}`);
 }
@@ -154,7 +170,7 @@ for (const p of plans) {
   const res = await cmd(setArgs);
   if (res !== "OK") fail(`${p.key}: SET returned ${res}${p.derived ? " (a stored summary appeared meanwhile; nothing overwritten)" : ""}`);
   const check = JSON.parse(await cmd(["GET", p.key]));
-  console.log(`WRITTEN ${p.key}: H ${check.spot.high} L ${check.spot.low} (TTL kept: ${ttl > 0 ? `${Math.round(ttl / 86400)} days` : "none"})`);
+  console.log(`WRITTEN ${p.key}: H ${check.spot.high} L ${check.spot.low}${check.fut ? ` fut close ${check.fut.close}` : ""} (TTL kept: ${ttl > 0 ? `${Math.round(ttl / 86400)} days` : "none"})`);
 }
 }
 

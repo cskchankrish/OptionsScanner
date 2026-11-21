@@ -1,0 +1,32 @@
+[
+  {
+    "date": "2026-11-16",
+    "field": "fut.close",
+    "expect": 25312.4,
+    "value": 25293.6
+  },
+  {
+    "date": "2026-11-17",
+    "field": "fut.close",
+    "expect": 25390,
+    "value": 25415.3
+  },
+  {
+    "date": "2026-11-18",
+    "field": "fut.close",
+    "expect": 25231.2,
+    "value": 25239.3
+  },
+  {
+    "date": "2026-11-19",
+    "field": "fut.close",
+    "expect": 25537.1,
+    "value": 25533
+  },
+  {
+    "date": "2026-11-20",
+    "field": "fut.close",
+    "expect": 25770.1,
+    "value": 25775.3
+  }
+]
