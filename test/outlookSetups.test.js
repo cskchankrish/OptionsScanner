@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { bs, pickStrike, computeSetups, evaluateSetupOutcome, tallySetups, getSetupConfig } from "../src/outlookSetups.js";
 import { computeWeeklyOutlook, computeInvalidationLadder, sessionsBetween, chooseHorizon, getOutlookConfig } from "../src/weeklyOutlook.js";
-import { chooseSetupExpiry, parseIndexQuote, reconcileSpotWithQuote, summariseChain, dteFromExpiry } from "../src/swingSummary.js";
+import { chooseSetupExpiry, parseIndexQuote, reconcileSpotWithQuote, summariseChain, dteFromExpiry, futuresClose } from "../src/swingSummary.js";
 import { createSwingHandler } from "../api/swing.js";
 
 const CFG = getOutlookConfig({});
@@ -433,4 +433,21 @@ test("GET /api/swing: a snapshot from an older outlook version is recomputed wit
   assert.equal(q.recomputed, false);
   assert.equal(q.headline, "v2 stored");
   assert.equal(body.days.find((x) => x.date === "2026-11-20").fut.expiry, null, "fut.expiry is exposed (null when not recorded)");
+});
+
+test("futures close: 15:10–15:40 volume-weighted average (NSE's method), trading until 15:40", () => {
+  const tk = (m, f, v) => ({ minutes: m, futPrice: f, futVolume: v });
+  // 20-Nov-like tail: prices rise then dip in the last minutes; the VWAP is not the last trade
+  const ticks = [tk(900, 25700, 1000), tk(911, 25780, 1100), tk(912, 25790, 1400), tk(925, 25780, 1700), tk(936, 25770, 1800), tk(938, 25763, 1850), tk(941, 25900, 1900)];
+  const c = futuresClose(ticks);
+  // increments in the window: 912 (+300 @25790), 925 (+300 @25780), 936 (+100 @25770), 938 (+50 @25763); 911's previous tick (900) is outside; 941 is after the close
+  assert.equal(c.close, Math.round(((25790 * 300 + 25780 * 300 + 25770 * 100 + 25763 * 50) / 750) * 100) / 100);
+  assert.equal(c.last, 25763, "last trade up to 15:40, the 15:41 print excluded");
+  assert.equal(c.closeBasis, "vwap-15:10-15:40");
+  // no volume increments → time-weighted average of the window
+  const flat = futuresClose([tk(911, 100, 5), tk(920, 110, 5), tk(930, 120, 5)]);
+  assert.equal(flat.close, 110);
+  assert.equal(flat.closeBasis, "twap-15:10-15:40");
+  // nothing in the window → the last tick
+  assert.deepEqual(futuresClose([tk(600, 25000, 10), tk(700, 25010, 20)]), { close: 25010, last: 25010, closeBasis: "last-tick" });
 });

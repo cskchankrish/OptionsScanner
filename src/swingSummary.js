@@ -9,7 +9,7 @@
  *
  * Every function here is pure (or takes its I/O as injected deps) and never throws.
  */
-import { isSpotFrozenAt } from "./flowCalc.js";
+import { isSpotFrozenAt, FNO_CLOSE_MINS } from "./flowCalc.js";
 import { firstLiveIndex } from "./sessionOpen.js";
 import { profileFromTicks, profileFromSeries } from "./volumeProfile.js";
 
@@ -20,8 +20,12 @@ import { getSetupConfig } from "./outlookSetups.js";
 
 export const SWING_SUMMARY_VERSION = 1;
 export const SWING_CAPTURE_END_MINS = 940; // 15:40 IST, last F&O minute
-export const SWING_PARTIAL_COVERAGE_PCT = 50;
-export const FUT_CLOSE_MINS = 930; // 15:30 IST: futures close = last tick at or before it // a captured day below this tick coverage is partial
+export const SWING_PARTIAL_COVERAGE_PCT = 50; // a captured day below this tick coverage is partial
+// Futures close (owner 2026-11-21): index futures trade until 15:40 IST (FNO_CLOSE_MINS). NSE's
+// official futures closing price is the volume-weighted average of the last 30 minutes, not the
+// last trade. On the archived 13–20 Nov minute series a 15:10–15:40 VWAP matched the official daily
+// close within 0.2–4.8 pts; the last trade missed by 2–19 pts. (An earlier cut at 15:30 was wrong.)
+export const FUT_CLOSE_WINDOW_START_MINS = 910; // 15:10 IST
 // With at least this many live ticks (isLiveTick !== false), OHLC/OI use live ticks only, so
 // gap-bridging (interpolated) ticks synced back by a browser cannot set a high or low.
 export const SWING_MIN_LIVE_TICKS = 30;
@@ -236,6 +240,36 @@ const validTicks = (timeline) =>
     .slice()
     .sort((a, b) => Number(a.minutes) - Number(b.minutes));
 
+/**
+ * NSE-style futures close from minute ticks: the volume-weighted average price of 15:10–15:40 IST,
+ * weighting each minute by its cumulative-volume increment (only increments whose previous tick is
+ * also inside the window, so a gap never dumps hours of volume on one minute). Without volume, the
+ * time-weighted average of the same window; without window ticks, the last tick up to 15:40.
+ * Returns { close, last, closeBasis }. Pure.
+ */
+export function futuresClose(futTicks) {
+  const rows = (Array.isArray(futTicks) ? futTicks : []).filter((p) => Number(p.futPrice) > 0 && Number(p.minutes) <= FNO_CLOSE_MINS);
+  if (!rows.length) {
+    const any = (Array.isArray(futTicks) ? futTicks : []).filter((p) => Number(p.futPrice) > 0);
+    const l = any.at(-1);
+    return l ? { close: r2(Number(l.futPrice)), last: r2(Number(l.futPrice)), closeBasis: "last-tick" } : { close: null, last: null, closeBasis: null };
+  }
+  const last = r2(Number(rows.at(-1).futPrice));
+  let pv = 0, vv = 0;
+  for (let k = 1; k < rows.length; k++) {
+    const r = rows[k], p = rows[k - 1];
+    if (Number(r.minutes) <= FUT_CLOSE_WINDOW_START_MINS || Number(p.minutes) < FUT_CLOSE_WINDOW_START_MINS - 1) continue;
+    const dv = Number(r.futVolume) - Number(p.futVolume);
+    if (!(dv > 0)) continue;
+    pv += Number(r.futPrice) * dv;
+    vv += dv;
+  }
+  if (vv > 0) return { close: r2(pv / vv), last, closeBasis: "vwap-15:10-15:40" };
+  const win = rows.filter((r) => Number(r.minutes) > FUT_CLOSE_WINDOW_START_MINS);
+  if (win.length) return { close: r2(win.reduce((a, r) => a + Number(r.futPrice), 0) / win.length), last, closeBasis: "twap-15:10-15:40" };
+  return { close: last, last, closeBasis: "last-tick" };
+}
+
 /** OHLC + OI from ticks. Pure. */
 function ohlcFromTicks(ticks, notes) {
   const spotTicks = ticks.filter((p) => Number(p.spot) > 0);
@@ -280,9 +314,7 @@ function ohlcFromTicks(ticks, notes) {
       open: r2(Number(src[0].futPrice)),
       high: r2(Math.max(...src.map((p) => Number(p.futPrice)))),
       low: r2(Math.min(...src.map((p) => Number(p.futPrice)))),
-      // last tick up to 15:30 IST (audit 21-Nov-2026: the 15:31–15:40 ticks drifted up to 22 pts
-      // from the session close, e.g. 16-Nov 25312.4 at 15:37 vs 25290.9 at 15:30)
-      close: r2(Number((futAll.filter((p) => Number(p.minutes) <= FUT_CLOSE_MINS).at(-1) || futAll[futAll.length - 1]).futPrice)),
+      ...futuresClose(futAll),
       oiOpen,
       oiClose,
       oiChangePct: oiOpen > 0 && oiClose > 0 ? r2(((oiClose - oiOpen) / oiOpen) * 100) : null,
