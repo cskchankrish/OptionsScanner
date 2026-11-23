@@ -8,6 +8,7 @@ import { isSessionLiveNow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { DataFreshnessBadge } from "./DataFreshness.jsx";
 import { ExitRulesPanel } from "./ExitRulesPanel.jsx";
+import { CandidatePaperPanel } from "./CandidatePaperPanel.jsx";
 import { OverrideCostPanel } from "./OverrideCostPanel.jsx";
 import { CarryCheckPanel } from "./CarryCheckPanel.jsx";
 
@@ -195,6 +196,8 @@ export function ScorecardView({ t, isDark }) {
       <OverrideCostPanel t={t} rolling={agg?.overrides} day={day?.overrides} />
 
       <ExitRulesPanel t={t} rolling={agg?.exitRules} dayRows={day?.exitRules} />
+
+      <CandidatePaperPanel t={t} rolling={agg?.candidatePaper} day={day?.candidatePaper} />
 
       <CarryCheckPanel t={t} days={days} />
 

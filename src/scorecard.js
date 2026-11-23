@@ -26,6 +26,7 @@ import { firstLiveIndex } from "./sessionOpen.js";
 import { isCandidateTelegramEnabled, formatCandidateOutcomeLine } from "./candidateShadow.js";
 import { ivCuts, ivBandOf, IV_BANDS } from "./ivShadow.js";
 import { evaluateDayExitRules, formatExitRuleLines } from "./exitRuleShadow.js";
+import { formatCandidatePaperLines, getCandidatePaperConfig } from "./candidatePaper.js";
 import { evaluateDayOverrides, formatOverrideLines } from "./overrideCost.js";
 
 export const SC_TTL_SEC = 180 * 86400;
@@ -823,6 +824,8 @@ export function formatDailyTelegram(doc, { candidates = true, outside = [] } = {
   // Exit-rule shadow (measurement only): the day's positions under rules A–E, in futures points.
   if (doc.series) {
     try { lines.push(...formatExitRuleLines(evaluateDayExitRules(doc))); } catch (e) { /* never blocks the message */ }
+    // Candidate paper trades (shadow): confirmed candidates as if real, under the Algo's rules.
+    try { lines.push(...formatCandidatePaperLines(doc, getCandidatePaperConfig(typeof process !== "undefined" ? process.env : {}))); } catch (e) { /* never blocks the message */ }
   }
   // Override cost (measurement only): manual closes and logged outside trades vs the system.
   try { lines.push(...formatOverrideLines(evaluateDayOverrides(doc, outside, { authed: true }))); } catch (e) { /* never blocks the message */ }

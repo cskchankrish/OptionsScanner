@@ -26,6 +26,7 @@ import {
 import { getSessionKindForDate } from "../src/marketCalendar.js";
 import { planKeys } from "../src/planDocShadow.js";
 import { evaluateDayExitRules, aggregateExitRules } from "../src/exitRuleShadow.js";
+import { buildCandidatePaper } from "../src/candidatePaper.js";
 import { evaluateDayOverrides, aggregateOverrides, normaliseOutsideTrade } from "../src/overrideCost.js";
 
 async function defaultDeps() {
@@ -168,11 +169,14 @@ export function createScorecardHandler(overrides = {}) {
       }
       // Exit-rule shadow: every position of the day replayed under rules A–E (measurement only).
       const exitRules = evaluateDayExitRules(view);
+      // Candidate paper ledger (shadow): confirmed candidates traded as if real under the Algo's rules.
+      let candidatePaper = null;
+      try { candidatePaper = buildCandidatePaper([view]); } catch (e) { candidatePaper = null; }
       let outside = [];
       try { outside = (await store.get(keys.outside(date))) || []; } catch (e) { outside = []; }
       let overrides = null;
       try { overrides = evaluateDayOverrides(authed ? doc : view, Array.isArray(outside) ? outside : [], { authed }); } catch (e) { overrides = null; }
-      return res.status(200).json({ ok: true, authenticated: authed, ...light, exitRules, overrides, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
+      return res.status(200).json({ ok: true, authenticated: authed, ...light, exitRules, candidatePaper, overrides, seriesPoints: series?.m?.length ?? null, ...(req.query?.series === "1" ? { series } : {}), ...(planDoc ? { planDoc } : {}) });
     }
 
     // ── rolling aggregate ──
@@ -190,6 +194,19 @@ export function createScorecardHandler(overrides = {}) {
     const agg = aggregate(docs, { minSample: getScorecardConfig().minSample, includeTrades: authed });
     agg.days = n;
     agg.exitRules = aggregateExitRules(docs); // shadow: rules A–E replayed on every position
+    // Candidate paper ledger (shadow): the go-live record is the WHOLE stored history (180 days,
+    // the scorecard TTL), not the window chosen in the dropdown (review 23-Nov-2026).
+    try {
+      let ledgerDocs = docs;
+      if (n < 180) {
+        const all = [];
+        for (let i = 0; i < 180; i++) all.push(shiftDate(today.date, -i));
+        ledgerDocs = (await store.mget(all.map((d) => keys.day(d)))).filter((d) => d && d.date && isSessionDayDoc(d));
+      }
+      agg.candidatePaper = buildCandidatePaper(ledgerDocs);
+    } catch (e) {
+      agg.candidatePaper = null;
+    }
     try {
       const outs = await store.mget(docs.map((d) => keys.outside(d.date)));
       agg.overrides = aggregateOverrides(docs.map((d, i) => evaluateDayOverrides(d, Array.isArray(outs?.[i]) ? outs[i] : [], { authed })));

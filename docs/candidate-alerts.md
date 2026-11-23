@@ -125,3 +125,42 @@ the chain's filtering is worth.
 Either untick "Send shadow candidate alerts (no orders)" on v4.3.1, or re-add the v4.3 indicator
 (`strategy_dashboard_v4_3_real_oi.pine`, unchanged) and recreate its alert the same way (delete,
 then "Any alert() function call" with the same URL and message).
+
+## Paper ledger (added 23-Nov-2026)
+
+Confirmed candidates are paper-traded **as if they were real signals**, so they can earn — or fail
+to earn — a switch to live. Code: `src/candidatePaper.js`; tests: `test/candidatePaper.test.js`;
+shown on the Scorecard tab ("Candidate paper trades") and in the daily scorecard Telegram. Paper
+only: nothing claims the trade slot, reaches the Algo or places an order.
+
+Why: on 23-Nov-2026 NIFTY fell ~625 points while the indicator's Auto-mode call-writing proxy (the
+futures basis) stayed off all day, so the real `SYNERGY_BEAR` never fired during the move. The
+`SYNERGY_BEAR_CAND` at 11:20 was CONFIRMED by the real chain (ΔPCR 0.35) but only logged.
+
+| Rule | Default | Env |
+|---|---|---|
+| Which candidates | `SYNERGY_BULL_CAND`, `SYNERGY_BEAR_CAND` | `CAND_PAPER_GRADES` |
+| Which verdicts | CONFIRMED | `CAND_PAPER_CATEGORIES` |
+| Stop limit (the Algo's flow `max_r_pts`) | 120 pts from entry | `CAND_PAPER_MAX_R_PTS` |
+| Positions | one at a time (a candidate while a paper position is open is skipped) | — |
+| Management | the exit-rule shadow's BASELINE path: NIFTY futures (spot levels shifted by the basis at entry), minute fills, stop before target in the same minute, T1 → stop to entry, T2, 15:36 square-off | — |
+| Go-live check | ≥ 30 trades, net points > 0, profit factor ≥ 1.5, both halves of the record positive | `CAND_PAPER_MIN_TRADES`, `CAND_PAPER_MIN_PF` |
+
+**Two tracks.** *As the Algo trades today*: a stop wider than the limit is rejected (shown as "not
+taken: stop too wide" with what it would have made). *Stop capped*: the same trade with the stop
+pulled in to the limit. Synergy stops come from the Supertrend line, which after a long move can be
+far away: the 23-Nov 11:20 candidate had a 226-pt stop — rejected as the Algo trades today; with
+the stop capped at 120 it reached T1, moved the stop to entry and was held to the 15:36 square-off
+for +270.3 futures points (2.58 R).
+
+The go-live thresholds are starting values. Meeting them is evidence, not a switch: turning
+candidates live (and any stop-policy change) stays the owner's decision.
+
+**Statuses.** `TAKEN` (closed: counted), `OPEN` (the series ends before the 15:36 square-off —
+today in progress or a feed that stopped: shown marked to market, never counted, and it keeps the
+slot), `SKIPPED_STOP_TOO_WIDE`, `SKIPPED_POSITION_OPEN` (a paper position held the slot),
+`SKIPPED_REAL_TRADE_OPEN` (an executed real signal held the Algo's single slot), `DUPLICATE_OF_REAL`
+(a real signal fired on the same bar and side: it is counted as real, not as paper evidence) and
+`UNMEASURABLE`. The running record and its go-live check always use the whole stored history
+(180 days), whatever window the Scorecard dropdown shows. Telegram lines put grades and reason codes
+in `code` so the legacy-Markdown daily message stays valid.
