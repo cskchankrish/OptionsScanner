@@ -164,3 +164,24 @@ slot), `SKIPPED_STOP_TOO_WIDE`, `SKIPPED_POSITION_OPEN` (a paper position held t
 `UNMEASURABLE`. The running record and its go-live check always use the whole stored history
 (180 days), whatever window the Scorecard dropdown shows. Telegram lines put grades and reason codes
 in `code` so the legacy-Markdown daily message stays valid.
+
+## Indicator v4.3.2 (23-Nov-2026): proxy fixes
+
+`strategy_dashboard_v4_3_1_candidates.pine` (file name kept; title, short title and payload `v` are
+now 4.3.2). Found by running the script's own futures/basis block on TradingView for 19–23 Nov:
+
+| Problem | Effect | Fix |
+|---|---|---|
+| Days to expiry came from `syminfo.expiration_date` of the continuous `NIFTY1!`, which TradingView does not provide | DTE was the manual fallback **12 on every bar**, so the expiry-week guards (`isExpiryWeek`, DTE ≤ 4) never switched on and the fair basis assumed 12 days | DTE from the NSE calendar: the monthly F&O expiry is the last Tuesday of the month, moved to the previous trading day on an exchange holiday (input "NSE Weekday Holidays", default 24-Nov-2026, 25-Dec-2026, 26-Jan-2027 — keep it current). Verified on TradingView: 19-Nov 4, 20-Nov 3, 23-Nov 0 (expiry moved from Tue 24-Nov to Mon 23-Nov) |
+| The spot index freezes 15:15–15:30 for the closing auction while futures trade | futures − frozen spot looked like a basis move; on 23-Nov a real `SYNERGY_BEAR` fired at 15:22 that the recalculated bars do not reproduce (Algo rejected it: stop 221.7 pts) | Input "Ignore Basis During the 15:15–15:30 Closing-Auction Spot Freeze" (on): a bar that opens inside 15:15–15:30 (the same live and on history), or any live evaluation from 15:16 to 15:30, treats the basis as unavailable (a bar confirming in the 15:15 minute keeps its valid close; on 75m/125m charts the last bar is frozen only for evaluations after 15:15). Verified on 5m bars: 15:15, 15:20, 15:25 frozen; 15:10, 15:30, 15:35 not for every basis-derived proxy (put/call writing, basis expanding up/down, fresh participation, proxy OI, trap flows). Displayed values are unchanged |
+
+What this does **not** change: in Auto mode the call-writing proxy still needs the futures basis to
+fall, and with the correct DTE it is now off for the whole expiry week (DTE ≤ 4), so a real
+`SYNERGY_BEAR` cannot fire on those days — on 23-Nov it would still have stayed silent, now for a
+stated reason. Those days are covered by the shadow candidates and their paper ledger (above). Side
+effect checked: over ~12 sessions (300 bars) the corrected fair basis changed the put-writing proxy
+on 3 bars (16-Nov, DTE 7).
+
+**To use it:** paste the script into TradingView (it is not deployed from this repo) and recreate
+the alerts, since an alert stays bound to the script version it was created with. Set the webhook
+secret in the alert yourself.

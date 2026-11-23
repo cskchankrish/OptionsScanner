@@ -19,8 +19,8 @@
 // ═══════════════════════════════════════════════════════════════════
 
 //@version=6
-indicator("Strategy Dashboard v4.3.1 (Smart Money Real Futures OI + Webhook Bridge Fusion + Shadow Candidates)",
-     shorttitle       = "SD v4.3.1 Real-OI",
+indicator("Strategy Dashboard v4.3.2 (Smart Money Real Futures OI + Webhook Bridge Fusion + Shadow Candidates)",
+     shorttitle       = "SD v4.3.2 Real-OI",
      overlay          = true,
      max_bars_back    = 500,
      max_lines_count  = 150,
@@ -123,9 +123,18 @@ useRealFutOi  = input.bool(true,  "Use Real NSE Futures Open Interest (_OI Ticke
      tooltip="Queries real exchange Open Interest via futTicker + '_OI' (and futNextTicker + '_OI'). Falls back automatically to the 1.5x Volume + Basis proxy if _OI is unavailable on your data plan.")
 useRolloverOi = input.bool(true,  "Aggregate Near + Next Month Futures OI (Rollover-Safe)", group=GFU,
      tooltip="Sums Near + Next month Open Interest so expiry-week contract rollovers never trigger false Long-Unwinding or Short-Covering signals.")
-autoDte       = input.bool(true,  "Auto-Calculate DTE from Futures Contract Expiry", group=GFU,
+autoDte       = input.bool(true,  "Auto-Calculate DTE (NSE monthly expiry calendar)", group=GFU,
      tooltip="Automatically computes Days to Expiry (DTE) from syminfo.expiration_date of the Futures contract. Uses manual DTE below only as fallback.")
 dteInput      = input.int(12,     "Fallback Manual DTE (Used only if Auto-DTE unavailable)", minval=0, maxval=35, group=GFU)
+// v4.3.2: TradingView gives no expiration date for the continuous NIFTY1! symbol, so the old
+// syminfo-based Auto-DTE always fell back to the manual 12 days — the expiry-week basis guards never
+// switched on (23-Nov-2026, the November expiry day, ran with DTE 12). The DTE now comes from the
+// NSE calendar: the monthly F&O expiry is the last Tuesday of the month, moved to the previous
+// trading day when that Tuesday is an exchange holiday (list below; keep it current).
+nseHolidays   = input.string("2026-11-24,2026-12-25,2027-01-26", "NSE Weekday Holidays (YYYY-MM-DD, comma-separated) for expiry shifts", group=GFU,
+     tooltip="A monthly expiry falling on one of these dates moves to the previous trading day (e.g. 24-Nov-2026 Guru Nanak Jayanti → 23-Nov). Add the NSE holidays that land on a last Tuesday.")
+freezeGuard   = input.bool(true,  "Ignore Basis During the 15:15–15:30 Closing-Auction Spot Freeze", group=GFU,
+     tooltip="The NIFTY 50 spot index stops updating at 15:15 IST for the closing auction while futures keep trading, so futures − spot is not a real basis until 15:30. On 23-Nov-2026 this produced a late SYNERGY_BEAR at 15:22.")
 volParticMult = input.float(1.50, "Fallback Proxy Volume Participation Multiplier (x 20-SMA)", minval=1.05, maxval=3.0, step=0.05, group=GFU,
      tooltip="Audit recommendation: 1.50x 20-bar SMA ensures genuine institutional participation when falling back to volume proxy.")
 trapLb15m     = input.int(24,     "15m Trap Lookback Bars (24 = 1 Full Trading Day)", minval=6, maxval=125, group=GFU,
@@ -871,8 +880,28 @@ float fLowBar     = hasFutFeed ? futL : low
 float fVol        = hasFutFeed ? futVol : nz(volume, 0)
 float fVolSma     = hasFutFeed ? futVolSma : chartVolSma
 
-// Auto-DTE Calculation from Futures Contract Expiration Metadata (with manual fallback)
-int calcAutoDte = (not na(futExpTime) and futExpTime > time) ? int(math.ceil((futExpTime - time) / 86400000.0)) : dteInput
+// Auto-DTE from the NSE monthly expiry calendar (v4.3.2). The syminfo expiration of the continuous
+// NIFTY1! symbol is not available on TradingView, so it is only a last resort.
+f_isNseHoliday(int t) =>
+    str.contains("," + str.replace_all(nseHolidays, " ", "") + ",", "," + str.format_time(t, "yyyy-MM-dd", "Asia/Kolkata") + ",")
+f_monthlyExpiry(int y, int m) =>
+    int nextY = m == 12 ? y + 1 : y
+    int nextM = m == 12 ? 1 : m + 1
+    int e = timestamp("Asia/Kolkata", nextY, nextM, 1, 0, 0) - 86400000
+    // dayofweek: 1 = Sunday … 3 = Tuesday … 7 = Saturday
+    e -= ((dayofweek(e, "Asia/Kolkata") - 3 + 7) % 7) * 86400000
+    int guard = 0
+    while guard < 10 and (f_isNseHoliday(e) or dayofweek(e, "Asia/Kolkata") == 1 or dayofweek(e, "Asia/Kolkata") == 7)
+        e -= 86400000
+        guard += 1
+    e
+int barDayIst   = timestamp("Asia/Kolkata", year(time, "Asia/Kolkata"), month(time, "Asia/Kolkata"), dayofmonth(time, "Asia/Kolkata"), 0, 0)
+int expThisMon  = f_monthlyExpiry(year(time, "Asia/Kolkata"), month(time, "Asia/Kolkata"))
+int nextMonY    = month(time, "Asia/Kolkata") == 12 ? year(time, "Asia/Kolkata") + 1 : year(time, "Asia/Kolkata")
+int nextMonM    = month(time, "Asia/Kolkata") == 12 ? 1 : month(time, "Asia/Kolkata") + 1
+int curExpiry   = expThisMon >= barDayIst ? expThisMon : f_monthlyExpiry(nextMonY, nextMonM)
+int calDte      = int(math.round((curExpiry - barDayIst) / 86400000.0)) // calendar days; 0 on expiry day
+int calcAutoDte = not na(curExpiry) ? calDte : ((not na(futExpTime) and futExpTime > time) ? int(math.ceil((futExpTime - time) / 86400000.0)) : dteInput)
 int dteEff      = autoDte ? math.max(0, math.min(45, calcAutoDte)) : dteInput
 bool isExpiryDay = dteEff <= 1
 
@@ -906,8 +935,22 @@ else
     cumFutVolChg   += nz(futSignedVol, 0)
     cumFutTotalV   += fVol
 
+// Closing-auction spot freeze (v4.3.2): from 15:15 to 15:30 IST the spot index is a stale print
+// while futures trade, so futures − spot is not a basis. The basis is treated as unavailable for the
+// option-writing / basis proxies (displayed values are unchanged) on:
+//   - a bar that OPENS inside 15:15–15:30 (its whole spot window is frozen; same live and on history);
+//   - any live evaluation from 15:16 to 15:30 (a bar still open then pairs the stale spot with live
+//     futures — the 15:22 SYNERGY_BEAR of 23-Nov-2026). A bar confirming in the 15:15 minute keeps
+//     its valid pre-freeze close, so live and history agree on it; on 75m/125m charts the last bar
+//     is only frozen for evaluations after 15:15, not from its 13:25/14:15 open.
+int  barOpenMinsIst  = hour(time, "Asia/Kolkata") * 60 + minute(time, "Asia/Kolkata")
+int  nowMinsIst      = hour(timenow, "Asia/Kolkata") * 60 + minute(timenow, "Asia/Kolkata")
+bool inAuctionFreeze = freezeGuard and timeframe.isintraday and
+     ((barOpenMinsIst >= 915 and barOpenMinsIst < 930) or (barstate.isrealtime and nowMinsIst >= 916 and nowMinsIst < 931))
+
 // 1. Fair-Value Cost-of-Carry Basis Math (r = 6.5% benchmark minus ~1.3% NIFTY dividend yield = 5.2% net carry)
 bool  hasDistinctFut      = hasFutFeed and math.abs(fLast - refSpotC) > 0.05
+bool  basisOk             = hasDistinctFut and not inAuctionFreeze // gate for every basis-derived proxy below
 float rawBasis            = hasDistinctFut ? (fLast - refSpotC) : 0.0
 float fairBasis           = hasDistinctFut ? (refSpotC * ((0.052 * math.max(0, dteEff)) / 365.0)) : 0.0
 float adjustedBasisSpread = hasDistinctFut ? (rawBasis - fairBasis) : 0.0
@@ -936,11 +979,11 @@ float priceMoveThrPct = isDailyChart ? 0.35 : (tfMins >= 60 ? 0.18 : 0.08)
 float basisShiftThr   = isDailyChart ? 10.0 : (tfMins >= 60 ? 7.0  : 5.0)
 float realOiThrPct    = isDailyChart ? 1.00 : (tfMins >= 60 ? 0.75 : 0.50)
 
-bool basisExpandingUp = hasDistinctFut and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= -2.0 and barBasisDelta >= 1.5))
-bool basisExpandingDn = hasDistinctFut and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -1.5)
+bool basisExpandingUp = basisOk and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= -2.0 and barBasisDelta >= 1.5))
+bool basisExpandingDn = basisOk and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -1.5)
 // Strict Institutional Participation: requires >=volParticMult (1.50x) 20-SMA volume OR >=basisShiftThr distinct futures basis expansion
 bool hasInstVol       = fVolSma > 0 and fVol >= volParticMult * fVolSma
-bool freshPartic      = inRegSession and (hasInstVol or (hasDistinctFut and math.abs(intradayBasisDelta) >= basisShiftThr))
+bool freshPartic      = inRegSession and (hasInstVol or (basisOk and math.abs(intradayBasisDelta) >= basisShiftThr))
 float prev5MaxVol     = ta.highest(fVol, 5)[1]
 bool volExhaustAfterSpike = fVolSma > 0 and prev5MaxVol >= volParticMult * fVolSma and fVol < 0.85 * fVolSma
 
@@ -952,9 +995,9 @@ float realOiChgPct = (hasRealNearOi and realOiRef > 0) ? ((totalRealOiC - realOi
 float proxyOiChgPct = 0.0
 if freshPartic and ((futPriceChgPct >= priceMoveThrPct and basisExpandingUp) or (futPriceChgPct <= -priceMoveThrPct and basisExpandingDn))
     proxyOiChgPct := math.max(0.55, math.abs(futPriceChgPct) * 1.5)
-else if futPriceChgPct >= (priceMoveThrPct * 1.5) and ((hasDistinctFut and not isExpiryWeek and (intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -2.0)) or volExhaustAfterSpike)
+else if futPriceChgPct >= (priceMoveThrPct * 1.5) and ((basisOk and not isExpiryWeek and (intradayBasisDelta <= -basisShiftThr or barBasisDelta <= -2.0)) or volExhaustAfterSpike)
     proxyOiChgPct := -0.55
-else if futPriceChgPct <= -(priceMoveThrPct * 1.5) and ((hasDistinctFut and (intradayBasisDelta >= basisShiftThr or barBasisDelta >= 2.0)) or volExhaustAfterSpike)
+else if futPriceChgPct <= -(priceMoveThrPct * 1.5) and ((basisOk and (intradayBasisDelta >= basisShiftThr or barBasisDelta >= 2.0)) or volExhaustAfterSpike)
     proxyOiChgPct := -0.55
 
 float effOiChgPct  = hasRealNearOi ? realOiChgPct : proxyOiChgPct
@@ -975,8 +1018,8 @@ float actFloor  = extFloorStrike > 0.0 ? extFloorStrike : autoFloor
 
 bool isManualOpt        = extOptMode == "Manual / Scanner Override (From OptionsScanner)"
 // Note: In Auto mode, Put/Call Blitz is a Futures Basis + Institutional Volume proxy (live 22-strike DeltaPCR requires Manual input or Webhook Bridge)
-bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : (hasDistinctFut and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= 3.0 and barBasisDelta >= 1.0)) and freshPartic)
-bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.70) : (hasDistinctFut and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr) and freshPartic)
+bool isPutWritingBlitz  = isManualOpt ? (extDeltaPcr >= 1.30) : (basisOk and (intradayBasisDelta >= basisShiftThr or (adjustedBasisSpread >= 3.0 and barBasisDelta >= 1.0)) and freshPartic)
+bool isCallWritingBlitz = isManualOpt ? (extDeltaPcr <= 0.70) : (basisOk and not isExpiryWeek and (rawBasis < -5.0 or intradayBasisDelta <= -basisShiftThr) and freshPartic)
 
 // High-Conviction Synergies
 bool isBullSynergy      = futQuadrant == "LONG_BUILDUP"  and isPutWritingBlitz  and basisExpandingUp
@@ -1016,7 +1059,7 @@ bool bullTrapPA   = isUptrendRegime ?
 // - Optional Spot-Only Volume+RSI Exhaustion fallback ONLY if explicitly enabled via allowSpotFlw
 bool realShortFlow = hasRealNearOi and ((futPriceChgPct >= priceMoveThrPct and realOiChgPct <= -realOiThrPct) or (close < open and realOiChgPct >= realOiThrPct and hasInstVol))
 bool spotBearFlw   = allowSpotFlw and not hasRealNearOi and not hasDistinctFut and hasInstVol and rsiVal[1] >= 62.0 and rsiVal < rsiVal[1]
-bool bullTrapFlow  = realShortFlow or (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (hasDistinctFut and not isExpiryWeek and intradayBasisDelta <= -basisShiftThr) or spotBearFlw
+bool bullTrapFlow  = realShortFlow or (futQuadrant == "SHORT_COVERING") or isCallWritingBlitz or (basisOk and not isExpiryWeek and intradayBasisDelta <= -basisShiftThr) or spotBearFlw
 
 // ── BEAR TRAP LOGIC (Real-Time Chart Timeframe — Zero Circular Flow!) ──
 bool sweepLo      = low <= localTrapLo and close > localTrapLo
@@ -1035,7 +1078,7 @@ bool bearTrapPA   = isUptrendRegime ?
 // - OR Put Writing Blitz / Positive Basis Expansion
 bool realLongFlow  = hasRealNearOi and ((futPriceChgPct <= -priceMoveThrPct and realOiChgPct <= -realOiThrPct) or (close > open and realOiChgPct >= realOiThrPct and hasInstVol))
 bool spotBullFlw   = allowSpotFlw and not hasRealNearOi and not hasDistinctFut and hasInstVol and rsiVal[1] <= 38.0 and rsiVal > rsiVal[1]
-bool bearTrapFlow  = realLongFlow or (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (hasDistinctFut and intradayBasisDelta >= basisShiftThr) or spotBullFlw
+bool bearTrapFlow  = realLongFlow or (futQuadrant == "LONG_UNWINDING") or isPutWritingBlitz or (basisOk and intradayBasisDelta >= basisShiftThr) or spotBullFlw
 
 // Anti-Whipsaw Cooldown
 var int lastTrapBar = -999
@@ -1994,7 +2037,7 @@ f_json(string _grade, string _dir, float _sl, int _sig, int _reType, string _swi
     string t2DistStr   = _hasSL ? str.tostring(t2P, "0.00") : "null"
     string t1Str       = _hasSL ? str.tostring(t1Prc, "0.00") : "null"
     string t2Str       = _hasSL ? str.tostring(t2Prc, "0.00") : "null"
-    '{"secret":"' + webhookSecret + '","v":"4.3.1","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","swingTf":"' + evalHtfLabel + '","dir":"' + _dir + '","grade":"' + _grade +
+    '{"secret":"' + webhookSecret + '","v":"4.3.2","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","swingTf":"' + evalHtfLabel + '","dir":"' + _dir + '","grade":"' + _grade +
      '","score":' + str.tostring(sc) +
      ',"sig":'    + str.tostring(_sig) +
      ',"reType":' + str.tostring(_reType) +
