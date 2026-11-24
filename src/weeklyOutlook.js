@@ -11,7 +11,7 @@
  */
 import { PRICE_DEADBAND_PCT, OI_DEADBAND_PCT } from "./smartMoneyFusion.js";
 import { combineProfiles } from "./volumeProfile.js";
-import { getSessionKindForDate } from "./marketCalendar.js";
+import { getSessionKindForDate, DEFAULT_MARKET_HOLIDAYS } from "./marketCalendar.js";
 import { computeSetups, getSetupConfig } from "./outlookSetups.js";
 
 // v2 (2026-11-21): days to expiry counted in trading sessions, volatility compares like with like,
@@ -101,7 +101,9 @@ const mondayOf = (iso) => shift(iso, -((dowOf(iso) + 6) % 7));
  * were shown to 01-Dec instead of 6. Defaults are dates NSE closes every year or whose expiry
  * shift confirms them; add more with SWING_EXCHANGE_HOLIDAYS (comma-separated YYYY-MM-DD).
  */
-export const DEFAULT_EXCHANGE_HOLIDAYS = Object.freeze(["2026-11-24", "2026-12-25", "2027-01-26"]);
+// Same defaults as the market calendar (src/marketCalendar.js, the single source since 24-Nov-2026);
+// getSessionKindForDate already closes them, SWING_EXCHANGE_HOLIDAYS can add more for the outlook only.
+export const DEFAULT_EXCHANGE_HOLIDAYS = DEFAULT_MARKET_HOLIDAYS;
 let exchangeHolidays = new Set(DEFAULT_EXCHANGE_HOLIDAYS);
 /** Replaces the holiday list (defaults + the given dates). Returns the list in use. */
 export function setExchangeHolidays(extra = []) {
@@ -363,7 +365,13 @@ function volatilityGroup(ds, horizon, cfg) {
 function weekLevels(ds, last, cfg) {
   if (!last) return { pivot: { value: null, basis: "no sessions recorded" }, prevWeek: null };
   const dow = dowOf(last.date);
-  const weekStart = dow === 5 || dow === 6 || dow === 0 ? mondayOf(last.date) : shift(mondayOf(last.date), -7);
+  // The last session closes its week when no trading session remains before that week's Friday
+  // (review 24-Nov-2026: with Fri 25-Dec-2026 a holiday, Thu 24-Dec ends the week; the dow === 5
+  // rule skipped it and served the week before as "previous week").
+  const fri = shift(mondayOf(last.date), 4);
+  const left = dow >= 1 && dow <= 4 ? sessionsBetween(last.date, fri) : null;
+  const weekDone = dow === 5 || dow === 6 || dow === 0 || (left && left.sessions === 0);
+  const weekStart = weekDone ? mondayOf(last.date) : shift(mondayOf(last.date), -7);
   const weekEnd = shift(weekStart, 6);
   const wk = ds.filter((d) => d.date >= weekStart && d.date <= weekEnd && hasSpotBar(d));
   const prevWeek = wk.length

@@ -563,7 +563,7 @@ export function eodSessionTimes(isoDate) {
   return { kind, openMins: null, closeMins: null, finalMins: null, closeTimeStr: null };
 }
 
-/** The next session date after isoDate by the calendar (closed weekend days skipped; exchange holidays are not modelled). */
+/** The next session date after isoDate by the calendar (closed weekend days and exchange holidays skipped). */
 export function nextSessionDate(isoDate) {
   if (!ISO_RE.test(String(isoDate || ""))) return null;
   let d = isoDate;
@@ -766,7 +766,7 @@ function capitalise(s) {
 
 /**
  * Resolve EVERY recorded PENDING row dated before today from the first real tick of its next
- * session (by the calendar; exchange holidays are not modelled):
+ * session (by the calendar, exchange holidays skipped):
  * - next session = today → today's timeline; no usable tick yet → stays PENDING;
  * - next session already over → `timelinesByDate[next]` when supplied, otherwise UNRESOLVED
  *   (the opening was not captured on that day, so it is not available now).
@@ -820,6 +820,25 @@ export function resolvePendingEodRows(rows, { todayIso, todayTimeline = [], time
     if (next === todayIso) return resolveOpenFromTimeline(r, todayIso, todayTimeline, { sessionOver: false }).row;
     const tl = timelinesByDate && Array.isArray(timelinesByDate[next]) ? timelinesByDate[next] : [];
     return resolveOpenFromTimeline(r, next, tl, { sessionOver: true }).row;
+  });
+}
+
+/**
+ * A row resolved from a date that is not its next session (24-Nov-2026: before holidays were in the
+ * calendar, 23-Nov's no-carry check was graded "correct" from a fake 24-Nov 09:15 "open" taken from
+ * the holiday's stale payload) goes back to waiting for its real next session. Seed rows are left alone.
+ */
+export function healMisdatedResolutions(rows) {
+  return (Array.isArray(rows) ? rows : []).map((r) => {
+    const from = r?.resolvedFrom?.date;
+    if (!r || !from || isSeedRow(r) || r.outcome === "IN_PROGRESS") return r;
+    const next = nextSessionDate(r.isoDate);
+    if (next && from === next) return r;
+    const { resolvedFrom, cashCheck, openGapPts, openGapPct, ...rest } = r;
+    void resolvedFrom; void cashCheck; void openGapPts; void openGapPct;
+    const note = `Re-opened: was resolved from ${from}, which is not a trading session; waiting for ${next || "the next session"}.`;
+    if (isCarryRow(r)) return { ...rest, outcome: "PENDING", nextDayOpen: null, gapPts: null, notes: note };
+    return { ...rest, nextDayOpen: null, gapPts: null, notes: `No carry. ${note}` };
   });
 }
 
@@ -1002,7 +1021,7 @@ export function buildTodayEodRow({ todayIso, nowMins, timeStr, dayName, spot, fl
  * row whose next session is today from today's timeline, sort newest first.
  */
 export function reconcileEodHistory({ history, todayIso, nowMins, timeStr, dayName, spot, floorStrike, roofStrike, eodDecision, todayTimeline = [], timelinesByDate = null, limit = 60, spotIsReal = false, nseDataMins = null }) {
-  let rows = sanitizeEodHistory(history);
+  let rows = healMisdatedResolutions(sanitizeEodHistory(history));
   if (!isSessionDate(todayIso)) return rows.slice(0, limit);
   rows = settleStaleProvisionalRows(rows, todayIso);
   const idx = rows.findIndex(r => r.isoDate === todayIso);

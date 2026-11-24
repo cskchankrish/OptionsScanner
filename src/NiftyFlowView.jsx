@@ -23,7 +23,7 @@ import { DataQualityStrip, PanelDataMarker } from "./DataQualityStrip.jsx";
 import { TurnTrackerPanel, TurnRadarRow } from "./TurnTrackerPanel.jsx";
 import { EodVerdictCard } from "./EodVerdictCard.jsx";
 import { WeeklyOutlookCard, primeWeeklyOutlook } from "./WeeklyOutlookCard.jsx";
-import { getSessionKind, isMuhuratTomorrow } from "./marketCalendar.js";
+import { getSessionKind, getSessionKindForDate, isMuhuratTomorrow } from "./marketCalendar.js";
 import { useAutoRefresh } from "./useAutoRefresh.js";
 import { tvSignalTone } from "./tvSignalTone.js";
 import { formatSignalStamp } from "./signalStamp.js";
@@ -92,7 +92,9 @@ function getMarketSessionStatus() {
   const day = nowIst.getDay(); // 0 = Sunday, 6 = Saturday
   // Weekends are closed unless the date is in the Muhurat list (src/marketCalendar.js).
   const isSunday = isMuhuratSessionToday(); // "the Muhurat session", not merely a calendar Sunday
-  const isSaturday = !isSunday && (day === 0 || day === 6); // any closed weekend day
+  // any closed day: a weekend, or an NSE trading holiday (src/marketCalendar.js, since 24-Nov-2026)
+  const isoToday = `${nowIst.getFullYear()}-${String(nowIst.getMonth() + 1).padStart(2, "0")}-${String(nowIst.getDate()).padStart(2, "0")}`;
+  const isSaturday = !isSunday && (day === 0 || day === 6 || getSessionKindForDate(isoToday) === "CLOSED");
   const mins = nowIst.getHours() * 60 + nowIst.getMinutes();
 
   // Sunday Diwali Muhurat Trading Window: 14:00 to 16:00 IST (mins 840 to 960)
@@ -111,6 +113,9 @@ function getMarketSessionStatus() {
   if (isSaturday) {
     if (isMuhuratTomorrow(Date.now())) {
       return { isAutoActive: false, reason: "Saturday · Diwali Muhurat Session Tomorrow 14:00 - 16:00 IST (Friday Settled Preserved)" };
+    }
+    if (day >= 1 && day <= 5) {
+      return { isAutoActive: false, reason: "NSE Trading Holiday · Market Closed · Resumes Next Trading Day 09:15 AM (Last Session Settled Preserved)" };
     }
     return { isAutoActive: false, reason: `${day === 0 ? "Sunday" : "Saturday"} · Weekend Closed · Resumes Monday 09:15 AM (Friday Settled Preserved)` };
   }
@@ -2402,6 +2407,10 @@ export function NiftyFlowView({ t, isDark }) {
         const winRateShort = liveStats.resolved > 0
           ? `${liveStats.wins}/${liveStats.resolved}${liveStats.tooFew ? " (too few)" : ` · ${liveStats.winRatePct.toFixed(1)}%`}`
           : "too few";
+        // The win rate counts carry calls only (BTST/STBT); "do not carry" days are scored separately by
+        // the no-carry check, so the headline can sit unchanged for weeks of cash days — say so.
+        const lastCarry = (eodHistory || []).filter(r => r && r.source !== "seed" && (r.bias === "BULLISH" || r.bias === "BEARISH")).map(r => r.isoDate).sort().pop() || null;
+        const noCarryText = liveStats.cashChecked > 0 ? `no-carry right ${liveStats.cashCorrect}/${liveStats.cashChecked}` : "no-carry not checked yet";
         const seedWinRateText = seedStats.resolved > 0 ? `${seedStats.wins}/${seedStats.resolved} (${seedStats.winRatePct.toFixed(1)}%)` : "none";
         const netPts = liveStats.netPts;
         const netPtsFormatted = `${netPts >= 0 ? "+" : ""}${netPts.toFixed(1)}`;
@@ -2794,7 +2803,7 @@ export function NiftyFlowView({ t, isDark }) {
                   }}
                 >
                   <span>
-                    📜 View Track Record &amp; Audit Log ({liveStats.sessions} recorded sessions · win rate {winRateText})
+                    📜 View Track Record &amp; Audit Log ({liveStats.sessions} recorded sessions · carry win rate {winRateText} · {noCarryText}{lastCarry ? ` · last carry call ${lastCarry}` : ""})
                     <span style={{ color: t.textMuted, fontWeight: 600 }}> · Hand-entered (before 7 Nov 2026): {seedWinRateText}</span>
                   </span>
                   <span>Review Past Trades →</span>

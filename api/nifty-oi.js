@@ -3,6 +3,7 @@ import {
   normalizeDateToIso,
   formatIsoToDisplayDate,
   sanitizeEodHistory,
+  healMisdatedResolutions,
   reconcileEodHistory,
   runEodHistoryRepairOnce,
   repairEodHistory,
@@ -687,12 +688,14 @@ export function getMarketSessionInfo(nowMs = Date.now()) {
     nextOpenDescription = mins < 840 ? "Opens Today 14:00 IST (Trading 14:20 - 15:20)" : "Monday 09:15 IST";
   } else if (isSaturday) {
     isLiveMarket = false;
-    isPostMarketSettled = true; // Reviewing Friday's settled session
+    isPostMarketSettled = true; // Reviewing the last settled session
     isPreMarket = false;
-    tradingWindow = "Closed (Weekend)";
+    // A closed Mon–Fri is an NSE trading holiday (src/marketCalendar.js, since 24-Nov-2026).
+    const isHoliday = day >= 1 && day <= 5;
+    tradingWindow = isHoliday ? "Closed (Exchange holiday)" : "Closed (Weekend)";
     nextOpenDescription = muhuratTomorrow
       ? "🪔 Diwali Muhurat Tomorrow (Sunday) 14:00 - 16:00 IST"
-      : "Monday 09:15 IST";
+      : isHoliday || day === 5 ? "Next Trading Day 09:15 IST" : "Monday 09:15 IST";
   } else {
     // Weekday (Mon - Fri)
     isLiveMarket = (mins >= 555 && mins <= 940);
@@ -853,6 +856,32 @@ export async function saveRedisEodHistory(historyArray) {
   }
 }
 
+/**
+ * Sanitised + misdated-resolution-healed history; saves it back when the stored copy changed
+ * (closed days and settled serves, where the live reconcile does not run). Never throws.
+ */
+async function healAndPersistEodHistory(history) {
+  const healed = healMisdatedResolutions(sanitizeEodHistory(history, { limit: 60 }));
+  try {
+    const before = JSON.stringify(sanitizeEodHistory(history, { limit: 60 }));
+    if (REDIS_URL && REDIS_TOKEN && JSON.stringify(healed) !== before) await saveRedisEodHistory(healed);
+  } catch (e) { /* display data only */ }
+  return healed;
+}
+
+/** A settled (cached / persisted) payload served with its track record repaired from the store. */
+async function withHealedEodHistory(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  try {
+    let history = REDIS_URL ? await getRedisEodHistory() : null;
+    if (!Array.isArray(history) || !history.length) history = Array.isArray(payload.eodHistory) ? payload.eodHistory : null;
+    if (!history) return payload;
+    return { ...payload, eodHistory: await healAndPersistEodHistory(history) };
+  } catch (e) {
+    return payload;
+  }
+}
+
 export async function getRedisFuturesSnapshot() {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
   try {
@@ -976,10 +1005,11 @@ export async function resolveAndSyncEodHistory({ spot, floorStrike, roofStrike, 
   if (!Array.isArray(history) || history.length === 0) {
     history = [...CANONICAL_EOD_SEED_HISTORY];
   }
-  // A closed weekend day has no session: never resolve outcomes or record a "today" entry
-  // (stored closed-weekend rows are still not served).
+  // A closed day (weekend or exchange holiday) has no session: never resolve outcomes or record a
+  // "today" entry (stored closed-day rows are still not served). Misdated resolutions ARE repaired and
+  // saved here (24-Nov-2026: a holiday-graded 23-Nov row must not wait for the next session).
   if (dayOfWeek === 6) {
-    return sanitizeEodHistory(history, { limit: 60 });
+    return healAndPersistEodHistory(history);
   }
 
   const repairKeysRan = [];
@@ -2711,7 +2741,7 @@ export default async function handler(req, res) {
     const nearCached = cacheByExpiry.get("near") || cacheByExpiry.get("default") || (cache.data?.expiryDate ? cache : null);
     if (nearCached && (nearCached.data.isSettledSession || now - nearCached.timestamp < 3600000)) {
       return res.status(200).json({
-        ...nearCached.data,
+        ...(await withHealedEodHistory(nearCached.data)),
         isLive: false,
         isSettledSession: true,
         fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,
@@ -2722,7 +2752,7 @@ export default async function handler(req, res) {
       const persisted = await getRedisSessionPayload();
       if (persisted) {
         const enriched = {
-          ...persisted,
+          ...(await withHealedEodHistory(persisted)),
           isLive: false,
           isSettledSession: true,
           fallbackNotice: `Market Closed · Displaying last settled trading session (Preserved until ${sessionInfo.nextOpenDescription})`,

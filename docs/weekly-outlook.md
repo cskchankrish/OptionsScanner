@@ -71,7 +71,7 @@ Every threshold is a default you can override; every raw input is kept in `group
 | Volatility (not directional) | the straddle and 3 daily ranges (`SWING_VOL_MIN_DAYS`), uses up to 5 (`SWING_VOL_LOOKBACK_DAYS`) | implied high–low range a session = 2 × straddle / √T (`SWING_VOL_RANGE_FACTOR`), T = trading sessions left + 0.25 × closed days left (`SWING_CLOSED_DAY_VAR_WEIGHT`), vs the average daily spot range. `COMPRESSED` = premium rich, `EXPANDING` = premium cheap | `COMPRESSED` if implied ≥ 1.3 × realised, `EXPANDING` if realised ≥ 1.3 × implied (`SWING_VOL_RATIO`), else `NORMAL` |
 
 **Outlook expiry.** The near weekly if it has at least 2 trading sessions left after the recorded
-session (`SWING_MIN_NEAR_SESSIONS`; weekdays and Muhurat dates, exchange holidays not modelled),
+session (`SWING_MIN_NEAR_SESSIONS`; weekdays minus NSE holidays from `src/marketCalendar.js`, and Muhurat dates),
 otherwise the next weekly. When sessions cannot be counted the old rule applies (≥ 3 calendar days,
 `SWING_MIN_NEAR_DTE`). If that chain was not captured, the first captured of near / next weekly /
 monthly is used and the outlook says so.
@@ -133,7 +133,7 @@ archived minute series (5 slices, 150+ checks, each mismatch adversarially verif
 
 | What | Before | Now |
 |---|---|---|
-| Sessions to expiry | exchange holidays not modelled: 7 sessions + 4 closed days to 01-Dec | weekday NSE holidays (`DEFAULT_EXCHANGE_HOLIDAYS` 24-Nov-2026, 25-Dec-2026, 26-Jan-2027, plus `SWING_EXCHANGE_HOLIDAYS`) are closed days for session counting only (the live session logic is unchanged): 6 + 5, T 7.25 |
+| Sessions to expiry | exchange holidays not modelled: 7 sessions + 4 closed days to 01-Dec | weekday NSE holidays (`DEFAULT_EXCHANGE_HOLIDAYS` 24-Nov-2026, 25-Dec-2026, 26-Jan-2027, plus `SWING_EXCHANGE_HOLIDAYS`) are closed days: 6 + 5, T 7.25. Since 24-Nov-2026 the list lives in `src/marketCalendar.js` (`DEFAULT_MARKET_HOLIDAYS`, env `MARKET_HOLIDAYS`) and closes those days for the whole system |
 | Futures contract roll | only a note; the price change spanned two contracts (December trades ~0.6% above an expiring November) | a roll is detected by a change of the recorded contract expiry or, when not recorded, a basis (fut − spot) jump ≥ 0.35% of spot (`SWING_FUT_ROLL_BASIS_PCT`); the price leg then uses the spot change. OI is near + next month combined, so roll-safe |
 | Futures close | the last captured tick (2–19 pts from NSE's close) | NSE's method: the 15:10–15:40 IST volume-weighted average of the minute ticks (futures trade until 15:40), matching the official daily close within 0.2–4.8 pts on 13–20 Nov; the time-weighted average without volume; `fut.last` keeps the last trade and `fut.closeBasis` says which was used |
 | Past outlooks | v1 snapshots scored as stored (20-Nov: TREND_UP into a one-session chain, tick lows) | snapshots with an older `v` are recomputed with the current rules from the recorded days up to their own date (no later data); `recomputed: true` and the stored regime / headline are kept in `stored` |

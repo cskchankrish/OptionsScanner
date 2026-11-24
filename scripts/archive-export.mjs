@@ -21,6 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { getSessionKindForDate } from "../src/marketCalendar.js";
 
 export const RAW_TIMELINE_DAYS = 14;
 // First scorecard day. Never read earlier dates: GET /api/scorecard?date=… lazily FINALISES a day that
@@ -44,6 +45,7 @@ export function exportDates({ nowMs, days = 12, since = ARCHIVE_SINCE }) {
     if (i === 0 && istMins(nowMs) < READY_MINS) continue;
     if (d < since) break;
     if (dow(d) === 0 || dow(d) === 6) continue; // a Muhurat weekend session is archived with --date
+    if (getSessionKindForDate(d) === "CLOSED") continue; // weekday exchange holiday
     out.push(d);
   }
   return out;
