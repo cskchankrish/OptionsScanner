@@ -316,6 +316,37 @@ test("fuseChartWithOptionChain: SYNERGY_BEAR VETOED (0 Lots) when real Option Ch
   assert.match(res.reasoning, /VETOED.*Floor defense near 25000/);
 });
 
+// 27-Nov-2026: both bear synergies sat within 50 pts of the 25800 Put Floor and were DOWNGRADE_TO_SCALP,
+// which the Algo never receives. The near-wall downgrade is removed; the defended-wall veto stays.
+for (const [label, close, dpcr, want] of [
+  ["09:45 bar, 41 pts above the floor, ΔPCR 0.81 → MODERATE", 25841.15, 0.81, "EXECUTE_MODERATE_SYNERGY"],
+  ["10:15 bar, on the floor, ΔPCR 0.74 → HIGH CONVICTION", 25801.3, 0.74, "EXECUTE_HIGH_CONVICTION_SYNERGY"],
+]) {
+  test(`fuseChartWithOptionChain: SYNERGY_BEAR near the Put Floor is not downgraded to scalp (${label})`, () => {
+    const tv = { dir: "SHORT", grade: "SYNERGY_BEAR", close, sl: close + 75, cappedSl: close + 75, rDist: 75, actFloor: 25700 };
+    const liveScanner = {
+      corridor: { deltaPCR: dpcr, floorStrike: 25800, roofStrike: 25900 },
+      smartMoneyFusion: { primaryScenario: "MIXED_FLOW" },
+      futures: { quadrant: "SHORT_BUILDUP" },
+    };
+    const res = fuseChartWithOptionChain(tv, liveScanner);
+    assert.equal(res.decision, want);
+    assert.doesNotMatch(res.reasoning, /approaching Put Floor/);
+  });
+}
+
+test("fuseChartWithOptionChain: SYNERGY_BEAR at the Put Floor with ΔPCR ≥ 0.85 is still VETOED (defended floor)", () => {
+  const tv = { dir: "SHORT", grade: "SYNERGY_BEAR", close: 25820, sl: 25895, cappedSl: 25895, rDist: 75, actFloor: 25700 };
+  const liveScanner = { corridor: { deltaPCR: 0.9, floorStrike: 25800, roofStrike: 25900 }, futures: { quadrant: "SHORT_BUILDUP" } };
+  assert.equal(fuseChartWithOptionChain(tv, liveScanner).decision, "VETO_DIVERGENT_SYNERGY");
+});
+
+test("fuseChartWithOptionChain: SYNERGY_BULL just under the Call Roof is not downgraded to scalp", () => {
+  const tv = { dir: "LONG", grade: "SYNERGY_BULL", close: 25170, sl: 25100, cappedSl: 25100, rDist: 70, actRoof: 25400 };
+  const liveScanner = { corridor: { deltaPCR: 1.6, floorStrike: 25000, roofStrike: 25200 }, futures: { quadrant: "LONG_BUILDUP" } };
+  assert.equal(fuseChartWithOptionChain(tv, liveScanner).decision, "EXECUTE_HIGH_CONVICTION_SYNERGY");
+});
+
 test("fuseChartWithOptionChain: SYNERGY_BULL verified with High Conviction (2 Lots) when Put Blitz aligns", () => {
   const tv = {
     dir: "LONG",

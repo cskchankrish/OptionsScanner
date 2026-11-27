@@ -641,14 +641,10 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
         reason.push(
           `VETOED: Chart flagged Bull Synergy, but real 22-strike Option Chain shows Call Writing resistance (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Futures Short Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}. Fake bull flow.`
         );
-      } else if (distToRoof !== null && distToRoof < 50 && deltaPCR !== null && deltaPCR < 1.30) {
-        decision = "DOWNGRADE_TO_SCALP";
-        recommendedLots = 1;
-        tier = "SCALP_ONLY";
-        reason.push(
-          `CAUTION: Bull Synergy approaching Call Roof ${roofStrike} (dist: ${distToRoof.toFixed(0)} pts). Cap at 1 intraday lot.`
-        );
       } else {
+        // No "approaching the Call Roof → DOWNGRADE_TO_SCALP" step (owner 27-Nov-2026): the walls move
+        // intraday, the rule was never backtested, and for the Algo (hard 1 lot) a downgrade was simply a
+        // veto. A roof that is actually defended is still caught by the nearCallWall veto above.
         const verified =
           (deltaPCR !== null && deltaPCR >= 1.25) ||
           serverScenario === "HIGH_CONVICTION_BULLISH_SYNERGY" ||
@@ -679,14 +675,9 @@ export function fuseChartWithOptionChain(tv, liveScanner, nowMs = Date.now()) {
         reason.push(
           `VETOED: Chart flagged Bear Synergy, but real 22-strike Option Chain shows aggressive Put Writing (ΔPCR=${deltaPCR !== null ? deltaPCR.toFixed(2) : "N/A"}) or Floor defense near ${floorStrike}${liveFutQuad === "LONG_BUILDUP" ? ` or Futures Long Buildup${liveFutQuadSourceLabel ? ` [quadrant: ${liveFutQuadSourceLabel}]` : ""}` : ""}. High risk of bounce.`
         );
-      } else if (distToFloor !== null && distToFloor < 50 && deltaPCR !== null && deltaPCR > 0.70) {
-        decision = "DOWNGRADE_TO_SCALP";
-        recommendedLots = 1;
-        tier = "SCALP_ONLY";
-        reason.push(
-          `CAUTION: Bear Synergy approaching Put Floor ${floorStrike} (dist: ${distToFloor.toFixed(0)} pts). Cap at 1 intraday lot.`
-        );
       } else {
+        // No "approaching the Put Floor → DOWNGRADE_TO_SCALP" step (owner 27-Nov-2026, see the bull
+        // branch). A defended floor is still caught by the nearPutWall veto above.
         const verified =
           (deltaPCR !== null && deltaPCR <= 0.75) ||
           serverScenario === "HIGH_CONVICTION_BEARISH_SYNERGY" ||

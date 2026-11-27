@@ -324,9 +324,10 @@ test("classification: synergy (bull) — all four categories", () => {
   const mod = classify("SYNERGY_BULL", "LONG", bullSnap({ corridor: { deltaPCR: 1.1, floorStrike: 24500, roofStrike: 25400 } }));
   assert.equal(mod.fused.decision, "EXECUTE_MODERATE_SYNERGY");
   assert.equal(mod.cat, "UNCONFIRMED");
-  const scalp = classify("SYNERGY_BULL", "LONG", bullSnap({ corridor: { deltaPCR: 1.2, floorStrike: 24500, roofStrike: 25000 } }));
-  assert.equal(scalp.fused.decision, "DOWNGRADE_TO_SCALP");
-  assert.equal(scalp.cat, "UNCONFIRMED");
+  // near the Call Roof: no longer downgraded to scalp (27-Nov-2026); a mixed ΔPCR stays MODERATE
+  const nearRoof = classify("SYNERGY_BULL", "LONG", bullSnap({ corridor: { deltaPCR: 1.2, floorStrike: 24500, roofStrike: 25000 } }));
+  assert.equal(nearRoof.fused.decision, "EXECUTE_MODERATE_SYNERGY");
+  assert.equal(nearRoof.cat, "UNCONFIRMED");
   const veto = classify("SYNERGY_BULL", "LONG", bullSnap({ corridor: { deltaPCR: 0.8, floorStrike: 24500, roofStrike: 25400 } }));
   assert.equal(veto.fused.decision, "VETO_DIVERGENT_SYNERGY");
   assert.equal(veto.cat, "REJECTED");
