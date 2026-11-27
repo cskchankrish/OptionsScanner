@@ -20,7 +20,9 @@
 import { createHmac, randomBytes } from "node:crypto";
 
 export const FLOW_BRIDGE_GRADES = ["BEAR_TRAP_BUY", "BULL_TRAP_SELL", "SYNERGY_BULL", "SYNERGY_BEAR"];
-export const DEFAULT_FLOW_BRIDGE_DECISIONS = ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY"];
+// EXECUTE_MODERATE_SYNERGY added 27-Nov-2026 (owner): a Synergy the chain neither confirms nor vetoes is
+// traded too (1 lot, like every flow trade). Never traded live before; not backtested.
+export const DEFAULT_FLOW_BRIDGE_DECISIONS = ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY", "EXECUTE_MODERATE_SYNERGY"];
 
 /** Vercel kills api/*.js at 15s (vercel.json maxDuration). */
 export const FUNCTION_BUDGET_MS = 15000;

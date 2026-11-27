@@ -117,7 +117,7 @@ test("OK: authenticated detail has config presence, target host, mode, accounts,
     { enabledFlag: true, urlPresent: true, urlValid: true, secretPresent: true },
   );
   assert.equal(d.config.target, "https://algo.example.test:8443");
-  assert.deepEqual(d.config.decisions, ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY"]);
+  assert.deepEqual(d.config.decisions, ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY", "EXECUTE_MODERATE_SYNERGY"]);
   assert.equal(d.algo.mode, "dry_run");
   assert.deepEqual(d.algo.accounts, [{ account: "ZERODHA-1", position: 0 }]);
   assert.deepEqual(d.algo.feed, { feed: "kite", quotes: 42, down: false });

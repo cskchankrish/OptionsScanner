@@ -39,7 +39,7 @@ by hand once you have checked the broker:
 | `FLOW_BRIDGE_ENABLED` | `true` turns the bridge on. Anything else means off. |
 | `FLOW_BRIDGE_URL` | The Algo's entry endpoint. Required. |
 | `FLOW_BRIDGE_SECRET` | HMAC key shared with the Algo. Required. |
-| `FLOW_BRIDGE_DECISIONS` | Comma-separated decision allow-list. Default `EXECUTE_TIER1_SCOUT,EXECUTE_HIGH_CONVICTION_SYNERGY`. |
+| `FLOW_BRIDGE_DECISIONS` | Comma-separated decision allow-list. Default `EXECUTE_TIER1_SCOUT,EXECUTE_HIGH_CONVICTION_SYNERGY,EXECUTE_MODERATE_SYNERGY` (moderate added 27-Nov-2026). The Algo must allow the same decisions (`flow_bridge.allowed_decisions`). |
 | `FLOW_BRIDGE_TIMEOUT_MS` | Upper bound for the dispatch call. Default 3000, clamped to 1000..5000. |
 | `FLOW_BRIDGE_FILL_WAIT_SEC` | Seconds an `ACCEPTED` trade may wait for ENTRY_FILLED or ENTRY_FAILED before the one-time "no fill report" alert. Default 120. |
 | `TV_WEBHOOK_SECRET` | Existing secret. The Algo's sync-back must carry it. |

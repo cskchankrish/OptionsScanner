@@ -146,7 +146,11 @@ test("config: bridge is enabled only with the flag AND url AND secret", () => {
   assert.equal(bridge.getFlowBridgeConfig({ ...BRIDGE_ON, FLOW_BRIDGE_SECRET: "" }).enabled, false);
   const c = bridge.getFlowBridgeConfig(BRIDGE_ON);
   assert.equal(c.enabled, true);
-  assert.deepEqual(c.decisions, ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY"]);
+  assert.deepEqual(c.decisions, ["EXECUTE_TIER1_SCOUT", "EXECUTE_HIGH_CONVICTION_SYNERGY", "EXECUTE_MODERATE_SYNERGY"]);
+  // moderate Synergy is sent to the Algo (27-Nov-2026); downgrades and vetoes never are
+  assert.equal(bridge.shouldDispatch(c, { grade: "SYNERGY_BEAR", decision: "EXECUTE_MODERATE_SYNERGY" }), true);
+  assert.equal(bridge.shouldDispatch(c, { grade: "SYNERGY_BEAR", decision: "DOWNGRADE_TO_SCALP" }), false);
+  assert.equal(bridge.shouldDispatch(c, { grade: "SYNERGY_BULL", decision: "VETO_DIVERGENT_SYNERGY" }), false);
   assert.equal(c.timeoutMs, 3000);
   assert.equal(bridge.getFlowBridgeConfig({ ...BRIDGE_ON, FLOW_BRIDGE_TIMEOUT_MS: "99999" }).timeoutMs, 5000);
   assert.equal(bridge.getFlowBridgeConfig({ ...BRIDGE_ON, FLOW_BRIDGE_TIMEOUT_MS: "10" }).timeoutMs, 1000);
@@ -219,8 +223,18 @@ test("dispatch: exact contract body, lots always 1, HMAC over the exact bytes se
   assert.match(init.headers["X-Flow-Signature"], /^[0-9a-f]{64}$/);
 }));
 
-test("allow-list: EXECUTE_MODERATE_SYNERGY is paper-only by default", bridgeCase({
+test("allow-list: EXECUTE_MODERATE_SYNERGY is sent to the Algo by default (27-Nov-2026)", bridgeCase({
   env: BRIDGE_ON,
+  snap: snapshot({ corridor: { deltaPCR: 0.9, floorStrike: 24700, roofStrike: 25200 } }),
+}, async ({ calls }) => {
+  const res = await post(bearAlert());
+  assert.equal(res.body.decision, "EXECUTE_MODERATE_SYNERGY");
+  assert.equal(calls.length, 1);
+  assert.equal(JSON.parse(calls[0].init.body).decision, "EXECUTE_MODERATE_SYNERGY");
+}));
+
+test("allow-list: a FLOW_BRIDGE_DECISIONS override without it keeps EXECUTE_MODERATE_SYNERGY paper-only", bridgeCase({
+  env: { ...BRIDGE_ON, FLOW_BRIDGE_DECISIONS: "EXECUTE_TIER1_SCOUT,EXECUTE_HIGH_CONVICTION_SYNERGY" },
   snap: snapshot({ corridor: { deltaPCR: 0.9, floorStrike: 24700, roofStrike: 25200 } }),
 }, async ({ redis, calls }) => {
   const res = await post(bearAlert());
